@@ -1,0 +1,46 @@
+#trash folder
+/trash
+
+# build output
+/build/
+
+# cmake / msbuild junk
+CMakeCache.txt
+CMakeFiles/
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.tlog
+*.recipe
+*.lastbuildstate
+
+# compiled artifacts
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.addon
+*.exe
+
+# reshade runtime leftovers
+dxgi.dll
+ReShade.ini
+ReShade.log
+ReShadeGUI.ini
+Preset.ini
+
+# export / output folders
+out/
+_selftest.png
+
+# archives
+*.zip
+*.7z
+
+# editor / os
+.vs/
+.vscode/
+*.user
+.DS_Store
+Thumbs.db
