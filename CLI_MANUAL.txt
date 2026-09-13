@@ -1,0 +1,132 @@
+ShaderLab CLI Manual
+============================
+Version: 1.2.1
+Author: RaySt
+----------------------------------------------------------------
+Primarily meant for developers and power users.
+ShaderLab includes a command line interface for batch rendering, headless shader testing, uniform parameter overriding, and depth generation.
+
+Run ShaderLab.exe with no arguments to launch the standard GUI.
+
+
+1. Batch & Direct Shader Rendering (render)
+===========================================
+Applies a ReShade preset OR renders a .fx shader file directly onto an image or directory of images.
+Supports overriding individual shader uniform parameters on the fly without editing presets or shaders.
+
+Usage:
+  ShaderLab.exe render (--preset <preset.ini> | --shader <path.fx>) --input <path> [options]
+
+Options:
+  -s, --shader <path>        Directly render a .fx shader file (no .ini preset required)
+  -t, --technique <name>     Specify technique name to run when using --shader
+  -u, --set <var>=<val>      Override shader uniform parameter (can be repeated)
+  -p, --preset <path>        Path to ReShade .ini preset file
+  -i, --input, --image <p>   Path to input image or directory (Required)
+  -o, --output <path>        Path to output file or directory (Default: input_dir/rendered/)
+  -f, --settle-frames <N>    Frames to wait for temporal shaders to settle (Default: 45)
+      --format <png|jpg>     Output image format (Default: png)
+      --json                 Output stats as JSON
+      --quiet                Suppress console output
+  -h, --help                 Show help message
+
+Uniform Override Syntax:
+  --set <var>=<val>                  Overrides uniform across active shader
+  --set <Shader.fx>:<var>=<val>      Targets a specific shader section in multi-effect presets
+  --set Ascii_spacing=3 --set Ascii_swap_colors=1    (chain multiple overrides)
+
+Examples:
+  # Direct shader rendering (no preset needed):
+  ShaderLab.exe render --shader reshade-shaders\Shaders\DisplayDepth.fx --input shot.png --output normals.png --set iUIPresentType=1
+
+  # Override parameters with Marty's Mods Clarity:
+  ShaderLab.exe render --shader reshade-shaders\Shaders\MartysMods_CLARITY.fx --input shot.png --output clarity.png --set EFFECT_RADIUS=0.990000
+
+  # Standard preset rendering with parameter tweak:
+  ShaderLab.exe render --preset "Preset.ini" --input "C:\Screenshots" --settle-frames 60 --set sharp_strength=1.5
+
+
+2. Shader Syntax Validation & Visual Testing (test-shader)
+==========================================================
+Headlessly compiles a ReShade .fx shader and reports syntax/compilation errors with line numbers.
+Optionally renders the shader onto an input image to produce a visual picture output.
+
+Usage:
+  ShaderLab.exe test-shader --shader <path.fx> [options]
+
+Options:
+  -s, --shader <path>        Path to .fx or .fxh shader file (Required)
+  -i, --image, --input <p>   Optional input image to render shader onto headlessly
+  -o, --output <path>        Optional output image path when --image is specified
+  -t, --technique <name>     Specify technique name to activate
+  -u, --set <var>=<val>      Override shader uniform parameter (can be repeated)
+  -p, --preset <path>        Optional preset to test with
+      --json                 Output structured JSON error report
+      --quiet                Quiet mode (Exit code 0 on success, 1 on error)
+  -h, --help                 Show help message
+
+Examples:
+  # Validate syntax & compiler errors:
+  ShaderLab.exe test-shader --shader "reshade-shaders\Shaders\AdaptiveSharpen.fx"
+
+  # Validate and immediately capture the visual picture:
+  ShaderLab.exe test-shader --shader "reshade-shaders\Shaders\ASCII.fx" --image "shot.png" --output "ascii.png" --set Ascii_spacing=3
+
+
+3. AI Depth Generation (depth)
+================================
+Generates 32-bit float depth maps using Depth Anything V2.
+
+Usage:
+  ShaderLab.exe depth --input <path> [options]
+
+Options:
+  -i, --input <path>         Image file or directory (Required)
+  -m, --encoder <type>       Model size: vitl (Large), vitb (Base), vits (Small). Default: vitl
+      --embed-png            Embed slDp chunk directly into PNG instead of saving .sldepth sidecar
+      --far-plane <val>      Virtual far-plane calibration (Default: 1000.0, recommended: 50.0 to 1000.0)
+      --json                 Output status as JSON
+  -h, --help                 Show help message
+
+Requirements:
+  Requires Python with PyTorch and Depth Anything V2 model weights (.pth).
+  Place weights (e.g. depth_anything_v2_vitl.pth) in 'common/' or 'tools/depth_anything_v2/'.
+
+Example:
+  ShaderLab.exe depth --input "C:\Screenshots" --encoder vitl --embed-png
+
+
+4. Metadata Inspector (info)
+=============================
+Displays image dimensions, channels, embedded slDp 3D depth chunks, and companion sidecars (.sldepth).
+
+Usage:
+  ShaderLab.exe info <image_path> [--json]
+
+Example:
+  ShaderLab.exe info "shot.png"
+
+
+5. Preset Inspector & Diff (preset)
+====================================
+Lists active techniques in a preset or shows differences between two presets.
+
+Usage:
+  ShaderLab.exe preset <preset.ini> [--diff <other.ini>] [--json]
+
+Examples:
+  ShaderLab.exe preset "Preset.ini"
+  ShaderLab.exe preset "Preset.ini" --diff "OtherPreset.ini"
+
+
+6. Hardware GPU Diagnostics (selftest)
+=======================================
+Runs basic D3D11 device and swapchain tests.
+
+Usage:
+  ShaderLab.exe selftest
+
+
+Exit codes:
+  0 = Success
+  1 = Error / Shader compilation failed

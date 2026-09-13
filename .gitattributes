@@ -1,2 +1,2 @@
-# Auto detect text files and perform LF normalization
+# keep line endings consistent, lf in the repo, native on checkout
 * text=auto
