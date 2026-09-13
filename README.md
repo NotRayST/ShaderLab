@@ -123,8 +123,8 @@ For third-party dependencies, open-source libraries, and model licenses (Depth A
 
 ## Pull Requests
 When submitting a pull request:
-- Test it out, make sure it works as intended, just because it compiles doesn't mean it works.
-- If you coded it with AI, please disclose it in the pull request, and please test it out really well before submitting.  
+- Test it out, make sure it works as intended, just because it compiles doesn't mean it works, especially if its AI generated code, it's also best to disclose if it was AI generated or not as that helps to know what areas to look closer at during review and test for subtle breakage.
+- Write a sufficient description of your addition/fix.
 
 You can also open an issue in the issues tab for the bug or feature request instead.
 
