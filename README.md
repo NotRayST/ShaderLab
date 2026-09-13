@@ -4,7 +4,7 @@ An image editor using ReShade shaders.
 
 If you just want to use the tool, grab the pre-built zip from the [Releases](https://github.com/NotRayST/ShaderLab/releases) tab.
 
-https://github.com/user-attachments/assets/f6729d89-9d86-49f0-9215-c9c8cb7e7c43
+<img width="1280" height="720" alt="Image" src="https://github.com/user-attachments/assets/8c1c8ba2-1fe0-4005-ac18-9a757464a90d" />
 
 ## Table of Contents
 - [What is this?](#what-is-this)
