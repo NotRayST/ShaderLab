@@ -322,8 +322,7 @@ void ZoomHud::update(float dt, float zoom, float idle_seconds, bool is_locked, b
     m_is_locked = is_locked;
     m_is_fine = is_fine;
 
-    constexpr float kHoldSeconds = 1.5f;
-    bool should_show = (std::abs(zoom - 1.0f) > 0.005f) || (idle_seconds < kHoldSeconds);
+    bool should_show = idle_seconds < 2.0f;
     if (should_show) {
         m_fade_alpha = (std::min)(1.0f, m_fade_alpha + dt * 5.0f);
     } else {
