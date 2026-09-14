@@ -1,0 +1,50 @@
+name: Nightly Build
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight UTC
+  workflow_dispatch:     # Allows manual trigger from GitHub Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure CMake
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build Release
+        run: cmake --build build --config Release
+
+      - name: Package Release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force
+          Copy-Item "build\host_app\Release\ShaderLab.exe" "dist\"
+          Copy-Item "build\addon\Release\ShaderLab.addon" "dist\"
+          Copy-Item "Readme.txt" "dist\"
+          Copy-Item "CLI_MANUAL.txt" "dist\"
+          Copy-Item "LICENSE" "dist\"
+          Copy-Item "THIRD_PARTY_LICENSES.md" "dist\"
+          if (Test-Path "tools\depth_anything_v2") {
+            Copy-Item "tools\depth_anything_v2" "dist\tools\depth_anything_v2" -Recurse
+          }
+          Compress-Archive -Path "dist\*" -DestinationPath "ShaderLab-nightly.zip"
+
+      - name: Publish Nightly Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "ShaderLab Nightly Build"
+          prerelease: true
+          files: |
+            ShaderLab-nightly.zip
+            build/game_capture_addon/Release/ShaderLabCapture.addon

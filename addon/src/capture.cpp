@@ -278,6 +278,15 @@ void on_reshade_begin_effects(
 }
 
 void on_init_effect_runtime(reshade::api::effect_runtime *runtime) {
+    char p[MAX_PATH] = {};
+    size_t sz = sizeof(p);
+    reshade::get_config_value(runtime, "GENERAL", "IntermediateCachePath", p, &sz);
+    if (!p[0] || strstr(p, "\\Temp\\") || strstr(p, "\\temp\\") || (strstr(p, "ShaderCache") && !strstr(p, "common"))) {
+        std::error_code ec;
+        fs::create_directories("common/ShaderCache", ec);
+        reshade::set_config_value(runtime, "GENERAL", "IntermediateCachePath", ".\\common\\ShaderCache");
+    }
+
     s_finish_effects_fired_this_frame = false;
     s_is_loading = true;
     JobQueueManager &queue_mgr = JobQueueManager::get();
@@ -372,6 +381,7 @@ void on_reshade_finish_effects(
             reshade::set_config_value(runtime, "ShaderLab", "FirstRunDone", 1);
             block->first_run_nudge = 1;
         }
+
     }
 
     block->addon_heartbeat++;
