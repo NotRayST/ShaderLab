@@ -22,7 +22,7 @@ jobs:
         run: cmake -B build -G "Visual Studio 17 2022" -A x64
 
       - name: Build Release
-        run: cmake --build build --config Release
+        run: cmake --build build --config Release --parallel
 
       - name: Package Release
         shell: pwsh

@@ -3,6 +3,7 @@
 
 # build output
 /build/
+/build_*/
 
 # cmake / msbuild junk
 CMakeCache.txt

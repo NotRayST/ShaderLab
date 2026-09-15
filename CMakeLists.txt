@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(BUILD_HOST "Build host application" ON)
 option(BUILD_ADDON "Build ReShade addon" ON)
 option(BUILD_GAME_CAPTURE "Build in-game capture addon" ON)
+option(BUILD_UNDO_REDO "Build standalone undo redo addon" ON)
 set(RESHADE_DIR "" CACHE PATH "Path to directory containing full-addon-support dxgi.dll")
 
 if(MSVC)
@@ -23,4 +24,8 @@ endif()
 
 if(BUILD_GAME_CAPTURE)
     add_subdirectory(game_capture_addon)
+endif()
+
+if(BUILD_UNDO_REDO)
+    add_subdirectory(undo_redo_addon)
 endif()

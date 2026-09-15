@@ -9,7 +9,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     switch (msg) {
+    case WM_CLOSE:
+        if (self) self->save_window_placement();
+        break;
     case WM_DESTROY:
+        if (self) self->save_window_placement();
         PostQuitMessage(0);
         return 0;
     case WM_ENTERSIZEMOVE:
@@ -55,6 +59,17 @@ GfxDevice::~GfxDevice() {
     shutdown();
 }
 
+void GfxDevice::save_window_placement() {
+    WINDOWPLACEMENT wp = { sizeof(wp) };
+    if (m_hwnd && !m_is_fullscreen && GetWindowPlacement(m_hwnd, &wp)) {
+        wchar_t b[64];
+        swprintf_s(b, L"%ld,%ld,%ld,%ld,%d", wp.rcNormalPosition.left, wp.rcNormalPosition.top,
+                   wp.rcNormalPosition.right - wp.rcNormalPosition.left, wp.rcNormalPosition.bottom - wp.rcNormalPosition.top,
+                   wp.showCmd == SW_SHOWMAXIMIZED ? 1 : 0);
+        WritePrivateProfileStringW(L"ShaderLab", L"WindowPlacement", b, L".\\ReShade.ini");
+    }
+}
+
 bool GfxDevice::initialize(const wchar_t *title, uint32_t win_width, uint32_t win_height, uint32_t init_render_width, uint32_t init_render_height, bool visible) {
     m_win_width = win_width;
     m_win_height = win_height;
@@ -72,7 +87,11 @@ bool GfxDevice::initialize(const wchar_t *title, uint32_t win_width, uint32_t wi
     }
 
     if (visible) {
-        ShowWindow(m_hwnd, SW_SHOWNORMAL);
+        wchar_t wp_buf[64] = {};
+        GetPrivateProfileStringW(L"ShaderLab", L"WindowPlacement", L"", wp_buf, _countof(wp_buf), L".\\ReShade.ini");
+        int x = 0, y = 0, w = 0, h = 0, max = 0;
+        bool is_max = (swscanf_s(wp_buf, L"%d,%d,%d,%d,%d", &x, &y, &w, &h, &max) == 5 && max);
+        ShowWindow(m_hwnd, is_max ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
         UpdateWindow(m_hwnd);
         SetForegroundWindow(m_hwnd);
         BringWindowToTop(m_hwnd);
@@ -89,6 +108,8 @@ bool GfxDevice::initialize(const wchar_t *title, uint32_t win_width, uint32_t wi
 }
 
 void GfxDevice::shutdown() {
+    save_window_placement();
+
     if (m_context) {
         m_context->ClearState();
         m_context->Flush();
@@ -137,6 +158,14 @@ bool GfxDevice::create_window(const wchar_t *title, uint32_t width, uint32_t hei
 
     RECT rc = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+
+    wchar_t wp_buf[64] = {};
+    GetPrivateProfileStringW(L"ShaderLab", L"WindowPlacement", L"", wp_buf, _countof(wp_buf), L".\\ReShade.ini");
+    int sx = 0, sy = 0, sw = 0, sh = 0, smax = 0;
+    if (swscanf_s(wp_buf, L"%d,%d,%d,%d,%d", &sx, &sy, &sw, &sh, &smax) >= 4 && sw > 100 && sh > 100 && MonitorFromPoint({ sx, sy }, MONITOR_DEFAULTTONULL)) {
+        posX = sx; posY = sy;
+        rc.left = 0; rc.top = 0; rc.right = sw; rc.bottom = sh;
+    }
 
     m_hwnd = CreateWindowExW(
         0,

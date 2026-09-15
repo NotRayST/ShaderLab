@@ -16,6 +16,7 @@ public:
 
     bool initialize(const wchar_t *title, uint32_t win_width, uint32_t win_height, uint32_t init_render_width, uint32_t init_render_height, bool visible = true);
     void shutdown();
+    void save_window_placement();
 
     bool resize_buffers(uint32_t width, uint32_t height);
     void handle_window_resize(uint32_t width, uint32_t height);
