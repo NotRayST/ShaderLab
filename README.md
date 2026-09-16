@@ -12,6 +12,7 @@ If you just want to use the tool, grab the pre-built zip from the [Releases](htt
 - [How to Run](#how-to-run)
 - [Controls & Hotkeys](#controls--hotkeys)
 - [In-Game Depth Capture](#in-game-depth-capture-shaderlabcaptureaddon)
+- [Standalone Undo / Redo Add-on](#standalone-undo--redo-add-on-undoredoaddon)
 - [Building from Source](#building-from-source)
 - [Project Structure](#project-structure)
 - [License](#license)
@@ -84,6 +85,16 @@ To capture the true depth buffer from games:
 
 ---
 
+## Standalone Undo / Redo Add-on (`UndoRedo.addon`)
+A standalone ReShade add-on that brings full undo and redo capability to any game or ReShade installation:
+- **Full History Tracking**: Tracks every uniform slider and technique toggle with up to 1,000 steps.
+- **Hotkeys**: `Ctrl + Z` to undo, `Ctrl + Y` (or `Ctrl + Shift + Z`) to redo.
+- **In-Overlay History Browser**: Appears directly in ReShade's Add-ons tab. Browse your entire tweak history, jump to any prior step or back to the initial preset state, and quickly undo / redo via dedicated buttons.
+- **Rebindable Keys**: Click-to-remap interface right in the overlay with automatic modifier detection (`Ctrl`, `Shift`, `Alt`), saved directly to your `ReShade.ini`.
+- **Zero Dependencies**: Lightweight single-file add-on that works with any 64-bit game running ReShade with full add-on support. Just drop `UndoRedo.addon` next to the game executable.
+
+---
+
 ## Building from Source
 
 ### Prerequisites
@@ -100,14 +111,16 @@ cmake --build build --config Release
 Built outputs:
 - `build/host_app/Release/ShaderLab.exe`
 - `build/addon/Release/ShaderLab.addon`
+- `build/undo_redo_addon/Release/UndoRedo.addon`
 - `build/game_capture_addon/Release/ShaderLabCapture.addon`
 
 ---
 
 ## Project Structure
 - `host_app/`: D3D11 host application, CLI parser & subcommands, HUD overlays, viewport controller.
-- `addon/`: ReShade add-on UI, undo/redo system, IPC hooks, export pipeline.
+- `addon/`: ReShade add-on UI, undo/redo system, IPC hooks, export pipeline, depth manager, etc.
 - `game_capture_addon/`: Standalone in-game camera depth grabber.
+- `undo_redo_addon/`: Standalone Undo / Redo ReShade add-on with remappable hotkeys and history browser.
 - `common/`: Shared memory IPC protocol (`ipc_protocol.h`), custom `.sldepth` chunk serializers, project file handlers.
 - `tools/depth_anything_v2/`: Python inference backend for AI depth estimation.
 - `third_party/`: Header-only vendor libraries (`reshade`, `imgui`, `stb`, `miniz`).

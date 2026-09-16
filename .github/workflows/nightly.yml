@@ -48,3 +48,4 @@ jobs:
           files: |
             ShaderLab-nightly.zip
             build/game_capture_addon/Release/ShaderLabCapture.addon
+            build/undo_redo_addon/Release/UndoRedo.addon

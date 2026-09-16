@@ -456,5 +456,13 @@ void CaptureManager::on_draw_overlay(reshade::api::effect_runtime* /*runtime*/) 
 
     ImGui::Spacing();
     ImGui::Checkbox("Export 16-Bit Depth (Recommended for file size)", &m_export_16bit);
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("ShaderLab Capture v1.2.1  -  by NotRayST");
+    ImGui::PopTextWrapPos();
 }
 

@@ -8,6 +8,7 @@ set(CAPTURE_SOURCES
     ../common/depth_chunk.cpp
     ../common/depth_file.cpp
     ../third_party/miniz/miniz.cpp
+    resource.rc
 )
 
 add_library(ShaderLabCapture SHARED ${CAPTURE_SOURCES})
@@ -40,4 +41,6 @@ set_target_properties(ShaderLabCapture PROPERTIES
     OUTPUT_NAME "ShaderLabCapture"
     SUFFIX ".addon"
     PREFIX ""
+    VERSION "1.2.1"
+    SOVERSION "1.2.1"
 )
