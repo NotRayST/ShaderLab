@@ -1,6 +1,7 @@
 #include "capture.h"
 #include "job_queue.h"
 #include "hud_composite.h"
+#include "before_after.h"
 #include "keybinds.h"
 #include "overlay_ui.h"
 #include "../../common/depth_file.h"
@@ -256,8 +257,8 @@ void on_reshade_present(reshade::api::effect_runtime *runtime) {
 
 void on_reshade_begin_effects(
     reshade::api::effect_runtime *runtime,
-    reshade::api::command_list *,
-    reshade::api::resource_view,
+    reshade::api::command_list *cmd_list,
+    reshade::api::resource_view rtv,
     reshade::api::resource_view)
 {
     JobQueueManager &queue_mgr = JobQueueManager::get();
@@ -265,6 +266,7 @@ void on_reshade_begin_effects(
     if (!block || !queue_mgr.is_connected()) return;
 
     sync_depth_peek_state(runtime, block);
+    before_after_capture_pre(block, runtime, cmd_list, rtv);
 
     if (block->depth_version != s_last_bound_depth_version) {
         s_last_bound_depth_version = block->depth_version;
@@ -401,6 +403,7 @@ void on_reshade_finish_effects(
 
     if (block->export_state == ExportState::Idle) {
         composite_hud(block, runtime, cmd_list, rtv);
+        before_after_composite(block, runtime, cmd_list, rtv);
     }
 
     if (block->export_state != ExportState::Capturing) {
