@@ -601,10 +601,28 @@ static int run_app(int argc, wchar_t **argv) {
             bool depth_peek = active_image.has_depth && active_image.depth_srv && is_d_pressed && is_app_focused && !want_text;
             bool pan_locked_held = (control_block->view_interaction_flags & VIEW_FLAG_PAN_LOCKED_ATTEMPT) != 0 ||
                                    viewport.is_pan_locked_attempt();
+            bool is_dragging_ba_pos = viewport.is_before_after_enabled() && viewport.is_dragging_split_pos();
+            bool is_dragging_ba_rot = viewport.is_before_after_enabled() && viewport.is_dragging_split_rot();
+
             if (depth_peek) {
                 toast_hud.show_held(L"Depth Peek (Holding D)");
             } else if (pan_locked_held) {
                 toast_hud.show_held(L"Pan Locked");
+            } else if (is_dragging_ba_pos) {
+                int pct = static_cast<int>(std::round((viewport.get_before_after_split() + 0.5f) * 100.0f));
+                wchar_t buf[48];
+                swprintf_s(buf, L"Split: %d%%", pct);
+                toast_hud.show_held(buf);
+            } else if (is_dragging_ba_rot) {
+                float ang = viewport.get_before_after_angle();
+                bool snapped = (std::fmod(ang, 45.0f) == 0.0f);
+                wchar_t buf[64];
+                if (snapped) {
+                    swprintf_s(buf, L"Split Angle: %.0f° (Snapped)", ang);
+                } else {
+                    swprintf_s(buf, L"Split Angle: %.1f°", ang);
+                }
+                toast_hud.show_held(buf);
             } else {
                 toast_hud.release_held();
             }
@@ -674,9 +692,15 @@ static int run_app(int argc, wchar_t **argv) {
             }
         }
 
-        // detect lock flag changes to show top notification
+        // detect before/after toggle or lock flag changes to show top notification
+        static uint32_t s_last_ba_flag = 0;
+        uint32_t cur_ba_flag = control_block->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER;
         uint32_t cur_lock_flags = control_block->view_interaction_flags & (VIEW_FLAG_LOCK_PAN | VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT);
-        if (cur_lock_flags != last_lock_flags) {
+        if (cur_ba_flag != s_last_ba_flag) {
+            s_last_ba_flag = cur_ba_flag;
+            toast_hud.show(cur_ba_flag ? L"Before / After Comparison Active" : L"Before / After Disabled");
+            last_lock_flags = cur_lock_flags;
+        } else if (cur_lock_flags != last_lock_flags) {
             uint32_t diff = cur_lock_flags ^ last_lock_flags;
             uint32_t all_mask = (VIEW_FLAG_LOCK_PAN | VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT);
             if ((diff & (diff - 1)) != 0) {
@@ -778,6 +802,10 @@ static int run_app(int argc, wchar_t **argv) {
                     control_block->request_save_project++;
                 } else if (action_id == static_cast<uint32_t>(IpcAction::SaveProjectAs)) {
                     control_block->request_save_project_as++;
+                } else if (action_id == static_cast<uint32_t>(IpcAction::ToggleBeforeAfter)) {
+                    viewport.toggle_before_after();
+                    viewport.sync_to_block(control_block);
+                    last_synced_xform_ver = control_block->view_transform_version;
                 }
                 control_block->mailbox.status = 1;
                 control_block->mailbox.seq_handled = control_block->mailbox.seq_request;
@@ -1366,6 +1394,14 @@ static int run_app(int argc, wchar_t **argv) {
                                      std::to_wstring(active_image.height) + L")";
                 if (active_image.has_depth) {
                     title += depth_peek ? L" [Depth Peek Active]" : L" [Depth Active]";
+                }
+                if (viewport.is_before_after_enabled()) {
+                    float a = viewport.get_before_after_angle();
+                    const wchar_t *sides = L" [Left: Before | Right: After]";
+                    if (a >= 45.0f && a < 135.0f) sides = L" [Top: Before | Bottom: After]";
+                    else if (a >= 135.0f && a < 225.0f) sides = L" [Right: Before | Left: After]";
+                    else if (a >= 225.0f && a < 315.0f) sides = L" [Bottom: Before | Top: After]";
+                    title += sides;
                 }
                 if (is_dirty) {
                     title += L" [unsaved changes]";

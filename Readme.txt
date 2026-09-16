@@ -71,6 +71,7 @@ Hotkeys (default keybinds, rebindable in ShaderLab Helper -> Keybinds tab):
   K                             Toggle Lock Rotation
   L                             Toggle Lock View (locks Pan, Zoom & Rotation)
   F11                           Toggle Borderless Fullscreen
+  B                             Toggle Before / After Split Comparison (LMB drag move, RMB drag rotate)
   Ctrl + S                      Save project (.shaderlab)
   Ctrl + Shift + S              Save project as...
   Ctrl + E                      Export image

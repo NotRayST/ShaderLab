@@ -5,6 +5,7 @@
 #include "job_queue.h"
 #include "undo_history.h"
 #include "keybinds.h"
+#include "before_after.h"
 #include "depth_manager.h"
 #include "project_file.h"
 #include <windows.h>
@@ -663,6 +664,9 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
             if (block) {
                 block->request_export_image++;
             }
+        } else if (keybinds::is_pressed(keybinds::Action::ToggleBeforeAfter) ||
+                   (!ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift && !ImGui::GetIO().KeyAlt && ImGui::IsKeyPressed(ImGuiKey_B, false))) {
+            before_after_toggle();
         }
     }
     static bool   s_overlay_panning  = false;
@@ -744,7 +748,21 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         bool alt_down = io.KeyAlt;
         static bool s_pan_locked_attempt = false;
 
-        if (!lock_pan && io.MouseDown[0] && !s_overlay_rotating) {
+        auto &ba_state_mut = before_after_get_state();
+        if (!ba_state_mut.is_dragging_pos && !ba_state_mut.is_dragging_rot) {
+            ba_state_mut.enabled = (block->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER) != 0;
+            ba_state_mut.angle = block->before_after_angle;
+            ba_state_mut.split_offset = block->before_after_split;
+        }
+
+        before_after_handle_input(bg_hovered, any_active, fine);
+        const auto &ba_state = before_after_get_state();
+        if (ba_state.enabled) {
+            block->before_after_angle = ba_state.angle;
+            block->before_after_split = ba_state.split_offset;
+        }
+
+        if (!lock_pan && !ba_state.enabled && io.MouseDown[0] && !s_overlay_rotating && !ba_state.is_dragging_pos) {
             s_pan_locked_attempt = false;
             if (!s_overlay_panning) {
                 if (bg_hovered && !any_active && !alt_down)
@@ -777,7 +795,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
 
         bool rotate_btn = io.MouseDown[1] || (io.MouseDown[0] && alt_down);
 
-        if (!lock_rotate && rotate_btn && !s_overlay_panning) {
+        if (!lock_rotate && rotate_btn && !s_overlay_panning && !ba_state.enabled) {
             if (!s_overlay_rotating) {
                 if (bg_hovered && !any_active) {
                     s_overlay_rotating = true;
@@ -942,6 +960,16 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
                     }
                     block->view_last_lock_ms = now_lock_ms;
                     block->view_transform_version++;
+                } else if (keybinds::is_pressed(keybinds::Action::ToggleBeforeAfter)) {
+                    before_after_toggle();
+                    if (before_after_get_state().enabled) {
+                        block->view_interaction_flags |= VIEW_FLAG_BEFORE_AFTER;
+                    } else {
+                        block->view_interaction_flags &= ~VIEW_FLAG_BEFORE_AFTER;
+                    }
+                    block->before_after_angle = before_after_get_state().angle;
+                    block->before_after_split = before_after_get_state().split_offset;
+                    block->view_transform_version++;
                 }
             }
 
@@ -962,13 +990,23 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
             }
         }
 
-        uint32_t preserved_flags = block->view_interaction_flags & (VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT | VIEW_FLAG_LOCK_PAN | VIEW_FLAG_DEPTH_PEEK);
+        uint32_t preserved_flags = block->view_interaction_flags & (VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT | VIEW_FLAG_LOCK_PAN | VIEW_FLAG_DEPTH_PEEK | VIEW_FLAG_BEFORE_AFTER | VIEW_FLAG_BEFORE_AFTER_DRAG);
         if (want_text) {
             preserved_flags |= VIEW_FLAG_TEXT_INPUT;
         } else {
             preserved_flags &= ~VIEW_FLAG_TEXT_INPUT;
         }
         uint32_t inter_flags = preserved_flags;
+        if (ba_state.enabled) {
+            inter_flags |= VIEW_FLAG_BEFORE_AFTER;
+        } else {
+            inter_flags &= ~VIEW_FLAG_BEFORE_AFTER;
+        }
+        if (ba_state.is_dragging_pos) {
+            inter_flags |= VIEW_FLAG_BEFORE_AFTER_DRAG;
+        } else {
+            inter_flags &= ~VIEW_FLAG_BEFORE_AFTER_DRAG;
+        }
         if (s_overlay_panning)    inter_flags |= VIEW_FLAG_PANNING;
         if (s_overlay_rotating)   inter_flags |= VIEW_FLAG_ROTATING;
         if (s_overlay_snapped)    inter_flags |= VIEW_FLAG_SNAPPED;

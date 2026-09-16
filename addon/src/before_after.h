@@ -12,6 +12,7 @@ struct BeforeAfterState {
 
 BeforeAfterState &before_after_get_state();
 void before_after_toggle();
+bool before_after_handle_input(bool bg_hovered, bool any_active, bool fine);
 
 void before_after_capture_pre(
     SharedControlBlock *block,

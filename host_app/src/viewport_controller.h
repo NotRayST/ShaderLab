@@ -76,6 +76,14 @@ public:
 
     bool matches_keybind(IpcAction action, WPARAM vk, bool ctrl, bool shift, bool alt) const;
 
+    bool is_before_after_enabled() const { return m_before_after_enabled; }
+    float get_before_after_angle() const { return m_before_after_angle; }
+    float get_before_after_split() const { return m_before_after_split; }
+    bool is_dragging_split_pos() const { return m_is_dragging_split_pos; }
+    bool is_dragging_split_rot() const { return m_is_dragging_split_rot; }
+    void set_before_after_enabled(bool enabled);
+    void toggle_before_after() { set_before_after_enabled(!m_before_after_enabled); }
+
 private:
     void update_snap();
     void clamp_pan(uint32_t render_w, uint32_t render_h, uint32_t img_w, uint32_t img_h);
@@ -94,6 +102,18 @@ private:
 
     bool m_is_pan_locked_attempt = false;
     bool m_is_rotate_locked_attempt = false;
+
+    // before/after comparison state
+    bool  m_before_after_enabled = false;
+    float m_before_after_angle = 0.0f;
+    float m_before_after_split = 0.0f;
+    bool  m_is_dragging_split_pos = false;
+    bool  m_is_dragging_split_rot = false;
+    bool  m_is_hovering_split = false;
+    float m_raw_split_angle = 0.0f;
+    bool  m_saved_lock_zoom = false;
+    bool  m_saved_lock_rotate = false;
+    bool  m_saved_lock_pan = false;
 
     IpcKeybind m_keybinds[kMaxKeybinds] = {};
     uint32_t   m_keybind_version = 0;

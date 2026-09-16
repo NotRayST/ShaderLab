@@ -81,6 +81,28 @@ void ViewportController::reset_zoom_and_pan() {
     m_transform.pan_y = 0.0f;
 }
 
+void ViewportController::set_before_after_enabled(bool enabled) {
+    if (m_before_after_enabled == enabled) return;
+    m_before_after_enabled = enabled;
+    if (enabled) {
+        m_saved_lock_zoom = m_lock_zoom;
+        m_saved_lock_rotate = m_lock_rotate;
+        m_saved_lock_pan = m_lock_pan;
+        m_lock_zoom = true;
+        m_lock_rotate = true;
+        m_lock_pan = true;
+        m_is_panning = false;
+        m_is_rotating = false;
+    } else {
+        m_lock_zoom = m_saved_lock_zoom;
+        m_lock_rotate = m_saved_lock_rotate;
+        m_lock_pan = m_saved_lock_pan;
+        m_is_dragging_split_pos = false;
+        m_is_dragging_split_rot = false;
+        ReleaseCapture();
+    }
+}
+
 void ViewportController::reset_rotation() {
     m_transform.angle = 0.0f;
     m_raw_angle = 0.0f;
@@ -281,6 +303,27 @@ bool ViewportController::handle_input(
         int client_y = GET_Y_LPARAM(lParam);
         m_last_mouse_client = { client_x, client_y };
 
+        if (m_before_after_enabled) {
+            float cur_render_x = static_cast<float>(client_x) * scale_x;
+            float cur_render_y = static_cast<float>(client_y) * scale_y;
+            float px = cur_render_x - center_x;
+            float py = cur_render_y - center_y;
+            float rad = m_before_after_angle * (kPi / 180.0f);
+            float nx = std::cos(rad), ny = std::sin(rad);
+            float extent = std::abs(static_cast<float>(render_w) * nx) + std::abs(static_cast<float>(render_h) * ny);
+            float split_offset_px = m_before_after_split * (extent > 0.0f ? extent : 1.0f);
+            float dist_px = std::abs((px * nx + py * ny) - split_offset_px);
+            float dist_client = dist_px / (scale_x > 0.0f ? scale_x : 1.0f);
+
+            if (dist_client <= 14.0f) {
+                m_is_dragging_split_pos = true;
+                SetCapture(hwnd);
+                SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+                return true;
+            }
+            return true;
+        }
+
         if (alt_down) {
             if (m_lock_rotate) {
                 m_is_rotate_locked_attempt = true;
@@ -314,15 +357,33 @@ bool ViewportController::handle_input(
     }
 
     case WM_RBUTTONDOWN: {
+        int client_x = GET_X_LPARAM(lParam);
+        int client_y = GET_Y_LPARAM(lParam);
+        m_last_mouse_client = { client_x, client_y };
+
+        if (m_before_after_enabled) {
+            float cur_render_x = static_cast<float>(client_x) * scale_x;
+            float cur_render_y = static_cast<float>(client_y) * scale_y;
+            float px = cur_render_x - center_x;
+            float py = cur_render_y - center_y;
+            m_is_dragging_split_rot = true;
+            SetCapture(hwnd);
+            if (px * px + py * py > 16.0f) {
+                m_last_drag_angle = std::atan2(px, -py) * (180.0f / kPi);
+                if (m_last_drag_angle < 0.0f) m_last_drag_angle += 360.0f;
+            } else {
+                m_last_drag_angle = m_before_after_angle;
+            }
+            m_raw_split_angle = m_before_after_angle;
+            return true;
+        }
+
         if (m_lock_rotate) {
             m_is_rotate_locked_attempt = true;
             SetCapture(hwnd);
             return true;
         }
         m_is_rotate_locked_attempt = false;
-        int client_x = GET_X_LPARAM(lParam);
-        int client_y = GET_Y_LPARAM(lParam);
-        m_last_mouse_client = { client_x, client_y };
 
         m_is_rotating = true;
         m_is_panning = false;
@@ -340,6 +401,61 @@ bool ViewportController::handle_input(
     case WM_MOUSEMOVE: {
         int client_x = GET_X_LPARAM(lParam);
         int client_y = GET_Y_LPARAM(lParam);
+
+        if (m_before_after_enabled) {
+            float cur_render_x = static_cast<float>(client_x) * scale_x;
+            float cur_render_y = static_cast<float>(client_y) * scale_y;
+            float px = cur_render_x - center_x;
+            float py = cur_render_y - center_y;
+            float rad = m_before_after_angle * (kPi / 180.0f);
+            float nx = std::cos(rad), ny = std::sin(rad);
+            float extent = std::abs(static_cast<float>(render_w) * nx) + std::abs(static_cast<float>(render_h) * ny);
+
+            if (m_is_dragging_split_pos) {
+                float proj = px * nx + py * ny;
+                m_before_after_split = std::clamp(proj / (extent > 0.0f ? extent : 1.0f), -0.5f, 0.5f);
+                SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+                m_last_mouse_client = { client_x, client_y };
+                return true;
+            }
+
+            if (m_is_dragging_split_rot) {
+                if (px * px + py * py > 16.0f) {
+                    float cur_ang = std::atan2(px, -py) * (180.0f / kPi);
+                    if (cur_ang < 0.0f) cur_ang += 360.0f;
+                    float delta = cur_ang - m_last_drag_angle;
+                    if (delta > 180.0f) delta -= 360.0f;
+                    else if (delta < -180.0f) delta += 360.0f;
+                    m_last_drag_angle = cur_ang;
+                    if (m_is_fine) delta *= 0.25f;
+                    m_raw_split_angle += delta;
+                    m_raw_split_angle = std::fmod(m_raw_split_angle, 360.0f);
+                    if (m_raw_split_angle < 0.0f) m_raw_split_angle += 360.0f;
+
+                    float snapped = m_raw_split_angle;
+                    if (!m_is_fine) {
+                        constexpr float kSnap = 45.0f, kRadius = 4.0f;
+                        float r = std::fmod(m_raw_split_angle + 0.5f * kSnap, kSnap) - 0.5f * kSnap;
+                        if (std::abs(r) < kRadius) snapped = m_raw_split_angle - r;
+                    }
+                    snapped = std::fmod(snapped, 360.0f);
+                    if (snapped < 0.0f) snapped += 360.0f;
+                    if (std::abs(snapped - 360.0f) < 0.001f) snapped = 0.0f;
+                    m_before_after_angle = snapped;
+                }
+                m_last_mouse_client = { client_x, client_y };
+                return true;
+            }
+
+            float split_offset_px = m_before_after_split * (extent > 0.0f ? extent : 1.0f);
+            float dist_px = std::abs((px * nx + py * ny) - split_offset_px);
+            m_is_hovering_split = (dist_px / (scale_x > 0.0f ? scale_x : 1.0f) <= 14.0f);
+            if (m_is_hovering_split) {
+                SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+            }
+            m_last_mouse_client = { client_x, client_y };
+            return true;
+        }
 
         if (m_is_rotating) {
             float cur_render_x = static_cast<float>(client_x) * scale_x;
@@ -402,6 +518,11 @@ bool ViewportController::handle_input(
     }
 
     case WM_LBUTTONUP: {
+        if (m_is_dragging_split_pos) {
+            m_is_dragging_split_pos = false;
+            ReleaseCapture();
+            return true;
+        }
         if (m_is_pan_locked_attempt || m_is_rotate_locked_attempt) {
             m_is_pan_locked_attempt = false;
             m_is_rotate_locked_attempt = false;
@@ -418,6 +539,11 @@ bool ViewportController::handle_input(
     }
 
     case WM_RBUTTONUP: {
+        if (m_is_dragging_split_rot) {
+            m_is_dragging_split_rot = false;
+            ReleaseCapture();
+            return true;
+        }
         if (m_is_rotate_locked_attempt) {
             m_is_rotate_locked_attempt = false;
             ReleaseCapture();
@@ -432,8 +558,31 @@ bool ViewportController::handle_input(
     }
 
     case WM_LBUTTONDBLCLK: {
+        if (m_before_after_enabled) {
+            m_before_after_split = 0.0f;
+            return true;
+        }
         reset();
         return true;
+    }
+
+    case WM_RBUTTONDBLCLK: {
+        if (m_before_after_enabled) {
+            m_before_after_angle = 0.0f;
+            m_raw_split_angle = 0.0f;
+            return true;
+        }
+        break;
+    }
+
+    case WM_SETCURSOR: {
+        if (m_before_after_enabled && LOWORD(lParam) == HTCLIENT) {
+            if (m_is_dragging_split_pos || m_is_dragging_split_rot || m_is_hovering_split) {
+                SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+                return true;
+            }
+        }
+        break;
     }
 
     case WM_SYSKEYDOWN:
@@ -443,7 +592,12 @@ bool ViewportController::handle_input(
         bool shift_down_local = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         bool alt_down_local   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
 
-        if (matches_keybind(IpcAction::ResetRotation, wParam, ctrl_down, shift_down_local, alt_down_local)) {
+        if (matches_keybind(IpcAction::ToggleBeforeAfter, wParam, ctrl_down, shift_down_local, alt_down_local)) {
+            if (!was_down) {
+                toggle_before_after();
+            }
+            return true;
+        } else if (matches_keybind(IpcAction::ResetRotation, wParam, ctrl_down, shift_down_local, alt_down_local)) {
             reset_rotation();
             return true;
         } else if (matches_keybind(IpcAction::ResetZoomPan, wParam, ctrl_down, shift_down_local, alt_down_local)) {
@@ -538,6 +692,10 @@ void ViewportController::sync_to_block(SharedControlBlock *block) {
     if (m_lock_rotate) flags |= VIEW_FLAG_LOCK_ROT;
     if (m_lock_pan)    flags |= VIEW_FLAG_LOCK_PAN;
     if (m_is_pan_locked_attempt) flags |= VIEW_FLAG_PAN_LOCKED_ATTEMPT;
+    if (m_before_after_enabled)  flags |= VIEW_FLAG_BEFORE_AFTER;
+    if (m_is_dragging_split_pos) flags |= VIEW_FLAG_BEFORE_AFTER_DRAG;
+    block->before_after_angle = m_before_after_angle;
+    block->before_after_split = m_before_after_split;
     // preserve flags owned outside viewport controller like depth peek and text input
     uint32_t preserved = block->view_interaction_flags & (VIEW_FLAG_DEPTH_PEEK | VIEW_FLAG_TEXT_INPUT);
     block->view_interaction_flags = flags | preserved;
@@ -560,6 +718,17 @@ void ViewportController::sync_from_block(const SharedControlBlock *block) {
     m_lock_zoom   = (block->view_interaction_flags & VIEW_FLAG_LOCK_ZOOM) != 0;
     m_lock_rotate = (block->view_interaction_flags & VIEW_FLAG_LOCK_ROT) != 0;
     m_lock_pan    = (block->view_interaction_flags & VIEW_FLAG_LOCK_PAN) != 0;
+
+    bool ext_ba = (block->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER) != 0;
+    if (ext_ba != m_before_after_enabled) {
+        set_before_after_enabled(ext_ba);
+    }
+    if (!m_is_dragging_split_rot) {
+        m_before_after_angle = block->before_after_angle;
+    }
+    if (!m_is_dragging_split_pos) {
+        m_before_after_split = block->before_after_split;
+    }
 
     if (block->view_last_lock_ms > m_last_lock_ms) {
         m_last_lock_ms = block->view_last_lock_ms;

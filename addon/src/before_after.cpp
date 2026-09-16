@@ -1,8 +1,11 @@
 #include "before_after.h"
+#define ImTextureID ImU64
+#include <imgui.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <cmath>
+#include <algorithm>
 
 using Microsoft::WRL::ComPtr;
 
@@ -34,7 +37,12 @@ float4 ps(VSOutput i) : SV_Target {
     float2 pos = (i.UV - 0.5f) * g_Resolution;
     float d = dot(pos, g_Normal) - g_SplitOffsetPx;
     float4 col = (d < 0.0f) ? g_Before.Sample(g_Sampler, i.UV) : g_After.Sample(g_Sampler, i.UV);
-    return (abs(d) < g_LineHalfWPx) ? float4(1, 1, 1, 1) : col;
+    float ad = abs(d);
+    float line_a = saturate(1.25f - ad);
+    float shadow_a = saturate(2.25f - ad) * 0.55f;
+    col = lerp(col, float4(0.0f, 0.0f, 0.0f, 1.0f), shadow_a);
+    col = lerp(col, float4(1.0f, 1.0f, 1.0f, 1.0f), line_a);
+    return col;
 }
 )";
 
@@ -128,9 +136,92 @@ void before_after_toggle() {
     if (!s_state.enabled) s_state.is_dragging_pos = s_state.is_dragging_rot = false;
 }
 
+bool before_after_handle_input(bool bg_hovered, bool any_active, bool fine) {
+    if (!s_state.enabled) {
+        s_state.is_dragging_pos = s_state.is_dragging_rot = false;
+        return false;
+    }
+
+    ImGuiIO &io = ImGui::GetIO();
+    float w = io.DisplaySize.x, h = io.DisplaySize.y;
+    if (w <= 0.0f || h <= 0.0f) return false;
+
+    float cx = w * 0.5f, cy = h * 0.5f;
+    float px = io.MousePos.x - cx, py = io.MousePos.y - cy;
+    float rad = s_state.angle * (3.1415926535f / 180.0f);
+    float nx = std::cos(rad), ny = std::sin(rad);
+    float extent = std::abs(w * nx) + std::abs(h * ny);
+    float offset_px = s_state.split_offset * (extent > 0.0f ? extent : 1.0f);
+    float dist = std::abs((px * nx + py * ny) - offset_px);
+
+    bool near_divider = bg_hovered && (dist <= 10.0f);
+    if (near_divider || s_state.is_dragging_pos) {
+        SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+    }
+
+    if (io.MouseDown[0] && !s_state.is_dragging_rot) {
+        if (!s_state.is_dragging_pos && near_divider && !any_active && !io.KeyAlt) {
+            s_state.is_dragging_pos = true;
+        }
+        if (s_state.is_dragging_pos) {
+            float proj = px * nx + py * ny;
+            s_state.split_offset = std::clamp(proj / (extent > 0.0f ? extent : 1.0f), -0.5f, 0.5f);
+        }
+    } else {
+        s_state.is_dragging_pos = false;
+    }
+
+    static float s_last_drag_ang = 0.0f;
+    static float s_raw_angle = 0.0f;
+    bool rotate_btn = io.MouseDown[1] || (io.MouseDown[0] && io.KeyAlt);
+
+    if (rotate_btn && !s_state.is_dragging_pos) {
+        if (!s_state.is_dragging_rot && bg_hovered && !any_active) {
+            s_state.is_dragging_rot = true;
+            s_last_drag_ang = std::atan2(px, -py) * (180.0f / 3.14159265f);
+            if (s_last_drag_ang < 0.0f) s_last_drag_ang += 360.0f;
+            s_raw_angle = s_state.angle;
+        }
+        if (s_state.is_dragging_rot && (px * px + py * py > 16.0f)) {
+            float cur_ang = std::atan2(px, -py) * (180.0f / 3.14159265f);
+            if (cur_ang < 0.0f) cur_ang += 360.0f;
+            float delta = cur_ang - s_last_drag_ang;
+            if (delta > 180.0f) delta -= 360.0f;
+            else if (delta < -180.0f) delta += 360.0f;
+            s_last_drag_ang = cur_ang;
+            if (fine) delta *= 0.25f;
+            s_raw_angle += delta;
+            s_raw_angle = std::fmod(s_raw_angle, 360.0f);
+            if (s_raw_angle < 0.0f) s_raw_angle += 360.0f;
+
+            float snapped = s_raw_angle;
+            if (!fine) {
+                constexpr float kSnap = 45.0f, kRadius = 4.0f;
+                float r = std::fmod(s_raw_angle + 0.5f * kSnap, kSnap) - 0.5f * kSnap;
+                if (std::abs(r) < kRadius) snapped = s_raw_angle - r;
+            }
+            s_state.angle = snapped;
+        }
+    } else {
+        s_state.is_dragging_rot = false;
+    }
+
+    return s_state.is_dragging_pos || s_state.is_dragging_rot;
+}
+
 void before_after_capture_pre(SharedControlBlock *b, reshade::api::effect_runtime *rt,
                               reshade::api::command_list *cmd, reshade::api::resource_view rtv) {
     g_before_valid = false;
+    if (b) {
+        if (!s_state.is_dragging_pos && !s_state.is_dragging_rot) {
+            s_state.enabled = (b->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER) != 0;
+            s_state.angle = b->before_after_angle;
+            s_state.split_offset = b->before_after_split;
+        } else {
+            b->before_after_angle = s_state.angle;
+            b->before_after_split = s_state.split_offset;
+        }
+    }
     if (!s_state.enabled || (b && b->export_state != ExportState::Idle)) return;
     ID3D11Device *dev; ID3D11DeviceContext *ctx; ID3D11Resource *bb;
     if (!get_d3d(rt, cmd, rtv, dev, ctx, bb) || !ensure_textures(dev, bb)) return;
@@ -140,6 +231,16 @@ void before_after_capture_pre(SharedControlBlock *b, reshade::api::effect_runtim
 
 void before_after_composite(SharedControlBlock *b, reshade::api::effect_runtime *rt,
                             reshade::api::command_list *cmd, reshade::api::resource_view rtv) {
+    if (b) {
+        if (!s_state.is_dragging_pos && !s_state.is_dragging_rot) {
+            s_state.enabled = (b->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER) != 0;
+            s_state.angle = b->before_after_angle;
+            s_state.split_offset = b->before_after_split;
+        } else {
+            b->before_after_angle = s_state.angle;
+            b->before_after_split = s_state.split_offset;
+        }
+    }
     if (!g_before_valid || !s_state.enabled || (b && b->export_state != ExportState::Idle)) return;
     g_before_valid = false;
 

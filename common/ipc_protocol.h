@@ -3,7 +3,7 @@
 #include <cstdint>
 
 static constexpr uint32_t kIpcMagic   = 0x53484C56; // 'SHLV'
-static constexpr uint32_t kIpcVersion = 16;
+static constexpr uint32_t kIpcVersion = 17;
 static constexpr uint32_t kMaxPathW   = 512;
 
 enum class IpcAction : uint32_t {
@@ -124,6 +124,8 @@ static constexpr uint32_t VIEW_FLAG_FINE       = (1 << 6);
 static constexpr uint32_t VIEW_FLAG_PAN_LOCKED_ATTEMPT = (1 << 7);
 static constexpr uint32_t VIEW_FLAG_DEPTH_PEEK        = (1 << 8);
 static constexpr uint32_t VIEW_FLAG_TEXT_INPUT         = (1 << 9); // text input active in reshade overlay
+static constexpr uint32_t VIEW_FLAG_BEFORE_AFTER       = (1 << 10); // before/after split comparison active
+static constexpr uint32_t VIEW_FLAG_BEFORE_AFTER_DRAG  = (1 << 11); // actively dragging divider line
 
 struct alignas(64) SharedControlBlock {
     uint32_t magic;
@@ -193,6 +195,9 @@ struct alignas(64) SharedControlBlock {
     uint32_t view_image_height;          // active image native height
     volatile uint32_t view_transform_version; // incremented whenever transform changes
     uint32_t view_interaction_flags;     // VIEW_FLAG_*
+    float    before_after_angle;         // separator angle in degrees (0 = vertical L/R, 90 = horizontal T/B)
+    float    before_after_split;         // separator split offset [-0.5..0.5] along normal
+    uint32_t pad_ba;                     // 8-byte alignment pad for uint64_t below
 
     // per-gesture idle timestamps, host <-> addon, same process so GetTickCount64
     // stays consistent on both sides. each HUD fades on its own timer so a zoom

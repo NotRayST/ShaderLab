@@ -402,8 +402,8 @@ void on_reshade_finish_effects(
     }
 
     if (block->export_state == ExportState::Idle) {
-        composite_hud(block, runtime, cmd_list, rtv);
         before_after_composite(block, runtime, cmd_list, rtv);
+        composite_hud(block, runtime, cmd_list, rtv);
     }
 
     if (block->export_state != ExportState::Capturing) {
