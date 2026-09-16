@@ -6,6 +6,7 @@
 #include "capture.h"
 #include "job_queue.h"
 #include "hud_composite.h"
+#include "before_after.h"
 #include "undo_history.h"
 
 extern "C" __declspec(dllexport) const char *NAME = "ShaderLab";
@@ -23,6 +24,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(&on_reshade_reloaded_effects);
         reshade::register_event<reshade::addon_event::reshade_finish_effects>(&on_reshade_finish_effects);
         reshade::register_event<reshade::addon_event::destroy_device>(&on_hud_destroy_device);
+        reshade::register_event<reshade::addon_event::destroy_device>(&on_before_after_destroy_device);
         reshade::register_event<reshade::addon_event::reshade_present>(&on_reshade_present);
         reshade::register_overlay("ShaderLab Helper", &on_overlay);
         undo_history::init();
@@ -31,6 +33,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         undo_history::shutdown();
         reshade::unregister_overlay("ShaderLab Helper", &on_overlay);
         reshade::unregister_event<reshade::addon_event::reshade_present>(&on_reshade_present);
+        reshade::unregister_event<reshade::addon_event::destroy_device>(&on_before_after_destroy_device);
         reshade::unregister_event<reshade::addon_event::destroy_device>(&on_hud_destroy_device);
         reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(&on_reshade_finish_effects);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(&on_reshade_reloaded_effects);

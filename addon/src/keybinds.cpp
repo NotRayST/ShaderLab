@@ -37,6 +37,7 @@ Binding defaults[] = {
     { ImGuiKey_S,             true,  true,  false }, // SaveProjectAs (Ctrl+Shift+S)
     { ImGuiKey_E,             true,  false, false }, // ExportImage (Ctrl+E)
     { ImGuiKey_E,             true,  true,  false }, // ExportImageAs (Ctrl+Shift+E)
+    { ImGuiKey_B,             false, false, false }, // ToggleBeforeAfter (B)
 };
 
 Binding current[static_cast<int>(keybinds::Action::Count)];
@@ -191,6 +192,7 @@ const char *name(Action action)
     case Action::SaveProjectAs: return "Save Project As...";
     case Action::ExportImage: return "Export Image";
     case Action::ExportImageAs: return "Export Image As...";
+    case Action::ToggleBeforeAfter: return "Before / After Split";
     default: return "?";
     }
 }

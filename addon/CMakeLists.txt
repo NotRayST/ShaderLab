@@ -13,6 +13,8 @@ set(ADDON_SOURCES
     src/capture.cpp
     src/hud_composite.h
     src/hud_composite.cpp
+    src/before_after.h
+    src/before_after.cpp
     src/undo_history.h
     src/undo_history.cpp
     src/keybinds.h

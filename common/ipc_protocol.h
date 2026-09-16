@@ -23,7 +23,8 @@ enum class IpcAction : uint32_t {
     SaveProjectAs    = 13,
     ExportImage      = 14,
     ExportImageAs    = 15,
-    Count            = 16
+    ToggleBeforeAfter = 16,
+    Count            = 17
 };
 
 enum class IpcCmd : uint32_t {

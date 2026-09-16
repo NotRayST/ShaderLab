@@ -21,6 +21,7 @@ static void init_default_keybinds(IpcKeybind *kb) {
     kb[static_cast<uint32_t>(IpcAction::SaveProjectAs)] = { 'S', 1, 1, 0, 0 };
     kb[static_cast<uint32_t>(IpcAction::ExportImage)]   = { 'E', 1, 0, 0, 0 };
     kb[static_cast<uint32_t>(IpcAction::ExportImageAs)] = { 'E', 1, 1, 0, 0 };
+    kb[static_cast<uint32_t>(IpcAction::ToggleBeforeAfter)] = { 'B', 0, 0, 0, 0 };
 }
 
 bool ViewportController::matches_keybind(IpcAction action, WPARAM vk, bool ctrl, bool shift, bool alt) const {
