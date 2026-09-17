@@ -1,4 +1,8 @@
 #pragma once
+#ifndef ImTextureID
+#define ImTextureID ImU64
+#endif
+#include <imgui.h>
 #include <reshade.hpp>
 #include "../../common/ipc_protocol.h"
 

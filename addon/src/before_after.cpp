@@ -1,6 +1,8 @@
-#include "before_after.h"
+#ifndef ImTextureID
 #define ImTextureID ImU64
+#endif
 #include <imgui.h>
+#include "before_after.h"
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
