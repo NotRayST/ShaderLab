@@ -60,6 +60,4 @@ checkpoints/
 common/*.pt
 common/*.pth
 common/*.onnx
-/tools/lama/__pycache__
-/tools/depth_anything_v2/dinov2_layers/__pycache__
-/tools/depth_anything_v2/util/__pycache__
+__pycache__/

@@ -37,6 +37,10 @@ jobs:
           if (Test-Path "tools\depth_anything_v2") {
             Copy-Item "tools\depth_anything_v2" "dist\tools\depth_anything_v2" -Recurse
           }
+          if (Test-Path "tools\lama\run_lama.py") {
+            New-Item -ItemType Directory -Path "dist\tools\lama" -Force
+            Copy-Item "tools\lama\run_lama.py" "dist\tools\lama\"
+          }
           Compress-Archive -Path "dist\*" -DestinationPath "ShaderLab-nightly.zip"
 
       - name: Publish Nightly Release
