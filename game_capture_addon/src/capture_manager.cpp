@@ -456,15 +456,6 @@ void CaptureManager::on_reshade_finish_effects(
     if (!runtime) return;
 
     load_notice_state(runtime);
-
-    if (!m_notice_dismissed && !m_overlay_opened_once) {
-        static uint32_t s_frame_delay = 0;
-        s_frame_delay++;
-        if (s_frame_delay > 90) { // wait ~1.5s after game loads
-            m_overlay_opened_once = true;
-            runtime->open_overlay(true, reshade::api::input_source::keyboard);
-        }
-    }
 }
 
 void CaptureManager::set_enabled(reshade::api::effect_runtime* runtime, bool enabled) {
@@ -473,6 +464,8 @@ void CaptureManager::set_enabled(reshade::api::effect_runtime* runtime, bool ena
         reshade::set_config_value<bool>(runtime, "ShaderLabCapture", "Enabled", m_enabled);
     }
 }
+
+static std::wstring find_shaderlab_executable();
 
 void CaptureManager::on_reshade_screenshot(reshade::api::effect_runtime* runtime, const char* path) {
     if (!m_enabled) {
@@ -485,13 +478,19 @@ void CaptureManager::on_reshade_screenshot(reshade::api::effect_runtime* runtime
     m_last_saved_png_path = path;
 
     embed_depth_in_png(runtime, path);
+
+    if (!m_notice_dismissed) {
+        m_toast_exe = find_shaderlab_executable();
+        m_notice_open = true;
+        m_toast_start = std::chrono::steady_clock::now();
+        runtime->open_overlay(true, reshade::api::input_source::keyboard);
+    }
 }
 
 void CaptureManager::load_notice_state(reshade::api::effect_runtime* runtime) {
     if (m_notice_checked) return;
     m_notice_checked = true;
     reshade::get_config_value<bool>(runtime, "ShaderLabCapture", "NoticeDismissed", m_notice_dismissed);
-    m_notice_open = !m_notice_dismissed;
     reshade::get_config_value<bool>(runtime, "ShaderLabCapture", "Enabled", m_enabled);
     if (!reshade::get_config_value<int>(runtime, "ShaderLabCapture", "BitDepth", m_depth_bit_depth)) {
         bool export_16bit = true;
@@ -515,35 +514,48 @@ void CaptureManager::on_reshade_overlay_frame(reshade::api::effect_runtime* runt
     load_notice_state(runtime);
     if (!m_notice_open) return;
 
-    // shown once, save it on first draw, so close counts as seen
-    if (!m_notice_dismissed) {
-        m_notice_dismissed = true;
-        reshade::set_config_value<bool>(runtime, "ShaderLabCapture", "NoticeDismissed", true);
+    constexpr auto kToastDuration = std::chrono::seconds(10);
+    if (std::chrono::steady_clock::now() - m_toast_start > kToastDuration ||
+        m_notice_dismissed) {
+        m_notice_open = false;
+        return;
     }
 
     ImGuiIO& io = ImGui::GetIO();
-    ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2((std::min)(ImGui::GetFontSize() * 32.0f, io.DisplaySize.x - 40.0f), 0.0f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.08f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.9f);
 
     bool open = true;
-    if (ImGui::Begin("ShaderLab Capture - Depth Data##FirstRunNotice", &open,
-                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextWrapped(
-            "Screenshots taken with this add-on embed full 3D scene depth data. "
-            "To view, relight, or edit it, you need ShaderLab, a free image editor using ReShade shaders.\n\n"
-            "Even without it, your screenshots still open normally anywhere, they just have an extra few MBs."
-        );
-        ImGui::Spacing();
+    if (ImGui::Begin("##CaptureSavedToast", &open,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoFocusOnAppearing)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.9f, 0.4f, 1.0f));
+        ImGui::Text("Capture Saved!");
+        ImGui::PopStyleColor();
 
-        if (ImGui::Button("Download ShaderLab (.zip)")) {
-            ShellExecuteW(nullptr, L"open", L"https://github.com/NotRayST/ShaderLab/releases/latest/download/ShaderLab_Windows.zip", nullptr, nullptr, SW_SHOW);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 100.0f);
+        if (m_toast_exe.empty()) {
+            ImGui::Text("ShaderLab.exe not detected.");
+            ImGui::Spacing();
+            if (ImGui::Button("Download ShaderLab Editor")) {
+                ShellExecuteW(nullptr, L"open", L"https://github.com/NotRayST/ShaderLab/releases/latest/download/ShaderLab_Windows.zip", nullptr, nullptr, SW_SHOW);
+                open = false;
+            }
+            ImGui::SameLine();
+        } else {
+            ImGui::Text("Open the image in ShaderLab?");
+            ImGui::Spacing();
+            if (ImGui::Button("Open in ShaderLab")) {
+                std::wstring arg = L"\"" + fs::path(m_last_saved_png_path).wstring() + L"\"";
+                ShellExecuteW(nullptr, L"open", m_toast_exe.c_str(), arg.c_str(), nullptr, SW_SHOW);
+                open = false;
+            }
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Dismiss")) {
             open = false;
         }
-        ImGui::SameLine();
-        if (ImGui::Button("ShaderLab GitHub")) {
-            ShellExecuteW(nullptr, L"open", L"https://github.com/NotRayST/ShaderLab#readme", nullptr, nullptr, SW_SHOW);
-        }
+        ImGui::PopStyleVar();
     }
     ImGui::End();  // must run even when Begin() returns false
 
@@ -688,6 +700,14 @@ void CaptureManager::on_draw_overlay(reshade::api::effect_runtime* runtime) {
     }
 
     ImGui::Spacing();
+    bool dont_show_prompt = m_notice_dismissed;
+    if (ImGui::Checkbox("Don't show capture prompt", &dont_show_prompt)) {
+        m_notice_dismissed = dont_show_prompt;
+        reshade::set_config_value<bool>(runtime, "ShaderLabCapture", "NoticeDismissed", dont_show_prompt);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Banner shown after each screenshot.");
+
+    ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
@@ -722,6 +742,22 @@ void CaptureManager::on_draw_overlay(reshade::api::effect_runtime* runtime) {
     ImGui::Separator();
     ImGui::Spacing();
 
+    struct Link { const char* label; const wchar_t* url; const char* tip; };
+    static const Link links[] = {
+        { "GitHub",         L"https://github.com/NotRayST/ShaderLab", "github.com/NotRayST/ShaderLab" },
+        { "Patreon",        L"https://www.patreon.com/cw/RayST",      "patreon.com/cw/RayST" },
+        { "ReShade Discord", L"https://discord.gg/PrwndfH",           "discord.gg/PrwndfH" },
+    };
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 100.0f);
+    for (int i = 0; i < IM_ARRAYSIZE(links); ++i) {
+        if (i) ImGui::SameLine();
+        if (ImGui::Button(links[i].label))
+            ShellExecuteW(nullptr, L"open", links[i].url, nullptr, nullptr, SW_SHOW);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", links[i].tip);
+    }
+    ImGui::PopStyleVar();
+
+    ImGui::Spacing();
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextDisabled("ShaderLab Capture v1.2.2  -  by NotRayST");
     ImGui::PopTextWrapPos();

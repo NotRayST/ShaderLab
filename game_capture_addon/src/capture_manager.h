@@ -63,13 +63,10 @@ private:
     std::string m_last_saved_png_path;
     std::string m_last_saved_sidecar_path;
 
-    // first-run ShaderLab notice state
-    bool m_notice_checked{ false };
-    bool m_notice_dismissed{ false };  // persisted: notice was already shown once
-    bool m_notice_open{ false };       // notice window visible this session
-    bool m_overlay_opened_once{ false };
-
     // post-capture prompt state
-    bool m_capture_notice_checked{ false };
-    bool m_capture_notice_dismissed{ false };
+    bool m_notice_checked{ false };
+    bool m_notice_dismissed{ false };
+    bool m_notice_open{ false };       // notice window visible this session
+    std::wstring m_toast_exe;
+    std::chrono::steady_clock::time_point m_toast_start{};
 };
