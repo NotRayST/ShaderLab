@@ -1,5 +1,7 @@
 #include "depth_manager.h"
+#include "erase_tool.h"
 #include "job_queue.h"
+#include "undo_history.h"
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -27,7 +29,6 @@ public:
     DownloadCallback(std::function<void(uint64_t, uint64_t)> cb, std::function<bool()> cancel_check)
         : m_cb(std::move(cb)), m_cancel(std::move(cancel_check)), m_ref(1) {}
 
-    // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
         if (!ppvObject) return E_POINTER;
         if (riid == IID_IUnknown || riid == IID_IBindStatusCallback) {
@@ -41,11 +42,13 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++m_ref; }
     ULONG STDMETHODCALLTYPE Release() override {
         ULONG res = --m_ref;
-        if (res == 0) delete this;
+        if (res == 0) {
+            delete this;
+            return 0;
+        }
         return res;
     }
 
-    // IBindStatusCallback
     HRESULT STDMETHODCALLTYPE OnStartBinding(DWORD, IBinding *) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetPriority(LONG *) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE OnLowResource(DWORD) override { return S_OK; }
@@ -79,17 +82,145 @@ private:
 using str_utils::wide_to_utf8;
 using str_utils::utf8_to_wide;
 
+static bool test_python_interpreter(const std::wstring &py_path) {
+    if (py_path.empty()) return false;
+    std::wstring cmd = L"\"" + py_path + L"\" -c \"import sys; sys.exit(0 if sys.version_info >= (3, 8) and sys.maxsize > 2**32 else 1)\"";
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(L'\0');
+    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+    DWORD wait_res = WaitForSingleObject(pi.hProcess, 3500);
+    DWORD code = 1;
+    if (wait_res == WAIT_OBJECT_0) {
+        GetExitCodeProcess(pi.hProcess, &code);
+    } else {
+        TerminateProcess(pi.hProcess, 1);
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (code == 0 && wait_res == WAIT_OBJECT_0);
+}
+
+static bool download_file_dynamic(
+    const std::string &url,
+    const fs::path &temp_file,
+    const fs::path &dest_file,
+    uint64_t expected_size,
+    const std::function<void(uint64_t received, uint64_t total, float mb_s)> &progress_fn,
+    const std::function<bool()> &cancel_fn
+) {
+    std::error_code ec;
+    wchar_t curl_exe[MAX_PATH] = {};
+    bool has_curl = (SearchPathW(nullptr, L"curl.exe", nullptr, MAX_PATH, curl_exe, nullptr) > 0);
+    if (!has_curl && fs::exists(L"C:\\Windows\\System32\\curl.exe", ec)) {
+        wcscpy_s(curl_exe, L"C:\\Windows\\System32\\curl.exe");
+        has_curl = true;
+    }
+
+    if (has_curl) {
+        std::wstring curl_cmd = L"\"" + std::wstring(curl_exe) + L"\" -L --fail --retry 2 --connect-timeout 15 -C - -s -o \""
+                              + temp_file.wstring() + L"\" \"" + utf8_to_wide(url.c_str()) + L"\"";
+
+        STARTUPINFOW si = { sizeof(si) };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi = {};
+        std::vector<wchar_t> cmd_buf(curl_cmd.begin(), curl_cmd.end());
+        cmd_buf.push_back(L'\0');
+
+        if (CreateProcessW(nullptr, cmd_buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            auto last_time = std::chrono::steady_clock::now();
+            uint64_t last_sz = (fs::exists(temp_file, ec) && !ec) ? fs::file_size(temp_file, ec) : 0;
+            float mb_s = 0.0f;
+
+            while (true) {
+                if (cancel_fn && cancel_fn()) {
+                    TerminateProcess(pi.hProcess, 1);
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                    return false;
+                }
+
+                DWORD wait_res = WaitForSingleObject(pi.hProcess, 150);
+                uint64_t cur_sz = (fs::exists(temp_file, ec) && !ec) ? fs::file_size(temp_file, ec) : 0;
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time).count();
+
+                if (elapsed_ms >= 500) {
+                    if (cur_sz > last_sz) {
+                        mb_s = static_cast<float>(cur_sz - last_sz) / (1024.0f * 1024.0f) / (elapsed_ms / 1000.0f);
+                    }
+                    last_time = now;
+                    last_sz = cur_sz;
+                }
+
+                if (progress_fn) {
+                    progress_fn(cur_sz, expected_size, mb_s);
+                }
+
+                if (wait_res != WAIT_TIMEOUT) {
+                    break;
+                }
+            }
+
+            DWORD code = 1;
+            GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+
+            uint64_t final_sz = (fs::exists(temp_file, ec) && !ec) ? fs::file_size(temp_file, ec) : 0;
+            uint64_t min_acceptable = static_cast<uint64_t>(expected_size * 0.95);
+            if (code == 0 && final_sz >= min_acceptable) {
+                fs::rename(temp_file, dest_file, ec);
+                if (ec) {
+                    fs::copy_file(temp_file, dest_file, fs::copy_options::overwrite_existing, ec);
+                    fs::remove(temp_file, ec);
+                }
+                return true;
+            }
+        }
+    }
+
+    fs::remove(temp_file, ec);
+    auto *cb = new DownloadCallback(
+        [&](uint64_t cur, uint64_t tot) {
+            if (progress_fn) progress_fn(cur, tot ? tot : expected_size, 0.0f);
+        },
+        cancel_fn
+    );
+    std::wstring url_w = utf8_to_wide(url.c_str());
+    HRESULT hr = URLDownloadToFileW(nullptr, url_w.c_str(), temp_file.wstring().c_str(), 0, cb);
+    cb->Release();
+
+    uint64_t min_acc = static_cast<uint64_t>(expected_size * 0.95);
+    if (SUCCEEDED(hr) && fs::exists(temp_file, ec) && fs::file_size(temp_file, ec) >= min_acc) {
+        fs::rename(temp_file, dest_file, ec);
+        if (ec) {
+            fs::copy_file(temp_file, dest_file, fs::copy_options::overwrite_existing, ec);
+            fs::remove(temp_file, ec);
+        }
+        return true;
+    }
+    fs::remove(temp_file, ec);
+    return false;
+}
+
 DepthManager &DepthManager::get() {
     static DepthManager instance;
     return instance;
 }
 
-DepthManager::DepthManager() {
-}
+DepthManager::DepthManager() = default;
 
 DepthManager::~DepthManager() {
-    if (m_ai_worker.joinable()) {
-        m_ai_worker.join();
+    stop_lama_worker();
+    if (m_worker.joinable()) {
+        m_worker.join();
     }
     if (m_download_worker.joinable()) {
         m_download_worker.join();
@@ -141,14 +272,14 @@ void DepthManager::clear_logs() {
     m_logs.clear();
 }
 
-std::string DepthManager::get_ai_status() const {
+std::string DepthManager::get_status() const {
     std::lock_guard<std::mutex> lock(m_status_mutex);
-    return m_ai_status;
+    return m_status_text;
 }
 
-std::string DepthManager::get_ai_last_error() const {
+std::string DepthManager::get_last_error() const {
     std::lock_guard<std::mutex> lock(m_status_mutex);
-    return m_ai_last_error;
+    return m_last_error;
 }
 
 uint64_t DepthManager::get_expected_model_size(const std::string &encoder) const {
@@ -271,10 +402,10 @@ bool DepthManager::trigger_model_download(const std::string &encoder) {
     m_downloading = true;
     m_download_received = 0;
     m_download_total = 0;
-    m_download_status_text = "Connecting to Hugging Face...";
+    m_download_status_text = "Connecting to download source...";
     m_download_error.clear();
 
-    log(0, "Initiating model download for encoder: " + encoder);
+    log(0, "Initiating dynamic model download for encoder: " + encoder);
 
     m_download_worker = std::thread([this, encoder]() {
         try {
@@ -286,21 +417,21 @@ bool DepthManager::trigger_model_download(const std::string &encoder) {
                     "https://hf-mirror.com/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth",
                     "https://modelscope.cn/api/v1/models/DepthAnything/Depth-Anything-V2-Large/repo?Revision=master&FilePath=depth_anything_v2_vitl.pth"
                 };
-                expected_size = 1341395338;
+                expected_size = 1341395338ULL;
             } else if (encoder == "vitb") {
                 urls = {
                     "https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.pth",
                     "https://hf-mirror.com/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.pth",
                     "https://modelscope.cn/api/v1/models/DepthAnything/Depth-Anything-V2-Base/repo?Revision=master&FilePath=depth_anything_v2_vitb.pth"
                 };
-                expected_size = 389961218;
+                expected_size = 389961218ULL;
             } else {
                 urls = {
                     "https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth",
                     "https://hf-mirror.com/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth",
                     "https://modelscope.cn/api/v1/models/DepthAnything/Depth-Anything-V2-Small/repo?Revision=master&FilePath=depth_anything_v2_vits.pth"
                 };
-                expected_size = 99218434;
+                expected_size = 99218434ULL;
             }
 
             std::vector<fs::path> search_dirs = get_base_search_dirs();
@@ -325,71 +456,134 @@ bool DepthManager::trigger_model_download(const std::string &encoder) {
 
             bool success = false;
             for (size_t url_idx = 0; url_idx < urls.size(); ++url_idx) {
+                if (!m_downloading.load()) break;
                 const std::string &url = urls[url_idx];
-                std::wstring url_w = utf8_to_wide(url.c_str());
-
                 log(0, "Connecting to download source (" + std::to_string(url_idx + 1) + "/" + std::to_string(urls.size()) + ") for " + model_fname + "...");
                 m_download_total = expected_size;
                 m_download_received = 0;
 
-                auto *cb = new DownloadCallback(
-                    [this, expected_size](uint64_t received, uint64_t total) {
-                        if (total == 0) total = expected_size;
-                        m_download_total = total;
-                        m_download_received = received;
-                        float mb_read = static_cast<float>(received) / (1024.0f * 1024.0f);
-                        float mb_tot = static_cast<float>(total) / (1024.0f * 1024.0f);
-                        int pct = (total > 0) ? static_cast<int>((received * 100) / total) : 0;
-                        char status_buf[128];
-                        snprintf(status_buf, sizeof(status_buf), "%.1f MB / %.1f MB (%d%%)", mb_read, mb_tot, pct);
-                        std::lock_guard<std::mutex> lock(m_status_mutex);
-                        m_download_status_text = status_buf;
-                    },
-                    [this]() { return !m_downloading.load(); }
-                );
-
-                fs::remove(temp_file, ec);
-                HRESULT hr = URLDownloadToFileW(nullptr, url_w.c_str(), temp_file.wstring().c_str(), 0, cb);
-                cb->Release();
-
-                uint64_t min_acceptable = static_cast<uint64_t>(expected_size * 0.95);
-                if (SUCCEEDED(hr) && fs::exists(temp_file, ec) && fs::file_size(temp_file, ec) >= min_acceptable) {
-                    fs::rename(temp_file, dest_file, ec);
-                    if (ec) {
-                        fs::copy_file(temp_file, dest_file, fs::copy_options::overwrite_existing, ec);
-                        fs::remove(temp_file, ec);
+                auto progress_fn = [this, expected_size](uint64_t received, uint64_t total, float mb_s) {
+                    if (total == 0) total = expected_size;
+                    m_download_total = total;
+                    m_download_received = received;
+                    float mb_read = static_cast<float>(received) / (1024.0f * 1024.0f);
+                    float mb_tot = static_cast<float>(total) / (1024.0f * 1024.0f);
+                    int pct = (total > 0) ? static_cast<int>((received * 100) / total) : 0;
+                    char status_buf[128];
+                    if (mb_s > 0.05f) {
+                        snprintf(status_buf, sizeof(status_buf), "%.1f / %.1f MB (%d%%) • %.1f MB/s", mb_read, mb_tot, pct, mb_s);
+                    } else {
+                        snprintf(status_buf, sizeof(status_buf), "%.1f / %.1f MB (%d%%)", mb_read, mb_tot, pct);
                     }
-                    log(3, "Model weights downloaded successfully: " + model_fname);
                     std::lock_guard<std::mutex> lock(m_status_mutex);
-                    m_download_status_text = "Download complete!";
-                    m_download_error.clear();
+                    m_download_status_text = status_buf;
+                };
+
+                auto cancel_fn = [this]() { return !m_downloading.load(); };
+
+                if (download_file_dynamic(url, temp_file, dest_file, expected_size, progress_fn, cancel_fn)) {
+                    log(3, "Model weights downloaded successfully: " + model_fname);
+                    {
+                        std::lock_guard<std::mutex> lock(m_status_mutex);
+                        m_download_status_text = "Download complete!";
+                        m_download_error.clear();
+                    }
                     success = true;
                     break;
                 } else {
-                    log(1, "Source " + std::to_string(url_idx + 1) + " failed or returned incomplete file. Trying next mirror...");
-                    fs::remove(temp_file, ec);
+                    log(1, "Source " + std::to_string(url_idx + 1) + " failed. Trying next mirror...");
                 }
             }
 
-            if (!success) {
+            if (!success && m_downloading.load()) {
                 std::lock_guard<std::mutex> lock(m_status_mutex);
                 m_download_error = "All download sources failed for " + model_fname;
                 log(2, m_download_error);
+                std::lock_guard<std::mutex> plock(m_pending_mutex);
+                m_pending_estimate.active = false;
             }
         } catch (const std::exception &e) {
             std::lock_guard<std::mutex> lock(m_status_mutex);
             m_download_error = std::string("Download error: ") + e.what();
             log(2, m_download_error);
+            std::lock_guard<std::mutex> plock(m_pending_mutex);
+            m_pending_estimate.active = false;
         } catch (...) {
             std::lock_guard<std::mutex> lock(m_status_mutex);
             m_download_error = "Download error: unexpected exception";
             log(2, m_download_error);
+            std::lock_guard<std::mutex> plock(m_pending_mutex);
+            m_pending_estimate.active = false;
         }
+
         invalidate_model_cache();
         m_downloading = false;
+
+        // Auto-chain into depth estimation if requested
+        PendingDepthEstimate req;
+        {
+            std::lock_guard<std::mutex> plock(m_pending_mutex);
+            if (m_pending_estimate.active) {
+                req = m_pending_estimate;
+                m_pending_estimate.active = false;
+            }
+        }
+        if (req.active) {
+            log(0, "Auto-starting depth estimation following successful model download...");
+            trigger_depth_estimate(
+                req.base_image_path,
+                req.far_plane,
+                req.embed_png,
+                req.model_encoder,
+                req.input_size,
+                req.gamma,
+                req.near_threshold,
+                req.sky_threshold,
+                req.edge_refine,
+                req.invert,
+                req.smooth_normals,
+                req.smooth_radius,
+                req.smooth_eps
+            );
+        }
     });
 
     return true;
+}
+
+bool DepthManager::trigger_model_download_and_estimate(
+    const std::wstring &base_image_path,
+    float far_plane,
+    bool embed_png,
+    const std::string &model_encoder,
+    int input_size,
+    float gamma,
+    float near_threshold,
+    float sky_threshold,
+    bool edge_refine,
+    bool invert,
+    bool smooth_normals,
+    int smooth_radius,
+    float smooth_eps
+) {
+    {
+        std::lock_guard<std::mutex> plock(m_pending_mutex);
+        m_pending_estimate.active = true;
+        m_pending_estimate.base_image_path = base_image_path;
+        m_pending_estimate.far_plane = far_plane;
+        m_pending_estimate.embed_png = embed_png;
+        m_pending_estimate.model_encoder = model_encoder;
+        m_pending_estimate.input_size = input_size;
+        m_pending_estimate.gamma = gamma;
+        m_pending_estimate.near_threshold = near_threshold;
+        m_pending_estimate.sky_threshold = sky_threshold;
+        m_pending_estimate.edge_refine = edge_refine;
+        m_pending_estimate.invert = invert;
+        m_pending_estimate.smooth_normals = smooth_normals;
+        m_pending_estimate.smooth_radius = smooth_radius;
+        m_pending_estimate.smooth_eps = smooth_eps;
+    }
+    return trigger_model_download(model_encoder);
 }
 
 void DepthManager::invalidate_model_cache() {
@@ -397,6 +591,7 @@ void DepthManager::invalidate_model_cache() {
     m_cached_model_paths.clear();
     m_cached_script_path.clear();
     m_cached_python_path.clear();
+    m_deps_verified = false;
 }
 
 bool DepthManager::provision_portable_python(std::wstring &out_py_exe) {
@@ -429,7 +624,7 @@ bool DepthManager::provision_portable_python(std::wstring &out_py_exe) {
         log(0, "Auto-provisioning portable Python 3.11 embed environment into " + wide_to_utf8(py_dir.wstring().c_str()));
         {
             std::lock_guard<std::mutex> lock(m_status_mutex);
-            m_ai_status = "Downloading portable Python (~11MB)...";
+            m_status_text = "Downloading portable Python (~11MB)...";
         }
 
         // download python embed zip
@@ -439,15 +634,30 @@ bool DepthManager::provision_portable_python(std::wstring &out_py_exe) {
             L"https://npmmirror.com/mirrors/python/3.11.9/python-3.11.9-embed-amd64.zip"
         };
 
+        auto py_dl_cb = new DownloadCallback(
+            [this](uint64_t current, uint64_t total) {
+                if (total > 0) {
+                    float pct = static_cast<float>(current) / static_cast<float>(total) * 100.0f;
+                    std::lock_guard<std::mutex> lock(m_status_mutex);
+                    char buf[96];
+                    snprintf(buf, sizeof(buf), "Downloading portable Python: %.0f%% (~11MB)...", pct);
+                    m_status_text = buf;
+                }
+            },
+            nullptr
+        );
+        py_dl_cb->AddRef();
+
         bool dl_ok = false;
         for (const auto &u : py_urls) {
             fs::remove(zip_path, ec);
-            HRESULT hr = URLDownloadToFileW(nullptr, u.c_str(), zip_path.wstring().c_str(), 0, nullptr);
+            HRESULT hr = URLDownloadToFileW(nullptr, u.c_str(), zip_path.wstring().c_str(), 0, py_dl_cb);
             if (SUCCEEDED(hr) && fs::exists(zip_path, ec) && fs::file_size(zip_path, ec) > 5000000) {
                 dl_ok = true;
                 break;
             }
         }
+        py_dl_cb->Release();
 
         if (!dl_ok) {
             log(2, "Failed to download portable Python embed zip");
@@ -456,7 +666,7 @@ bool DepthManager::provision_portable_python(std::wstring &out_py_exe) {
 
         {
             std::lock_guard<std::mutex> lock(m_status_mutex);
-            m_ai_status = "Extracting portable Python...";
+            m_status_text = "Extracting portable Python...";
         }
 
         std::wstring extract_cmd = L"tar.exe -xf \"" + zip_path.wstring() + L"\" -C \"" + py_dir.wstring() + L"\"";
@@ -470,12 +680,16 @@ bool DepthManager::provision_portable_python(std::wstring &out_py_exe) {
 
         bool extracted = false;
         if (CreateProcessW(nullptr, cmd_buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-            WaitForSingleObject(pi.hProcess, 30000);
+            DWORD wait_res = WaitForSingleObject(pi.hProcess, 30000);
             DWORD exit_code = 1;
-            GetExitCodeProcess(pi.hProcess, &exit_code);
+            if (wait_res == WAIT_TIMEOUT) {
+                TerminateProcess(pi.hProcess, 1);
+            } else {
+                GetExitCodeProcess(pi.hProcess, &exit_code);
+            }
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
-            extracted = (exit_code == 0 && fs::exists(py_exe, ec));
+            extracted = (exit_code == 0 && wait_res == WAIT_OBJECT_0 && fs::exists(py_exe, ec));
         }
 
         fs::remove(zip_path, ec);
@@ -509,7 +723,7 @@ bool DepthManager::provision_portable_python(std::wstring &out_py_exe) {
         // download get-pip.py and bootstrap pip
         {
             std::lock_guard<std::mutex> lock(m_status_mutex);
-            m_ai_status = "Bootstrapping portable pip (~2MB)...";
+            m_status_text = "Bootstrapping portable pip (~2MB)...";
         }
 
         fs::path get_pip_path = py_dir / "get-pip.py";
@@ -518,15 +732,30 @@ bool DepthManager::provision_portable_python(std::wstring &out_py_exe) {
             L"https://raw.githubusercontent.com/pypa/get-pip/main/public/get-pip.py"
         };
 
+        auto pip_dl_cb = new DownloadCallback(
+            [this](uint64_t current, uint64_t total) {
+                if (total > 0) {
+                    float pct = static_cast<float>(current) / static_cast<float>(total) * 100.0f;
+                    std::lock_guard<std::mutex> lock(m_status_mutex);
+                    char buf[96];
+                    snprintf(buf, sizeof(buf), "Downloading get-pip.py: %.0f%% (~2MB)...", pct);
+                    m_status_text = buf;
+                }
+            },
+            nullptr
+        );
+        pip_dl_cb->AddRef();
+
         bool get_pip_ok = false;
         for (const auto &u : pip_urls) {
             fs::remove(get_pip_path, ec);
-            HRESULT hr = URLDownloadToFileW(nullptr, u.c_str(), get_pip_path.wstring().c_str(), 0, nullptr);
+            HRESULT hr = URLDownloadToFileW(nullptr, u.c_str(), get_pip_path.wstring().c_str(), 0, pip_dl_cb);
             if (SUCCEEDED(hr) && fs::exists(get_pip_path, ec) && fs::file_size(get_pip_path, ec) > 500000) {
                 get_pip_ok = true;
                 break;
             }
         }
+        pip_dl_cb->Release();
 
         if (get_pip_ok) {
             std::wstring pip_boot_cmd = L"\"" + py_exe.wstring() + L"\" \"" + get_pip_path.wstring() + L"\" --no-warn-script-location --no-setuptools --no-wheel";
@@ -539,7 +768,10 @@ bool DepthManager::provision_portable_python(std::wstring &out_py_exe) {
             pip_buf.push_back(L'\0');
 
             if (CreateProcessW(nullptr, pip_buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &pip_si, &pip_pi)) {
-                WaitForSingleObject(pip_pi.hProcess, 60000);
+                DWORD wait_res = WaitForSingleObject(pip_pi.hProcess, 60000);
+                if (wait_res == WAIT_TIMEOUT) {
+                    TerminateProcess(pip_pi.hProcess, 1);
+                }
                 CloseHandle(pip_pi.hProcess);
                 CloseHandle(pip_pi.hThread);
             }
@@ -578,6 +810,11 @@ std::wstring DepthManager::find_python_executable() const {
             return true;
         };
 
+        auto is_candidate_working = [&](const fs::path &p) -> bool {
+            if (!is_valid_python(p)) return false;
+            return test_python_interpreter(p.wstring());
+        };
+
         std::vector<fs::path> base_dirs = get_base_search_dirs();
         for (const auto &b : base_dirs) {
             fs::path cur = b;
@@ -592,7 +829,7 @@ std::wstring DepthManager::find_python_executable() const {
                     cur / ".venv" / "Scripts" / "python.exe"
                 };
                 for (const auto &p : local_candidates) {
-                    if (is_valid_python(p)) {
+                    if (is_candidate_working(p)) {
                         m_cached_python_path = p.wstring();
                         return m_cached_python_path;
                     }
@@ -604,13 +841,7 @@ std::wstring DepthManager::find_python_executable() const {
 
         wchar_t out_path[MAX_PATH] = {};
         if (SearchPathW(nullptr, L"python.exe", nullptr, MAX_PATH, out_path, nullptr) > 0) {
-            if (is_valid_python(out_path)) {
-                m_cached_python_path = out_path;
-                return m_cached_python_path;
-            }
-        }
-        if (SearchPathW(nullptr, L"py.exe", nullptr, MAX_PATH, out_path, nullptr) > 0) {
-            if (is_valid_python(out_path)) {
+            if (is_candidate_working(out_path)) {
                 m_cached_python_path = out_path;
                 return m_cached_python_path;
             }
@@ -621,11 +852,10 @@ std::wstring DepthManager::find_python_executable() const {
             L"C:\\Python313\\python.exe",
             L"C:\\Python312\\python.exe",
             L"C:\\Python311\\python.exe",
-            L"C:\\Python310\\python.exe",
-            L"C:\\Windows\\py.exe"
+            L"C:\\Python310\\python.exe"
         };
         for (const auto *p : common_paths) {
-            if (is_valid_python(p)) {
+            if (is_candidate_working(p)) {
                 m_cached_python_path = p;
                 return m_cached_python_path;
             }
@@ -641,7 +871,7 @@ std::wstring DepthManager::find_python_executable() const {
                 while (!root_ec && it != end_it) {
                     try {
                         fs::path exe = it->path() / "python.exe";
-                        if (is_valid_python(exe)) {
+                        if (is_candidate_working(exe)) {
                             m_cached_python_path = exe.wstring();
                             return m_cached_python_path;
                         }
@@ -663,7 +893,7 @@ std::wstring DepthManager::find_python_executable() const {
                 while (!pf_ec && it != end_it) {
                     try {
                         fs::path exe = it->path() / "python.exe";
-                        if (is_valid_python(exe)) {
+                        if (is_candidate_working(exe)) {
                             m_cached_python_path = exe.wstring();
                             return m_cached_python_path;
                         }
@@ -793,11 +1023,9 @@ bool DepthManager::attach_depth_from_image(
 
     log(0, "Attaching depth from image: " + wide_to_utf8(depth_image_path.c_str()));
 
-    // load depth image
     std::string depth_u8 = wide_to_utf8(depth_image_path.c_str());
     int dw = 0, dh = 0, dcomp = 0;
-    
-    // check if 16-bit
+
     bool is_16bit = stbi_is_16_bit(depth_u8.c_str()) != 0;
     std::vector<float> linear_floats;
 
@@ -899,7 +1127,7 @@ bool DepthManager::attach_depth_from_image(
     return true;
 }
 
-bool DepthManager::trigger_ai_depth(
+bool DepthManager::trigger_depth_estimate(
     const std::wstring &base_image_path,
     float far_plane,
     bool embed_png,
@@ -914,35 +1142,35 @@ bool DepthManager::trigger_ai_depth(
     int smooth_radius,
     float smooth_eps
 ) {
-    if (m_ai_running.load()) {
-        log(1, "AI generation already in progress...");
+    if (m_processing.load()) {
+        log(1, "Depth generation already in progress...");
         return false;
     }
 
     if (base_image_path.empty() || !fs::exists(base_image_path)) {
         std::lock_guard<std::mutex> lock(m_status_mutex);
-        m_ai_last_error = "Active image path is empty or does not exist: " + wide_to_utf8(base_image_path.c_str());
-        log(2, m_ai_last_error);
+        m_last_error = "Active image path is empty or does not exist: " + wide_to_utf8(base_image_path.c_str());
+        log(2, m_last_error);
         return false;
     }
 
-    if (m_ai_worker.joinable()) {
-        m_ai_worker.join();
+    if (m_worker.joinable()) {
+        m_worker.join();
     }
 
-    m_ai_running = true;
-    m_ai_progress.store(-1.0f);
+    m_processing = true;
+    m_progress.store(-1.0f);
     {
         std::lock_guard<std::mutex> lock(m_status_mutex);
-        m_ai_status = "Locating Python environment and neural model...";
-        m_ai_last_error = "";
+        m_status_text = "Locating Python environment and neural model...";
+        m_last_error = "";
     }
 
     log(0, "==================================================");
     log(0, "Starting Depth Anything V2 Machine Learning Depth Estimation");
     log(0, "Active Image: " + wide_to_utf8(base_image_path.c_str()));
 
-    m_ai_worker = std::thread([this, base_image_path, far_plane, embed_png, model_encoder, input_size, gamma, near_threshold, sky_threshold, edge_refine, invert, smooth_normals, smooth_radius, smooth_eps]() {
+    m_worker = std::thread([this, base_image_path, far_plane, embed_png, model_encoder, input_size, gamma, near_threshold, sky_threshold, edge_refine, invert, smooth_normals, smooth_radius, smooth_eps]() {
         try {
             std::wstring py_exe = find_python_executable();
             std::wstring script = find_script_path();
@@ -966,9 +1194,9 @@ bool DepthManager::trigger_ai_depth(
                     log(3, "Auto-provisioned portable Python successfully: " + wide_to_utf8(py_exe.c_str()));
                 } else {
                     std::lock_guard<std::mutex> lock(m_status_mutex);
-                    m_ai_last_error = "Could not locate or auto-download Python. Please check your internet connection or install Python 3.10+.";
-                    m_ai_running = false;
-                    log(2, m_ai_last_error);
+                    m_last_error = "Could not locate or auto-download Python. Please check your internet connection or install Python 3.10+.";
+                    m_processing = false;
+                    log(2, m_last_error);
                     return;
                 }
             }
@@ -976,18 +1204,18 @@ bool DepthManager::trigger_ai_depth(
             std::error_code script_ec;
             if (script.empty() || !fs::exists(script, script_ec) || script_ec) {
                 std::lock_guard<std::mutex> lock(m_status_mutex);
-                m_ai_last_error = "Inference script not found (run_depth_anything.py). Please check that the tools folder is present.";
-                m_ai_running = false;
-                log(2, m_ai_last_error);
+                m_last_error = "Inference script not found (run_depth_anything.py). Please check that the tools folder is present.";
+                m_processing = false;
+                log(2, m_last_error);
                 return;
             }
 
             bool model_valid = !model.empty() && verify_model_file(model, model_encoder);
             if (!model_valid) {
                 std::lock_guard<std::mutex> lock(m_status_mutex);
-                m_ai_last_error = "Model weights for '" + model_encoder + "' not found or incomplete. Please download the model checkpoint.";
-                m_ai_running = false;
-                log(2, m_ai_last_error);
+                m_last_error = "Model weights for '" + model_encoder + "' not found or incomplete. Please download the model checkpoint.";
+                m_processing = false;
+                log(2, m_last_error);
                 return;
             }
 
@@ -1029,7 +1257,7 @@ bool DepthManager::trigger_ai_depth(
                 if (has_torch && has_cv2 && has_numpy && has_scipy) {
                     deps_ready = true;
                     m_deps_verified = true;
-                    log(0, "Verified local AI dependencies in " + wide_to_utf8(local_site_p.wstring().c_str()) + " (torch, cv2, numpy, scipy present)");
+                    log(0, "Verified local model dependencies in " + wide_to_utf8(local_site_p.wstring().c_str()) + " (torch, cv2, numpy, scipy present)");
                 }
             }
 
@@ -1055,7 +1283,7 @@ bool DepthManager::trigger_ai_depth(
                         if (code == 0) {
                             deps_ready = true;
                             m_deps_verified = true;
-                            log(0, "Verified AI dependencies via Python import successfully");
+                            log(0, "Verified model dependencies via Python import successfully");
                         }
                     } else if (wait_res == WAIT_TIMEOUT) {
                         log(1, "Dependency check timed out after 45s, terminating check process...");
@@ -1071,10 +1299,10 @@ bool DepthManager::trigger_ai_depth(
                         fs::create_directories(base_dest, py_ec);
                         local_site_w = fs::absolute(base_dest).wstring();
                     }
-                    log(1, "Missing AI dependencies (torch, cv2, numpy). Installing locally to " + wide_to_utf8(local_site_w.c_str()) + " via pip...");
+                    log(1, "Missing model dependencies (torch, cv2, numpy). Installing locally to " + wide_to_utf8(local_site_w.c_str()) + " via pip...");
                     {
                         std::lock_guard<std::mutex> lock(m_status_mutex);
-                        m_ai_status = "Auto-installing AI packages locally into ShaderLab folder...";
+                        m_status_text = "Auto-installing model packages locally into ShaderLab folder...";
                     }
 
                     std::wstring pip_cmd = L"\"" + py_exe + L"\" -m pip install --no-user --target \"" + local_site_w + L"\" torch opencv-python numpy scipy --extra-index-url https://download.pytorch.org/whl/cu126 --extra-index-url https://download.pytorch.org/whl/cu124";
@@ -1087,13 +1315,18 @@ bool DepthManager::trigger_ai_depth(
                     pip_buf.push_back(L'\0');
 
                     if (CreateProcessW(nullptr, pip_buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &pip_si, &pip_pi)) {
-                        WaitForSingleObject(pip_pi.hProcess, 600000);
+                        DWORD wait_res = WaitForSingleObject(pip_pi.hProcess, 120000);
                         DWORD pip_exit = 1;
-                        GetExitCodeProcess(pip_pi.hProcess, &pip_exit);
+                        if (wait_res == WAIT_TIMEOUT) {
+                            TerminateProcess(pip_pi.hProcess, 1);
+                            log(2, "Local pip dependency install timed out after 120s");
+                        } else {
+                            GetExitCodeProcess(pip_pi.hProcess, &pip_exit);
+                        }
                         CloseHandle(pip_pi.hProcess);
                         CloseHandle(pip_pi.hThread);
 
-                        if (pip_exit == 0) {
+                        if (pip_exit == 0 && wait_res == WAIT_OBJECT_0) {
                             deps_ready = true;
                             m_deps_verified = true;
                             log(3, "Dependencies installed locally successfully via pip!");
@@ -1104,9 +1337,9 @@ bool DepthManager::trigger_ai_depth(
 
             if (!deps_ready) {
                 std::lock_guard<std::mutex> lock(m_status_mutex);
-                m_ai_last_error = "Required AI dependencies (torch, cv2, numpy) could not be installed or verified.";
-                m_ai_running = false;
-                log(2, m_ai_last_error);
+                m_last_error = "Required model dependencies (torch, cv2, numpy) could not be installed or verified.";
+                m_processing = false;
+                log(2, m_last_error);
                 return;
             }
 
@@ -1133,7 +1366,7 @@ bool DepthManager::trigger_ai_depth(
 
             {
                 std::lock_guard<std::mutex> lock(m_status_mutex);
-                m_ai_status = "Running PyTorch neural network inference...";
+                m_status_text = "Running PyTorch neural network inference...";
             }
 
             // launch subprocess with pipes
@@ -1176,9 +1409,9 @@ bool DepthManager::trigger_ai_depth(
             if (!created) {
                 CloseHandle(hReadPipe);
                 std::lock_guard<std::mutex> lock(m_status_mutex);
-                m_ai_last_error = "Failed to launch Python subprocess (Error " + std::to_string(GetLastError()) + ")";
-                m_ai_running = false;
-                log(2, m_ai_last_error);
+                m_last_error = "Failed to launch Python subprocess (Error " + std::to_string(GetLastError()) + ")";
+                m_processing = false;
+                log(2, m_last_error);
                 return;
             }
 
@@ -1195,13 +1428,17 @@ bool DepthManager::trigger_ai_depth(
                     char c = pipe_buf[i];
                     if (c == '\n' || c == '\r') {
                         if (!line_accum.empty()) {
-                            // parse progress markers like [PROGRESS 45%]
-                            auto ppos = line_accum.find("[PROGRESS ");
+                            // parse progress markers like [PROGRESS 45%] or [PROGRESS] 45:
+                            auto ppos = line_accum.find("[PROGRESS");
                             if (ppos != std::string::npos) {
-                                int pct = atoi(line_accum.c_str() + ppos + 10);
-                                m_ai_progress.store(static_cast<float>(pct) / 100.0f);
-                                std::lock_guard<std::mutex> lock(m_status_mutex);
-                                m_ai_status = "Inference progress: " + std::to_string(pct) + "%";
+                                const char *ptr = line_accum.c_str() + ppos + 9;
+                                while (*ptr == ']' || *ptr == ' ' || *ptr == ':' || *ptr == '%') ptr++;
+                                int pct = atoi(ptr);
+                                if (pct >= 0 && pct <= 100) {
+                                    m_progress.store(static_cast<float>(pct) / 100.0f);
+                                    std::lock_guard<std::mutex> lock(m_status_mutex);
+                                    m_status_text = "Inference progress: " + std::to_string(pct) + "%";
+                                }
                             } else {
                                 log(0, "[Python] " + line_accum);
                             }
@@ -1264,22 +1501,24 @@ bool DepthManager::trigger_ai_depth(
                     }
                 }
 
+                m_progress.store(1.0f);
                 {
                     std::lock_guard<std::mutex> lock(m_status_mutex);
-                    m_ai_status = "Depth generation complete!";
-                    m_ai_last_error = "";
+                    m_status_text = "Depth generation complete!";
+                    m_last_error = "";
                 }
                 log(3, "Depth generation complete! Triggering host reload...");
                 // trigger reload in host
                 JobQueueManager::get().set_preview_image(base_p.wstring());
             } else {
+                m_progress.store(-1.0f);
                 std::lock_guard<std::mutex> lock(m_status_mutex);
                 if (proc_output.find("No module named 'torch'") != std::string::npos ||
                     proc_output.find("No module named torch") != std::string::npos) {
-                    m_ai_last_error = "PyTorch is missing in your Python environment. Run: pip install torch torchvision";
+                    m_last_error = "PyTorch is missing in your Python environment. Run: pip install torch torchvision";
                 } else if (proc_output.find("No module named 'cv2'") != std::string::npos ||
                            proc_output.find("No module named cv2") != std::string::npos) {
-                    m_ai_last_error = "OpenCV is missing in your Python environment. Run: pip install opencv-python";
+                    m_last_error = "OpenCV is missing in your Python environment. Run: pip install opencv-python";
                 } else {
                     std::string trimmed_err = proc_output;
                     size_t last_nl = trimmed_err.find_last_not_of(" \r\n");
@@ -1288,22 +1527,22 @@ bool DepthManager::trigger_ai_depth(
                     if (prev_nl != std::string::npos && prev_nl + 1 < trimmed_err.size()) {
                         trimmed_err = trimmed_err.substr(prev_nl + 1);
                     }
-                    m_ai_last_error = "Inference failed (Exit " + std::to_string(exit_code) + "): " + trimmed_err;
+                    m_last_error = "Inference failed (Exit " + std::to_string(exit_code) + "): " + trimmed_err;
                 }
-                log(2, m_ai_last_error);
+                log(2, m_last_error);
             }
         } catch (const std::exception &e) {
             std::lock_guard<std::mutex> lock(m_status_mutex);
-            m_ai_last_error = std::string("AI generation error: ") + e.what();
-            log(2, m_ai_last_error);
+            m_last_error = std::string("Depth generation error: ") + e.what();
+            log(2, m_last_error);
         } catch (...) {
             std::lock_guard<std::mutex> lock(m_status_mutex);
-            m_ai_last_error = "AI generation error: unexpected exception";
-            log(2, m_ai_last_error);
+            m_last_error = "Depth generation error: unexpected exception";
+            log(2, m_last_error);
         }
 
         log(0, "==================================================");
-        m_ai_running = false;
+        m_processing = false;
     });
 
     return true;
@@ -1362,13 +1601,29 @@ bool DepthManager::remove_depth(const std::wstring &base_image_path, std::string
                 }
 
                 if (had_chunk) {
-                    std::ofstream out_f(base_p, std::ios::binary);
-                    if (out_f.is_open()) {
-                        out_f.write(reinterpret_cast<char *>(stripped.data()), stripped.size());
-                        out_f.close();
+                    fs::path tmp_p = base_p;
+                    tmp_p += L".tmp";
+                    bool write_ok = false;
+                    {
+                        std::ofstream out_f(tmp_p, std::ios::binary);
+                        if (out_f.is_open()) {
+                            out_f.write(reinterpret_cast<char *>(stripped.data()), stripped.size());
+                            write_ok = out_f.good();
+                            out_f.close();
+                        }
+                    }
+                    if (write_ok) {
+                        std::error_code ec;
+                        fs::rename(tmp_p, base_p, ec);
+                        if (ec) {
+                            fs::copy_file(tmp_p, base_p, fs::copy_options::overwrite_existing, ec);
+                            fs::remove(tmp_p, ec);
+                        }
                         removed_any = true;
                     } else {
-                        out_error = "Failed to write modified PNG (file may be write-protected or locked)";
+                        std::error_code ec;
+                        fs::remove(tmp_p, ec);
+                        out_error = "Failed to write modified PNG (file may be write-protected, locked, or disk full)";
                         log(2, out_error);
                         return false;
                     }
@@ -1473,3 +1728,70 @@ bool DepthManager::export_depth(
     return true;
 }
 
+std::wstring DepthManager::find_lama_script_path() const {
+    return EraseTool::get().find_lama_script_path();
+}
+
+std::wstring DepthManager::find_lama_model_path() const {
+    return EraseTool::get().find_lama_model_path();
+}
+
+std::string DepthManager::get_lama_model_name() const {
+    return EraseTool::get().get_lama_model_name();
+}
+
+bool DepthManager::is_lama_present() const {
+    return EraseTool::get().is_model_present();
+}
+
+bool DepthManager::trigger_lama_download() {
+    return EraseTool::get().trigger_model_download();
+}
+
+bool DepthManager::ensure_stage_cache_initialized(const std::wstring &base_image_path) {
+    return EraseTool::get().ensure_stage_cache_initialized(base_image_path);
+}
+
+bool DepthManager::prewarm_lama_worker() {
+    return EraseTool::get().prewarm_worker();
+}
+
+void DepthManager::stop_lama_worker() {
+    EraseTool::get().stop_worker();
+}
+
+bool DepthManager::is_lama_worker_ready() const {
+    return EraseTool::get().is_worker_ready();
+}
+
+bool DepthManager::trigger_erase(const std::wstring &base_image_path, const std::wstring &mask_path) {
+    return EraseTool::get().trigger_erase(base_image_path, mask_path);
+}
+
+bool DepthManager::can_undo_erase() const {
+    return EraseTool::get().can_undo_erase();
+}
+
+bool DepthManager::can_redo_erase() const {
+    return EraseTool::get().can_redo_erase();
+}
+
+bool DepthManager::undo_erase() {
+    return EraseTool::get().undo_erase();
+}
+
+bool DepthManager::redo_erase() {
+    return EraseTool::get().redo_erase();
+}
+
+size_t DepthManager::get_current_erase_step() const {
+    return EraseTool::get().get_current_erase_step();
+}
+
+size_t DepthManager::get_total_erase_steps() const {
+    return EraseTool::get().get_total_erase_steps();
+}
+
+void DepthManager::clear_erase_history() {
+    EraseTool::get().clear_erase_history();
+}

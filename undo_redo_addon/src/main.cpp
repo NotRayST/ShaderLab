@@ -1,1029 +1,909 @@
 #define ImTextureID ImU64
+#ifndef UNDOREDO_WINDOW_LAYOUT
+#define UNDOREDO_WINDOW_LAYOUT 0
+#endif
 #include <imgui.h>
+#define GImGui (ImGui::GetCurrentContext())
+#include <imgui_internal.h>
 #include <reshade.hpp>
+
+namespace ImGui {
+inline ImGuiContext* GetCurrentContext() {
+    const auto *table = imgui_function_table_instance();
+    if (!table || !table->GetIO) return nullptr;
+    uintptr_t io_addr = reinterpret_cast<uintptr_t>(&table->GetIO());
+    if (io_addr < 0x10000 || io_addr > 0x7FFFFFFFFFFF) return nullptr;
+    uintptr_t ctx_addr = io_addr - offsetof(ImGuiContext, IO);
+    if (ctx_addr < 0x10000 || ctx_addr > 0x7FFFFFFFFFFF) return nullptr;
+    ImGuiContext *ctx = reinterpret_cast<ImGuiContext *>(ctx_addr);
+    return ctx->Initialized ? ctx : nullptr;
+}
+}
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <list>
+#include <memory>
 #include <string>
+#include <vector>
+#include <unordered_map>
 #include <windows.h>
 #include <shellapi.h>
 
+#include "ReShadeUndoRedo_API.h"
+#include "DynamicPayload.hpp"
+#include "ICommand.hpp"
+#include "Commands.hpp"
+#include "CommandQueue.hpp"
+#include "ContextManager.hpp"
+#include "AuditionStateMachine.hpp"
+#include "TransactionCoalescer.hpp"
+#include "AddonRegistry.hpp"
+
 extern "C" __declspec(dllexport) const char *NAME = "Undo/Redo by NotRayST";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "Advanced Undo/Redo for ReShade";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "Undo and redo support for ReShade effects and presets";
+
+reshade::api::effect_runtime *g_runtime = nullptr;
 
 namespace {
 
-constexpr size_t kHistoryLimit = 1000;
+std::string g_preset_path;
+bool g_allow_all_hidden = false;
+bool g_log_addon_uniforms = false;
+bool g_global_mode = true;
+bool g_standalone_tab = true;
+char g_filter[128] = "";
+int g_suppress_tracking_frames = 0;
 
-struct HistoryEntry {
-    enum class Kind {
-        UniformValue,
-        TechniqueState,
-    };
+bool matches_filter(const std::string &text, const char *f) {
+    if (!f || !f[0]) return true;
+    size_t flen = strlen(f);
+    auto it = std::search(
+        text.begin(), text.end(),
+        f, f + flen,
+        [](char ch1, char ch2) { return ::tolower(static_cast<unsigned char>(ch1)) == ::tolower(static_cast<unsigned char>(ch2)); }
+    );
+    return it != text.end();
+}
 
-    union Value {
-        bool     as_bool;
-        float    as_float[16];
-        int32_t  as_int[16];
-        uint32_t as_uint[16];
-    };
+// --- small ui helpers ---
 
-    Kind kind = Kind::UniformValue;
-
-    std::string effect_name;
-    std::string variable_name;
-    reshade::api::format base_type = reshade::api::format::unknown;
-    Value before;
-    Value after;
-
-    std::string technique_name;
-    bool technique_enabled = false;
+struct ScopedDisabled {
+    explicit ScopedDisabled(bool d) { ImGui::BeginDisabled(d); }
+    ~ScopedDisabled() { ImGui::EndDisabled(); }
 };
 
-struct History {
-    std::list<HistoryEntry> entries;
-    size_t position = 0;
-    bool suppressing = false;
-    std::string last_preset_path;
+// dims text (theme's disabled color) while in scope, no-op when off
+struct Dim {
+    bool on;
+    explicit Dim(bool o) : on(o) {
+        if (on) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    }
+    ~Dim() { if (on) ImGui::PopStyleColor(); }
 };
 
-History &state()
-{
-    static History history;
-    return history;
+// dimmed, wrapped helper text
+void note(const char *fmt, ...) {
+    char buf[320];
+    va_list args; va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    Dim dim(true);
+    ImGui::TextWrapped("%s", buf);
 }
 
-constexpr uint32_t kHistoryFileMagic = 0x53485421; // "SHT!"
-constexpr uint32_t kHistoryFileVersion = 1;
-
-std::wstring history_file_path()
-{
-    wchar_t temp[MAX_PATH] = {};
-    if (GetTempPathW(MAX_PATH, temp) == 0)
-        return L"ReShade_undo_history.dat";
-    return std::wstring(temp) + L"ReShade_undo_history.dat";
+void tip(const char *text) {
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
 }
 
-void write_str(FILE *f, const std::string &s)
+// --- uniform & technique filtering ---
+
+bool is_trackable_uniform(reshade::api::effect_runtime *rt,
+                          reshade::api::effect_uniform_variable var, bool allow_hidden)
 {
-    uint32_t len = static_cast<uint32_t>(s.size());
-    fwrite(&len, sizeof(len), 1, f);
-    if (len > 0)
-        fwrite(s.data(), 1, len, f);
-}
-
-bool read_str(FILE *f, std::string &out)
-{
-    uint32_t len = 0;
-    if (fread(&len, sizeof(len), 1, f) != 1)
-        return false;
-    out.resize(len);
-    if (len > 0 && fread(&out[0], 1, len, f) != len)
-        return false;
-    return true;
-}
-
-void save_history_to_file()
-{
-    const History &history = state();
-    const std::wstring path = history_file_path();
-
-    FILE *f = _wfopen(path.c_str(), L"wb");
-    if (!f)
-        return;
-
-    fwrite(&kHistoryFileMagic, sizeof(kHistoryFileMagic), 1, f);
-    fwrite(&kHistoryFileVersion, sizeof(kHistoryFileVersion), 1, f);
-
-    uint64_t position = history.position;
-    uint64_t count = history.entries.size();
-    fwrite(&position, sizeof(position), 1, f);
-    fwrite(&count, sizeof(count), 1, f);
-
-    for (const HistoryEntry &e : history.entries) {
-        uint32_t kind = static_cast<uint32_t>(e.kind);
-        fwrite(&kind, sizeof(kind), 1, f);
-        write_str(f, e.effect_name);
-
-        if (e.kind == HistoryEntry::Kind::UniformValue) {
-            write_str(f, e.variable_name);
-            uint32_t base_type = static_cast<uint32_t>(e.base_type);
-            fwrite(&base_type, sizeof(base_type), 1, f);
-            fwrite(e.before.as_uint, sizeof(uint32_t), 16, f);
-            fwrite(e.after.as_uint, sizeof(uint32_t), 16, f);
-        } else {
-            write_str(f, e.technique_name);
-            uint8_t enabled = e.technique_enabled ? 1 : 0;
-            fwrite(&enabled, sizeof(enabled), 1, f);
-        }
-    }
-
-    fclose(f);
-}
-
-bool load_history_from_file()
-{
-    History &history = state();
-    const std::wstring path = history_file_path();
-
-    FILE *f = _wfopen(path.c_str(), L"rb");
-    if (!f)
-        return false;
-
-    uint32_t magic = 0, version = 0;
-    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != kHistoryFileMagic ||
-        fread(&version, sizeof(version), 1, f) != 1 || version != kHistoryFileVersion) {
-        fclose(f);
-        return false;
-    }
-
-    uint64_t position = 0, count = 0;
-    if (fread(&position, sizeof(position), 1, f) != 1 ||
-        fread(&count, sizeof(count), 1, f) != 1) {
-        fclose(f);
-        return false;
-    }
-
-    if (count > kHistoryLimit)
-        count = kHistoryLimit;
-
-    std::list<HistoryEntry> loaded;
-    for (uint64_t i = 0; i < count; ++i) {
-        uint32_t kind = 0;
-        if (fread(&kind, sizeof(kind), 1, f) != 1)
-            break;
-
-        HistoryEntry e;
-        e.kind = static_cast<HistoryEntry::Kind>(kind);
-        if (!read_str(f, e.effect_name))
-            break;
-
-        if (e.kind == HistoryEntry::Kind::UniformValue) {
-            if (!read_str(f, e.variable_name))
-                break;
-            uint32_t base_type = 0;
-            if (fread(&base_type, sizeof(base_type), 1, f) != 1)
-                break;
-            e.base_type = static_cast<reshade::api::format>(base_type);
-            if (fread(e.before.as_uint, sizeof(uint32_t), 16, f) != 16 ||
-                fread(e.after.as_uint, sizeof(uint32_t), 16, f) != 16)
-                break;
-        } else {
-            if (!read_str(f, e.technique_name))
-                break;
-            uint8_t enabled = 0;
-            if (fread(&enabled, sizeof(enabled), 1, f) != 1)
-                break;
-            e.technique_enabled = enabled != 0;
-        }
-
-        loaded.push_back(std::move(e));
-    }
-
-    fclose(f);
-
-    if (loaded.empty())
-        return false;
-
-    history.entries = std::move(loaded);
-    history.position = std::min(static_cast<size_t>(position), history.entries.size());
-    return true;
-}
-
-void delete_history_file()
-{
-    _wremove(history_file_path().c_str());
-}
-
-bool valid_uniform(reshade::api::effect_runtime *runtime, reshade::api::effect_uniform_variable variable)
-{
-    if (variable == reshade::api::effect_uniform_variable{ 0 })
-        return false;
+    if (var == reshade::api::effect_uniform_variable{ 0 }) return false;
 
     char source[64] = {};
-    if (runtime->get_annotation_string_from_uniform_variable(variable, "source", source))
-        return false;
-    int32_t hidden = 0, noedit = 0, noreset = 0, nosave = 0;
-    runtime->get_annotation_int_from_uniform_variable(variable, "hidden", &hidden, 1);
-    runtime->get_annotation_int_from_uniform_variable(variable, "noedit", &noedit, 1);
-    runtime->get_annotation_int_from_uniform_variable(variable, "noreset", &noreset, 1);
-    runtime->get_annotation_int_from_uniform_variable(variable, "nosave", &nosave, 1);
-    return !(hidden || noedit || noreset || nosave);
-}
-
-bool valid_technique(reshade::api::effect_runtime *runtime, reshade::api::effect_technique technique)
-{
-    if (technique == reshade::api::effect_technique{ 0 })
-        return false;
-
-    int32_t hidden = 0, force = 0, screenshot = 0, timeout = 0;
-    runtime->get_annotation_int_from_technique(technique, "hidden", &hidden, 1);
-    runtime->get_annotation_int_from_technique(technique, "enabled", &force, 1);
-    runtime->get_annotation_int_from_technique(technique, "enabled_in_screenshot", &screenshot, 1);
-    runtime->get_annotation_int_from_technique(technique, "timeout", &timeout, 1);
-    return !(hidden || force || screenshot || timeout);
-}
-
-void read_uniform_value(reshade::api::effect_runtime *runtime,
-                        reshade::api::effect_uniform_variable variable,
-                        reshade::api::format base_type,
-                        HistoryEntry::Value &out)
-{
-    switch (base_type) {
-    case reshade::api::format::r32_typeless:
-        runtime->get_uniform_value_bool(variable, &out.as_bool, 1);
-        break;
-    case reshade::api::format::r32_float:
-        runtime->get_uniform_value_float(variable, out.as_float, 16);
-        break;
-    case reshade::api::format::r32_sint:
-        runtime->get_uniform_value_int(variable, out.as_int, 16);
-        break;
-    case reshade::api::format::r32_uint:
-        runtime->get_uniform_value_uint(variable, out.as_uint, 16);
-        break;
-    default:
-        break;
-    }
-}
-
-void write_uniform_value(reshade::api::effect_runtime *runtime,
-                         reshade::api::effect_uniform_variable variable,
-                         reshade::api::format base_type,
-                         const HistoryEntry::Value &value)
-{
-    switch (base_type) {
-    case reshade::api::format::r32_typeless:
-        runtime->set_uniform_value_bool(variable, &value.as_bool, 1);
-        break;
-    case reshade::api::format::r32_float:
-        runtime->set_uniform_value_float(variable, value.as_float, 16);
-        break;
-    case reshade::api::format::r32_sint:
-        runtime->set_uniform_value_int(variable, value.as_int, 16);
-        break;
-    case reshade::api::format::r32_uint:
-        runtime->set_uniform_value_uint(variable, value.as_uint, 16);
-        break;
-    default:
-        break;
-    }
-}
-
-reshade::api::effect_uniform_variable resolve_uniform(reshade::api::effect_runtime *runtime,
-                                                      const HistoryEntry &entry)
-{
-    auto u = runtime->find_uniform_variable(entry.effect_name.c_str(), entry.variable_name.c_str());
-    if (u == reshade::api::effect_uniform_variable{ 0 }) {
-        u = runtime->find_uniform_variable(nullptr, entry.variable_name.c_str());
-    }
-    return u;
-}
-
-reshade::api::effect_technique resolve_technique(reshade::api::effect_runtime *runtime,
-                                                 const HistoryEntry &entry)
-{
-    auto tech = runtime->find_technique(entry.effect_name.c_str(), entry.technique_name.c_str());
-    if (tech == reshade::api::effect_technique{ 0 }) {
-        tech = runtime->find_technique(nullptr, entry.technique_name.c_str());
-    }
-    return tech;
-}
-
-void apply(reshade::api::effect_runtime *runtime, const HistoryEntry &entry, bool undo)
-{
-    switch (entry.kind) {
-    case HistoryEntry::Kind::UniformValue: {
-        const reshade::api::effect_uniform_variable variable = resolve_uniform(runtime, entry);
-        if (variable == reshade::api::effect_uniform_variable{ 0 })
-            return;
-        write_uniform_value(runtime, variable, entry.base_type,
-                            undo ? entry.before : entry.after);
-        break;
-    }
-    case HistoryEntry::Kind::TechniqueState: {
-        const reshade::api::effect_technique technique = resolve_technique(runtime, entry);
-        if (technique == reshade::api::effect_technique{ 0 })
-            return;
-        runtime->set_technique_state(technique,
-                                     undo ? !entry.technique_enabled : entry.technique_enabled);
-        break;
-    }
+    if (rt->get_annotation_string_from_uniform_variable(var, "source", source) && source[0]) {
+        std::string s = source;
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)::tolower(c); });
+        static const char *excludes[] = {
+            "framecount","frametime","time","date","timer","pingpong",
+            "random","key","mousebutton","mousedelta","mousewheel","mousepoint","bufready_",
+            "camera","overlay","menu","ui_"
+        };
+        for (auto e : excludes) if (s.find(e) != std::string::npos) return false;
     }
 
-    runtime->save_current_preset();
+    char vn[256] = {};
+    rt->get_uniform_variable_name(var, vn);
+    if (is_ui_state_variable(vn)) return false;
+
+    std::string vnl = vn;
+    std::transform(vnl.begin(), vnl.end(), vnl.begin(), [](unsigned char c) { return (char)::tolower(c); });
+    // blacklist automated camera streams from IGCS
+    if (vnl.rfind("igcs_", 0) == 0) return false;
+
+    char eff[256] = {};
+    rt->get_uniform_variable_effect_name(var, eff);
+    std::string enl = eff;
+    std::transform(enl.begin(), enl.end(), enl.begin(), [](unsigned char c) { return (char)::tolower(c); });
+    // blacklist multi-sample DoF helper passes
+    if (enl.find("igcsdof") != std::string::npos) return false;
+
+    int32_t noedit = 0;
+    rt->get_annotation_int_from_uniform_variable(var, "noedit", &noedit, 1);
+    if (noedit) return false;
+    if (allow_hidden) return true;
+
+    int32_t hidden = 0, nosave = 0;
+    rt->get_annotation_int_from_uniform_variable(var, "hidden", &hidden, 1);
+    rt->get_annotation_int_from_uniform_variable(var, "nosave", &nosave, 1);
+    return !(hidden || nosave);
 }
 
-void record(History &history, HistoryEntry entry)
-{
-    while (history.position > 0) {
-        history.entries.pop_front();
-        --history.position;
-    }
-
-    // merge consecutive changes to the same variable
-    if (entry.kind == HistoryEntry::Kind::UniformValue) {
-        if (auto it = history.entries.begin(); it != history.entries.end() &&
-            it->kind == HistoryEntry::Kind::UniformValue &&
-            it->effect_name == entry.effect_name && it->variable_name == entry.variable_name) {
-            std::memcpy(&entry.before, &it->before, sizeof(entry.before));
-            history.entries.pop_front();
-        }
-    }
-
-    if (history.entries.size() < kHistoryLimit)
-        history.entries.push_front(std::move(entry));
-    history.position = 0;
-    save_history_to_file();
+bool is_trackable_technique(reshade::api::effect_runtime *rt, reshade::api::effect_technique tech) {
+    if (tech == reshade::api::effect_technique{ 0 }) return false;
+    int32_t hidden = 0, force = 0, ss = 0, to = 0;
+    rt->get_annotation_int_from_technique(tech, "hidden", &hidden, 1);
+    rt->get_annotation_int_from_technique(tech, "enabled", &force, 1);
+    rt->get_annotation_int_from_technique(tech, "enabled_in_screenshot", &ss, 1);
+    rt->get_annotation_int_from_technique(tech, "timeout", &to, 1);
+    return !(hidden || force || ss || to);
 }
 
-void undo(reshade::api::effect_runtime *runtime)
-{
-    History &history = state();
-    if (history.position >= history.entries.size())
-        return;
+// --- keybinds ---
 
-    auto it = history.entries.begin();
-    std::advance(it, static_cast<std::ptrdiff_t>(history.position));
+enum class Action { Undo = 0, Redo = 1, Count = 2 };
 
-    history.suppressing = true;
-    apply(runtime, *it, true);
-    ++history.position;
-    history.suppressing = false;
-    save_history_to_file();
-}
+struct Binding { ImGuiKey key = ImGuiKey_None; bool ctrl = false, shift = false, alt = false; };
 
-void redo(reshade::api::effect_runtime *runtime)
-{
-    History &history = state();
-    if (history.position == 0)
-        return;
-
-    auto it = history.entries.begin();
-    std::advance(it, static_cast<std::ptrdiff_t>(history.position) - 1);
-
-    history.suppressing = true;
-    --history.position;
-    apply(runtime, *it, false);
-    history.suppressing = false;
-    save_history_to_file();
-}
-
-void jump_to_position(reshade::api::effect_runtime *runtime, size_t target_position)
-{
-    History &history = state();
-    target_position = (std::min)(target_position, history.entries.size());
-
-    while (history.position < target_position)
-        undo(runtime);
-    while (history.position > target_position)
-        redo(runtime);
-}
-
-size_t undo_count() { return state().entries.size() - state().position; }
-size_t redo_count() { return state().position; }
-size_t history_size() { return state().entries.size(); }
-bool history_undone(size_t index) { return index < state().position; }
-
-bool history_label(size_t index, char *buf, size_t size)
-{
-    History &history = state();
-    if (index >= history.entries.size() || buf == nullptr || size == 0)
-        return false;
-
-    auto it = history.entries.begin();
-    std::advance(it, static_cast<std::ptrdiff_t>(index));
-
-    if (it->kind == HistoryEntry::Kind::UniformValue) {
-        const char *scope = it->variable_name.c_str();
-        if (scope[0] == '\0')
-            scope = it->effect_name.c_str();
-        switch (it->base_type) {
-        case reshade::api::format::r32_typeless:
-            snprintf(buf, size, "Uniform %s = %s", scope, it->after.as_bool ? "true" : "false");
-            break;
-        case reshade::api::format::r32_float:
-            snprintf(buf, size, "Uniform %s = %.2f", scope, it->after.as_float[0]);
-            break;
-        case reshade::api::format::r32_sint:
-            snprintf(buf, size, "Uniform %s = %d", scope, it->after.as_int[0]);
-            break;
-        case reshade::api::format::r32_uint:
-            snprintf(buf, size, "Uniform %s = %u", scope, it->after.as_uint[0]);
-            break;
-        default:
-            snprintf(buf, size, "Uniform %s", scope);
-            break;
-        }
-    } else {
-        snprintf(buf, size, "%s %s", it->technique_name.c_str(),
-                 it->technique_enabled ? "on" : "off");
-    }
-    return true;
-}
-
-void clear_history()
-{
-    History &history = state();
-    history.entries.clear();
-    history.position = 0;
-    save_history_to_file();
-}
-
-// --- keybinds & remapping ----------------------------------------------------
-
-enum class Action {
-    Undo = 0,
-    Redo = 1,
-    Count = 2
+Binding g_defaults[] = {
+    { ImGuiKey_Z, true, false, false },
+    { ImGuiKey_Y, true, false, false },
 };
+Binding g_bindings[2];
 
-struct Binding {
-    ImGuiKey key = ImGuiKey_None;
-    bool ctrl = false;
-    bool shift = false;
-    bool alt = false;
-};
-
-Binding g_defaults[static_cast<int>(Action::Count)] = {
-    { ImGuiKey_Z, true, false, false }, // Undo (Ctrl+Z)
-    { ImGuiKey_Y, true, false, false }, // Redo (Ctrl+Y)
-};
-
-Binding g_bindings[static_cast<int>(Action::Count)];
-reshade::api::effect_runtime *g_runtime = nullptr;
-
-bool is_modifier_key(ImGuiKey key)
-{
-    return key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl ||
-           key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift ||
-           key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt ||
-           key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper;
+bool is_mod(ImGuiKey k) {
+    return k == ImGuiKey_LeftCtrl || k == ImGuiKey_RightCtrl ||
+           k == ImGuiKey_LeftShift || k == ImGuiKey_RightShift ||
+           k == ImGuiKey_LeftAlt || k == ImGuiKey_RightAlt ||
+           k == ImGuiKey_LeftSuper || k == ImGuiKey_RightSuper;
 }
+bool is_ctrl(ImGuiKey k)  { return k == ImGuiKey_LeftCtrl  || k == ImGuiKey_RightCtrl; }
+bool is_shift(ImGuiKey k) { return k == ImGuiKey_LeftShift || k == ImGuiKey_RightShift; }
+bool is_alt(ImGuiKey k)   { return k == ImGuiKey_LeftAlt   || k == ImGuiKey_RightAlt; }
 
-bool is_ctrl_key(ImGuiKey key)  { return key == ImGuiKey_LeftCtrl  || key == ImGuiKey_RightCtrl; }
-bool is_shift_key(ImGuiKey key) { return key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift; }
-bool is_alt_key(ImGuiKey key)   { return key == ImGuiKey_LeftAlt   || key == ImGuiKey_RightAlt; }
+const char *action_name(Action a) { return a == Action::Undo ? "Undo" : "Redo"; }
 
-const char *action_name(Action a)
-{
-    switch (a) {
-    case Action::Undo: return "Undo";
-    case Action::Redo: return "Redo";
-    default: return "?";
-    }
-}
-
-void describe_binding(Action a, char *buf, size_t size)
-{
+void describe_binding(Action a, char *buf, size_t sz) {
     const Binding &b = g_bindings[static_cast<int>(a)];
-    if (size == 0) return;
     buf[0] = '\0';
-    if (b.ctrl)  strncat(buf, "Ctrl+", size - 1);
-    if (b.shift) strncat(buf, "Shift+", size - 1);
-    if (b.alt)   strncat(buf, "Alt+", size - 1);
-
-    const char *kname = ImGui::GetKeyName(b.key);
-    if (is_shift_key(b.key)) kname = "Shift";
-    else if (is_ctrl_key(b.key)) kname = "Ctrl";
-    else if (is_alt_key(b.key)) kname = "Alt";
-    strncat(buf, kname ? kname : "None", size - 1);
+    if (b.ctrl)  strncat(buf, "Ctrl+", sz - 1);
+    if (b.shift) strncat(buf, "Shift+", sz - 1);
+    if (b.alt)   strncat(buf, "Alt+", sz - 1);
+    const char *kn = ImGui::GetKeyName(b.key);
+    if (is_shift(b.key)) kn = "Shift";
+    else if (is_ctrl(b.key)) kn = "Ctrl";
+    else if (is_alt(b.key)) kn = "Alt";
+    strncat(buf, kn ? kn : "None", sz - 1);
 }
 
-void load_binding(Action a)
-{
-    Binding &b = g_bindings[static_cast<int>(a)];
+static void binding_keys(Action a, char *kn, char *cn, char *sn, char *an) {
+    const char *pfx = a == Action::Undo ? "Undo" : "Redo";
+    snprintf(kn, 32, "%sKey", pfx); snprintf(cn, 32, "%sCtrl", pfx);
+    snprintf(sn, 32, "%sShift", pfx); snprintf(an, 32, "%sAlt", pfx);
+}
+
+void load_binding(Action a) {
+    auto &b = g_bindings[static_cast<int>(a)];
     b = g_defaults[static_cast<int>(a)];
     if (!g_runtime) return;
-
-    const char *sec = "UndoRedo";
-    const char *prefix = (a == Action::Undo) ? "Undo" : "Redo";
-    char kName[32], cName[32], sName[32], aName[32];
-    snprintf(kName, sizeof(kName), "%sKey", prefix);
-    snprintf(cName, sizeof(cName), "%sCtrl", prefix);
-    snprintf(sName, sizeof(sName), "%sShift", prefix);
-    snprintf(aName, sizeof(aName), "%sAlt", prefix);
-
-    int key_val = static_cast<int>(b.key);
-    reshade::get_config_value(g_runtime, sec, kName, key_val);
-    b.key = static_cast<ImGuiKey>(key_val);
-    reshade::get_config_value(g_runtime, sec, cName, b.ctrl);
-    reshade::get_config_value(g_runtime, sec, sName, b.shift);
-    reshade::get_config_value(g_runtime, sec, aName, b.alt);
+    char kn[32], cn[32], sn[32], an[32];
+    binding_keys(a, kn, cn, sn, an);
+    int kv = static_cast<int>(b.key);
+    reshade::get_config_value(g_runtime, "UndoRedo", kn, kv); b.key = static_cast<ImGuiKey>(kv);
+    reshade::get_config_value(g_runtime, "UndoRedo", cn, b.ctrl);
+    reshade::get_config_value(g_runtime, "UndoRedo", sn, b.shift);
+    reshade::get_config_value(g_runtime, "UndoRedo", an, b.alt);
 }
 
-void save_binding(Action a)
-{
+void save_binding(Action a) {
     if (!g_runtime) return;
-    const Binding &b = g_bindings[static_cast<int>(a)];
-    const char *sec = "UndoRedo";
-    const char *prefix = (a == Action::Undo) ? "Undo" : "Redo";
-    char kName[32], cName[32], sName[32], aName[32];
-    snprintf(kName, sizeof(kName), "%sKey", prefix);
-    snprintf(cName, sizeof(cName), "%sCtrl", prefix);
-    snprintf(sName, sizeof(sName), "%sShift", prefix);
-    snprintf(aName, sizeof(aName), "%sAlt", prefix);
-
-    reshade::set_config_value(g_runtime, sec, kName, static_cast<int>(b.key));
-    reshade::set_config_value(g_runtime, sec, cName, b.ctrl);
-    reshade::set_config_value(g_runtime, sec, sName, b.shift);
-    reshade::set_config_value(g_runtime, sec, aName, b.alt);
+    const auto &b = g_bindings[static_cast<int>(a)];
+    char kn[32], cn[32], sn[32], an[32];
+    binding_keys(a, kn, cn, sn, an);
+    reshade::set_config_value(g_runtime, "UndoRedo", kn, static_cast<int>(b.key));
+    reshade::set_config_value(g_runtime, "UndoRedo", cn, b.ctrl);
+    reshade::set_config_value(g_runtime, "UndoRedo", sn, b.shift);
+    reshade::set_config_value(g_runtime, "UndoRedo", an, b.alt);
 }
 
-void init_keybinds(reshade::api::effect_runtime *runtime)
-{
-    g_runtime = runtime;
-    for (int i = 0; i < static_cast<int>(Action::Count); ++i)
-        load_binding(static_cast<Action>(i));
+void init_keybinds(reshade::api::effect_runtime *rt) {
+    g_runtime = rt;
+    for (int i = 0; i < 2; ++i) load_binding(static_cast<Action>(i));
 }
 
-void reset_keybinds()
-{
-    for (int i = 0; i < static_cast<int>(Action::Count); ++i) {
-        g_bindings[i] = g_defaults[i];
-        save_binding(static_cast<Action>(i));
-    }
+void reset_keybinds() {
+    for (int i = 0; i < 2; ++i) { g_bindings[i] = g_defaults[i]; save_binding(static_cast<Action>(i)); }
 }
 
-static int s_capturing = -1;
+int s_capturing = -1;
+int s_cap_seen = 0;  // last frame the keybinding row was drawn
 
-bool is_pressed(Action action)
-{
-    const Binding &b = g_bindings[static_cast<int>(action)];
-    if (!ImGui::IsKeyPressed(b.key, false))
-        return false;
-
+bool is_pressed(Action a) {
+    const auto &b = g_bindings[static_cast<int>(a)];
+    if (!ImGui::IsKeyPressed(b.key, false)) return false;
     ImGuiIO &io = ImGui::GetIO();
-    if (b.ctrl != io.KeyCtrl && !is_ctrl_key(b.key)) return false;
-    if (b.shift != io.KeyShift && !is_shift_key(b.key)) return false;
-    if (b.alt != io.KeyAlt && !is_alt_key(b.key)) return false;
+    if (b.ctrl != io.KeyCtrl && !is_ctrl(b.key)) return false;
+    if (b.shift != io.KeyShift && !is_shift(b.key)) return false;
+    if (b.alt != io.KeyAlt && !is_alt(b.key)) return false;
     return true;
 }
 
-// --- reshade event handlers --------------------------------------------------
+// --- undo / redo dispatch ---
 
-bool on_set_uniform_value(reshade::api::effect_runtime *runtime,
+void flush_pending() {
+    g_suppress_tracking_frames = 2;
+    AuditionStateMachine::instance().flush_session();
+    TransactionCoalescer::instance().commit_transaction();
+}
+
+void step(reshade::api::effect_runtime *rt, bool redo) {
+    flush_pending();
+    if (g_global_mode)
+        redo ? ContextManager::instance().redo_global(rt) : ContextManager::instance().undo_global(rt);
+    else
+        redo ? ContextManager::instance().redo_active(rt) : ContextManager::instance().undo_active(rt);
+    if (rt) rt->save_current_preset();
+}
+
+// --- reshade event handlers ---
+
+bool on_set_uniform_value(reshade::api::effect_runtime *rt,
                           reshade::api::effect_uniform_variable variable,
                           const void *new_value, size_t new_value_size)
 {
-    History &history = state();
-    if (history.suppressing || !valid_uniform(runtime, variable))
-        return false;
+    if (ContextManager::instance().is_suppressing()) return false;
+    if (!is_trackable_uniform(rt, variable, g_allow_all_hidden)) return false;
 
-    HistoryEntry entry;
-    entry.kind = HistoryEntry::Kind::UniformValue;
-    runtime->get_uniform_variable_type(variable, &entry.base_type);
+    reshade::api::format base_type = reshade::api::format::unknown;
+    uint32_t rows = 0, cols = 0, arr = 0;
+    rt->get_uniform_variable_type(variable, &base_type, &rows, &cols, &arr);
 
     char eff[256] = {}, vn[256] = {};
-    runtime->get_uniform_variable_effect_name(variable, eff);
-    runtime->get_uniform_variable_name(variable, vn);
-    entry.effect_name = eff;
-    entry.variable_name = vn;
+    rt->get_uniform_variable_effect_name(variable, eff);
+    rt->get_uniform_variable_name(variable, vn);
 
-    std::memset(&entry.before, 0, sizeof(entry.before));
-    std::memset(&entry.after, 0, sizeof(entry.after));
-    read_uniform_value(runtime, variable, entry.base_type, entry.before);
-    std::memcpy(entry.after.as_uint, new_value,
-                (std::min)(new_value_size, sizeof(HistoryEntry::Value)));
+    uint32_t elem = (std::max)(1u, rows) * (std::max)(1u, cols) * (std::max)(1u, arr);
 
-    if (std::memcmp(&entry.before, &entry.after, sizeof(HistoryEntry::Value)) == 0)
-        return false;
+    DynamicPayload before;
+    before.format = base_type; before.rows = rows; before.cols = cols; before.element_count = elem;
 
-    record(history, std::move(entry));
-    return false;
-}
-
-bool on_set_technique_state(reshade::api::effect_runtime *runtime,
-                            reshade::api::effect_technique technique,
-                            bool enabled)
-{
-    History &history = state();
-    if (history.suppressing || !valid_technique(runtime, technique))
-        return false;
-
-    HistoryEntry entry;
-    entry.kind = HistoryEntry::Kind::TechniqueState;
-    entry.technique_enabled = enabled;
-
-    char eff[256] = {}, tn[128] = {};
-    runtime->get_technique_effect_name(technique, eff);
-    runtime->get_technique_name(technique, tn);
-    entry.effect_name = eff;
-    entry.technique_name = tn;
-
-    record(history, std::move(entry));
-    return false;
-}
-
-void on_preset_changed(reshade::api::effect_runtime *, const char *path)
-{
-    History &history = state();
-
-    std::string new_path = path ? path : "";
-    if (new_path != history.last_preset_path) {
-        history.entries.clear();
-        history.position = 0;
-        save_history_to_file();
+    switch (base_type) {
+    case reshade::api::format::r32_typeless:
+        before.bytes.resize(elem * sizeof(bool));
+        rt->get_uniform_value_bool(variable, reinterpret_cast<bool *>(before.bytes.data()), elem); break;
+    case reshade::api::format::r32_float:
+        before.bytes.resize(elem * sizeof(float));
+        rt->get_uniform_value_float(variable, reinterpret_cast<float *>(before.bytes.data()), elem); break;
+    case reshade::api::format::r32_sint:
+        before.bytes.resize(elem * sizeof(int32_t));
+        rt->get_uniform_value_int(variable, reinterpret_cast<int32_t *>(before.bytes.data()), elem); break;
+    case reshade::api::format::r32_uint:
+        before.bytes.resize(elem * sizeof(uint32_t));
+        rt->get_uniform_value_uint(variable, reinterpret_cast<uint32_t *>(before.bytes.data()), elem); break;
+    default: return false;
     }
-    history.last_preset_path = new_path;
-}
 
-void on_overlay_frame(reshade::api::effect_runtime *runtime)
-{
-    ImGuiIO &io = ImGui::GetIO();
-    if (io.WantTextInput || s_capturing != -1)
-        return;
+    DynamicPayload after = before;
 
-    if (is_pressed(Action::Undo))
-        undo(runtime);
-    else if (is_pressed(Action::Redo))
-        redo(runtime);
-    else if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, true))
-        redo(runtime);
-}
-
-void on_runtime_init(reshade::api::effect_runtime *runtime)
-{
-    init_keybinds(runtime);
-    reshade::set_config_value(runtime, "INPUT", "InputProcessing", 1);
-}
-
-// --- overlay ui --------------------------------------------------------------
-
-void on_draw_overlay(reshade::api::effect_runtime *runtime)
-{
-    try {
-        ImGui::Spacing();
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextUnformatted("Effect History (undo/redo)");
-        ImGui::PopTextWrapPos();
-
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextWrapped("Click an entry to jump.\n%zu undoable, %zu redoable.",
-                           undo_count(), redo_count());
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
-
-        ImGui::Spacing();
-
-        // quick undo / redo action buttons
-        ImGui::BeginDisabled(undo_count() == 0);
-        char undo_btn[64];
-        char u_desc[32];
-        describe_binding(Action::Undo, u_desc, sizeof(u_desc));
-        snprintf(undo_btn, sizeof(undo_btn), "Undo (%s)", u_desc);
-        if (ImGui::Button(undo_btn, ImVec2(140.0f, 0))) {
-            undo(runtime);
-        }
-        ImGui::EndDisabled();
-
-        ImGui::SameLine();
-        ImGui::BeginDisabled(redo_count() == 0);
-        char redo_btn[64];
-        char r_desc[32];
-        describe_binding(Action::Redo, r_desc, sizeof(r_desc));
-        snprintf(redo_btn, sizeof(redo_btn), "Redo (%s)", r_desc);
-        if (ImGui::Button(redo_btn, ImVec2(140.0f, 0))) {
-            redo(runtime);
-        }
-        ImGui::EndDisabled();
-
-        ImGui::Spacing();
-
-        size_t hsize = history_size();
-        if (hsize == 0) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextWrapped("No edits recorded yet.");
-            ImGui::PopTextWrapPos();
-            ImGui::PopStyleColor();
+    if (base_type == reshade::api::format::r32_typeless) {
+        if (new_value_size == elem * sizeof(uint32_t) || (new_value_size % 4 == 0 && new_value_size > after.bytes.size())) {
+            size_t cnt = (std::min)(elem, static_cast<uint32_t>(new_value_size / 4));
+            const uint32_t *w = static_cast<const uint32_t *>(new_value);
+            for (size_t i = 0; i < cnt; ++i) after.bytes[i] = w[i] ? 1 : 0;
         } else {
-            ImGui::BeginChild("EffectHistory", ImVec2(0, 180), true, ImGuiWindowFlags_HorizontalScrollbar);
-            bool is_at_base = (undo_count() == 0);
-            if (!is_at_base)
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
-            if (ImGui::Selectable("[Initial Preset State]", is_at_base)) {
-                jump_to_position(runtime, hsize);
-            }
-            if (!is_at_base)
-                ImGui::PopStyleColor();
+            size_t cnt = (std::min)(after.bytes.size(), new_value_size);
+            const uint8_t *s = static_cast<const uint8_t *>(new_value);
+            for (size_t i = 0; i < cnt; ++i) after.bytes[i] = s[i] ? 1 : 0;
+        }
+    } else {
+        std::memcpy(after.bytes.data(), new_value, (std::min)(after.bytes.size(), new_value_size));
+    }
 
-            for (size_t i = hsize; i-- > 0;) {
-                char label[256] = {};
-                if (!history_label(i, label, sizeof(label)))
-                    continue;
-                bool undone = history_undone(i);
-                bool is_selected = (!undone && (i == redo_count()));
-                if (undone)
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
-                ImGui::PushID(static_cast<int>(i));
-                if (ImGui::Selectable(label, is_selected)) {
-                    jump_to_position(runtime, i);
+    if (before == after) return false;
+
+    bool mouse = is_user_interacting();
+    if (g_log_addon_uniforms) {
+        char msg[512] = {};
+        snprintf(msg, sizeof(msg),
+            "[UndoRedo] Intercepted: Effect='%s', Var='%s', Elements=%u, Bytes=%zu, Mouse=%d",
+            eff, vn, elem, new_value_size, mouse ? 1 : 0);
+        reshade::log::message(reshade::log::level::info, msg);
+    }
+
+    if (mouse) {
+        TransactionCoalescer::instance().stage_uniform(eff, vn, std::move(before), std::move(after));
+    } else {
+        ContextManager::instance().push_command(
+            std::make_unique<UniformCommand>(eff, vn, std::move(before), std::move(after)));
+    }
+    return false;
+}
+
+bool on_set_technique_state(reshade::api::effect_runtime *rt,
+                            reshade::api::effect_technique tech, bool enabled)
+{
+    if (ContextManager::instance().is_suppressing()) return false;
+    if (!is_trackable_technique(rt, tech)) return false;
+    char eff[256] = {}, tn[128] = {};
+    rt->get_technique_effect_name(tech, eff);
+    rt->get_technique_name(tech, tn);
+    AuditionStateMachine::instance().process_technique_toggle(eff, tn, enabled);
+    return false;
+}
+
+void on_preset_changed(reshade::api::effect_runtime *, const char *path) {
+    std::string np = path ? path : "";
+    if (np == g_preset_path) return;
+    g_preset_path = np;
+    AuditionStateMachine::instance().reset();
+    TransactionCoalescer::instance().reset();
+    ContextManager::instance().clear_all();
+}
+
+void dbg(const char *fmt, ...) {
+    if (!g_log_addon_uniforms) return;
+    char buf[256];
+    va_list a; va_start(a, fmt); vsnprintf(buf, sizeof(buf), fmt, a); va_end(a);
+    reshade::log::message(reshade::log::level::info, buf);
+}
+
+void track_overlay_windows() {
+    ImGuiContext *ctx = ImGui::GetCurrentContext();
+    if (!ctx) return;
+
+    struct WinTrack {
+        ImVec2 cpos, csize; uint32_t cdock = 0;
+        ImVec2 dpos, dsize; uint32_t ddock = 0;
+        bool dragging = false, has_base = false;
+    };
+    static std::unordered_map<ImGuiID, WinTrack> s_tracked;
+
+    static int s_suppress_frames = 0;
+    if (g_suppress_tracking_frames > 0) {
+        s_suppress_frames = g_suppress_tracking_frames;
+        g_suppress_tracking_frames = 0;
+    }
+    bool suppressing = ContextManager::instance().is_suppressing() || WindowTransformCommand::s_defer_transforms;
+    if (s_suppress_frames > 0) {
+        --s_suppress_frames;
+        suppressing = true;
+    }
+
+    bool mouse_down = ctx->IO.MouseDown[0] || ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
+
+    static ImVec2 s_last_disp = {};
+    bool res_changed = s_last_disp.x > 0 && s_last_disp.y > 0 &&
+        (fabs(ctx->IO.DisplaySize.x - s_last_disp.x) >= 1.0f || fabs(ctx->IO.DisplaySize.y - s_last_disp.y) >= 1.0f);
+    s_last_disp = ctx->IO.DisplaySize;
+
+    ImGuiDockNode *reshade_node = nullptr;
+    for (ImGuiWindow *w : ctx->Windows)
+        if (w && w->DockNode && is_reshade_main_dock_node(w->DockNode)) { reshade_node = w->DockNode; break; }
+
+    struct Target {
+        const char *name;
+        ImGuiID id;
+        ImVec2 pos, size;
+        uint32_t dock;
+        bool track_ps;
+    };
+    std::vector<Target> targets;
+
+    if (reshade_node)
+        targets.push_back({"ReShade", reshade_node->ID, reshade_node->Pos, reshade_node->Size, reshade_node->ID, true});
+
+    for (ImGuiWindow *w : ctx->Windows) {
+        if (!w || !w->Name || !w->Name[0] || w->IsExplicitChild) continue;
+        if (w->Flags & (ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_Popup)) continue;
+        if (strncmp(w->Name, "##", 2) == 0 && !strstr(w->Name, "###")) continue;
+        if (strcmp(w->Name, "Viewport") == 0 || strcmp(w->Name, "##Viewport") == 0) continue;
+        if (!w->WasActive && !w->Active) continue;
+
+        bool is_child_docked = (w->DockNode != nullptr) &&
+                               !(w->DockNode->IsFloatingNode() && w->DockNode->Windows.Size <= 1);
+        uint32_t dock_id = is_child_docked ? w->DockNode->ID : 0;
+        targets.push_back({w->Name, w->ID, w->Pos, w->Size, dock_id, !is_child_docked});
+    }
+
+    auto ps_changed = [](const Target &t, const ImVec2 &pos, const ImVec2 &size, bool &pc, bool &sc) {
+        pc = t.track_ps && (fabs(t.pos.x - pos.x) >= 1.0f || fabs(t.pos.y - pos.y) >= 1.0f);
+        sc = t.track_ps && (fabs(t.size.x - size.x) >= 1.0f || fabs(t.size.y - size.y) >= 1.0f);
+        return pc || sc;
+    };
+
+    for (const auto &t : targets) {
+        auto &st = s_tracked[t.id];
+        bool pc = false, sc = false;
+        bool changed = st.has_base && ps_changed(t, st.cpos, st.csize, pc, sc);
+
+        if (!st.has_base || suppressing || res_changed) {
+            if (changed && mouse_down)
+                dbg("[UndoRedo] DROP '%s': suppress_ctx=%d defer=%d res=%d",
+                    t.name, ContextManager::instance().is_suppressing(),
+                    WindowTransformCommand::s_defer_transforms, res_changed);
+            st.cpos = t.pos; st.csize = t.size; st.cdock = t.dock;
+            st.dpos = t.pos; st.dsize = t.size; st.ddock = t.dock;
+            st.dragging = false; st.has_base = true;
+            continue;
+        }
+
+        if (mouse_down && changed && !st.dragging) {
+            dbg("[UndoRedo] START '%s'", t.name);
+            st.dragging = true;
+            st.dpos = st.cpos; st.dsize = st.csize; st.ddock = st.cdock;
+        }
+    }
+
+    if (!mouse_down) {
+        for (const auto &t : targets) {
+            auto &st = s_tracked[t.id];
+            bool pc = false, sc = false;
+
+            if (!st.dragging) {
+                if (ps_changed(t, st.cpos, st.csize, pc, sc)) {
+                    dbg("[UndoRedo] MISS '%s': changed with mouse up, never seen mid-drag", t.name);
+                    st.cpos = t.pos; st.csize = t.size; st.cdock = t.dock;
                 }
-                ImGui::PopID();
-                if (undone)
-                    ImGui::PopStyleColor();
+                continue;
             }
-            ImGui::EndChild();
+
+            st.dragging = false;
+            if (ps_changed(t, st.dpos, st.dsize, pc, sc)) {
+                dbg("[UndoRedo] COMMIT '%s'", t.name);
+                float bp[2] = {st.dpos.x, st.dpos.y}, bs[2] = {st.dsize.x, st.dsize.y};
+                float ap[2] = {t.pos.x, t.pos.y}, as[2] = {t.size.x, t.size.y};
+                ContextManager::instance().push_command(std::make_unique<WindowTransformCommand>(
+                    t.name, bp, bs, ap, as, -1, -1, st.ddock, t.dock));
+            }
+            st.cpos = t.pos; st.csize = t.size; st.cdock = t.dock;
         }
+    }
+}
 
-        if (ImGui::Button("Clear History")) {
-            clear_history();
-        }
+void on_overlay_frame(reshade::api::effect_runtime *rt) {
+    if (!ImGui::GetCurrentContext()) return;
+#if UNDOREDO_WINDOW_LAYOUT
+    if (WindowTransformCommand::s_defer_transforms && !ImGui::IsAnyItemActive()) {
+        WindowTransformCommand::set_defer_transforms(false);
+        g_suppress_tracking_frames = 2;
+    }
+    track_overlay_windows();
+#endif
+    TransactionCoalescer::instance().update_frame();
+    AuditionStateMachine::instance().update_frame();
 
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
+    ImGuiIO &io = ImGui::GetIO();
+    // panel hidden mid-capture (tab switch, collapsed header): drop the capture or hotkeys stay dead
+    if (s_capturing != -1 && ImGui::GetFrameCount() > s_cap_seen + 2) s_capturing = -1;
+    if (io.WantTextInput || s_capturing != -1) return;
 
-        // keybindings remapping section
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextUnformatted("Keybindings");
-        ImGui::PopTextWrapPos();
+    if (is_pressed(Action::Undo)) step(rt, false);
+    else if (is_pressed(Action::Redo)) step(rt, true);
+    else if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) step(rt, true);
+}
 
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextWrapped("Click a binding, then press the desired key combination. Modifiers (Ctrl/Shift/Alt) are recorded automatically.");
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
+void on_runtime_init(reshade::api::effect_runtime *rt) {
+    g_runtime = rt;
+    init_keybinds(rt);
+    reshade::get_config_value(rt, "UndoRedo", "CaptureAllHiddenUniforms", g_allow_all_hidden);
+    reshade::get_config_value(rt, "UndoRedo", "LogAddonUniforms", g_log_addon_uniforms);
+    reshade::get_config_value(rt, "UndoRedo", "GlobalUndoMode", g_global_mode);
+    reshade::get_config_value(rt, "UndoRedo", "StandaloneTab", g_standalone_tab);
+    reshade::set_config_value(rt, "INPUT", "InputProcessing", 1);
 
-        ImGui::Spacing();
+    char pp[MAX_PATH] = {}; size_t ps = sizeof(pp);
+    rt->get_current_preset_path(pp, &ps);
+    g_preset_path = pp;
+}
 
-        struct HeldState {
-            bool ctrl = false;
-            bool shift = false;
-            bool alt = false;
-            ImGuiKey normal_key = ImGuiKey_None;
-            ImGuiKey last_mod_key = ImGuiKey_None;
+void on_runtime_destroy(reshade::api::effect_runtime *rt) {
+    if (g_runtime == rt) g_runtime = nullptr;
+}
 
-            bool empty() const {
-                return !ctrl && !shift && !alt && (normal_key == ImGuiKey_None);
+// --- overlay ui ---
+
+// newest-first rows; only visible rows are built when unfiltered
+template <class Match, class Row>
+void draw_rows(size_t n, Match match, Row row) {
+    if (g_filter[0]) {
+        for (size_t i = n; i-- > 0;) if (match(i)) row(i);
+        return;
+    }
+    ImGuiListClipper clip;
+    clip.Begin(static_cast<int>(n));
+    while (clip.Step())
+        for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r) row(n - 1 - static_cast<size_t>(r));
+}
+
+bool initial_row(bool at_base) {
+    Dim dim(!at_base);
+    return ImGui::Selectable("Initial state", at_base);
+}
+
+void render_queue_viewer(reshade::api::effect_runtime *rt, CommandDomain domain, const char *child_id) {
+    ContextManager &cm = ContextManager::instance();
+    CommandQueue &q = cm.get_domain(domain);
+    if (q.size() == 0) {
+        note("No edits yet. Changes you make will show up here.");
+        return;
+    }
+
+    ImGui::BeginChild(child_id, ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 12), true, ImGuiWindowFlags_HorizontalScrollbar);
+    if (initial_row(q.undo_count() == 0)) {
+        flush_pending(); cm.jump_domain(domain, q.size(), rt);
+    }
+
+    const auto &entries = q.entries();
+    draw_rows(entries.size(),
+        [&](size_t i) { return matches_filter(entries[i]->get_label(), g_filter); },
+        [&](size_t i) {
+            std::string label = entries[i]->get_label();
+            std::string delta = entries[i]->get_delta_preview();
+            bool undone = q.is_undone(i);
+            Dim dim(undone);
+            ImGui::PushID(static_cast<int>(i));
+            std::string txt = delta.empty() ? label : label + "  [" + delta + "]";
+            if (ImGui::Selectable(txt.c_str(), !undone && i == q.redo_count())) {
+                flush_pending(); cm.jump_domain(domain, i, rt);
             }
-            int count() const {
-                return (ctrl ? 1 : 0) + (shift ? 1 : 0) + (alt ? 1 : 0) + (normal_key != ImGuiKey_None ? 1 : 0);
+            ImGui::PopID();
+        });
+    ImGui::EndChild();
+}
+
+void render_combined_timeline(reshade::api::effect_runtime *rt) {
+    ContextManager &cm = ContextManager::instance();
+    const auto &tl = cm.global_timeline();
+    if (tl.empty()) {
+        note("No edits yet. Changes you make will show up here.");
+        return;
+    }
+
+    ImGui::BeginChild("CombinedTimelineChild", ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 12), true, ImGuiWindowFlags_HorizontalScrollbar);
+    if (initial_row(cm.global_undo_count() == 0)) {
+        flush_pending(); cm.jump_global(tl.size(), rt);
+    }
+
+    draw_rows(tl.size(),
+        [&](size_t i) { return matches_filter(tl[i].label, g_filter); },
+        [&](size_t i) {
+            const char *tag = tl[i].domain == CommandDomain::WindowLayout ? "[UI] "
+                            : tl[i].domain == CommandDomain::AddonCustom  ? "[EXT] " : "[FX] ";
+            bool undone = cm.global_undone(i);
+            Dim dim(undone);
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::Selectable((std::string(tag) + tl[i].label).c_str(), !undone && i == cm.global_redo_count())) {
+                flush_pending(); cm.jump_global(i, rt);
             }
-        };
+            ImGui::PopID();
+        });
+    ImGui::EndChild();
+}
 
-        static int s_capturing_start_frame = 0;
-        static HeldState s_peak_chord;
-        static bool s_has_peak = false;
-        static uint64_t s_release_start_ms = 0;
-        static bool s_in_release = false;
-        static bool s_prev_ctrl = false;
-        static bool s_prev_shift = false;
-        static bool s_prev_alt = false;
-        static ImGuiKey s_last_mod_down = ImGuiKey_None;
+void draw_keybindings() {
+    note("Click a binding, then press the new key combination. Ctrl+Shift+Z also redoes.");
+    ImGui::Spacing();
 
-        constexpr int kActionCount = static_cast<int>(Action::Count);
-        for (int a = 0; a < kActionCount; ++a) {
-            Action act = static_cast<Action>(a);
-            ImGui::Text("%s", action_name(act));
-            ImGui::SameLine(120.0f);
+    const float fs = ImGui::GetFontSize(), col_x = fs * 5.0f, btn_w = fs * 9.0f;
 
+    struct ChordState { bool ctrl = false, shift = false, alt = false; ImGuiKey normal = ImGuiKey_None, last_mod = ImGuiKey_None;
+        bool empty() const { return !ctrl && !shift && !alt && normal == ImGuiKey_None; }
+        int count() const { return (ctrl?1:0) + (shift?1:0) + (alt?1:0) + (normal != ImGuiKey_None?1:0); }
+    };
+    static int s_cap_frame = 0;
+    static ChordState s_peak; static bool s_has_peak = false;
+    static uint64_t s_rel_ms = 0; static bool s_in_rel = false;
+    static bool s_pc = false, s_ps = false, s_pa = false;
+    static ImGuiKey s_lm = ImGuiKey_None;
+
+    for (int a = 0; a < 2; ++a) {
+        Action act = static_cast<Action>(a);
+        ImGui::Text("%s", action_name(act));
+        ImGui::SameLine(col_x);
+
+        if (s_capturing == a) {
+            s_cap_seen = ImGui::GetFrameCount();
+            if (ImGui::GetFrameCount() > s_cap_frame + 2) {
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) s_capturing = -1;
+                else if (ImGui::IsMouseClicked(0, false) && !s_has_peak) s_capturing = -1;
+            }
             if (s_capturing == a) {
-                // cancel on escape or click away
-                if (ImGui::GetFrameCount() > s_capturing_start_frame + 2) {
-                    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-                        s_capturing = -1;
-                    } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left, false) && !s_has_peak) {
-                        s_capturing = -1;
-                    }
+                ChordState cur;
+                cur.ctrl  = ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) || ImGui::GetIO().KeyCtrl;
+                cur.shift = ((GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0) || ImGui::GetIO().KeyShift;
+                cur.alt   = ((GetAsyncKeyState(VK_MENU)    & 0x8000) != 0) || ImGui::GetIO().KeyAlt;
+                if (cur.ctrl && !s_pc)   s_lm = (GetAsyncKeyState(VK_RCONTROL)&0x8000) ? ImGuiKey_RightCtrl : ImGuiKey_LeftCtrl;
+                if (cur.shift && !s_ps)  s_lm = (GetAsyncKeyState(VK_RSHIFT)&0x8000) ? ImGuiKey_RightShift : ImGuiKey_LeftShift;
+                if (cur.alt && !s_pa)    s_lm = (GetAsyncKeyState(VK_RMENU)&0x8000) ? ImGuiKey_RightAlt : ImGuiKey_LeftAlt;
+                s_pc = cur.ctrl; s_ps = cur.shift; s_pa = cur.alt;
+
+                for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k) {
+                    ImGuiKey ik = static_cast<ImGuiKey>(k);
+                    if (ik == ImGuiKey_Escape || (ik >= ImGuiKey_MouseLeft && ik <= ImGuiKey_MouseMiddle) ||
+                        is_mod(ik) || (ik >= ImGuiKey_ReservedForModCtrl && ik <= ImGuiKey_ReservedForModSuper)) continue;
+                    if (ImGui::IsKeyDown(ik)) { cur.normal = ik; break; }
+                }
+                cur.last_mod = s_lm;
+
+                uint64_t now = GetTickCount64();
+                int cc = cur.count(), pc = s_has_peak ? s_peak.count() : 0;
+                if (cc > 0) {
+                    if (cc >= pc || (cur.normal != ImGuiKey_None && s_peak.normal == ImGuiKey_None)) {
+                        s_peak = cur; s_has_peak = true; s_in_rel = false;
+                    } else if (!s_in_rel) { s_in_rel = true; s_rel_ms = now; }
+                    else if (now - s_rel_ms > 250) { s_peak = cur; s_in_rel = false; }
                 }
 
-                if (s_capturing == a) {
-                    HeldState current;
-                    current.ctrl  = ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) || ImGui::GetIO().KeyCtrl;
-                    current.shift = ((GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0) || ImGui::GetIO().KeyShift;
-                    current.alt   = ((GetAsyncKeyState(VK_MENU)    & 0x8000) != 0) || ImGui::GetIO().KeyAlt;
+                int dots = 1 + static_cast<int>(fmod(ImGui::GetTime() * 3, 3));
+                std::string preview;
+                const ChordState &disp = !cur.empty() ? cur : s_peak;
+                if (!disp.empty() && (s_has_peak || !cur.empty())) {
+                    if (disp.ctrl)  preview += "Ctrl+";
+                    if (disp.shift) preview += "Shift+";
+                    if (disp.alt)   preview += "Alt+";
+                    if (disp.normal != ImGuiKey_None) preview += ImGui::GetKeyName(disp.normal);
+                    else if (!cur.empty()) preview += std::string(dots, '.');
+                    else if (disp.last_mod != ImGuiKey_None) preview += is_shift(disp.last_mod) ? "Shift" : is_ctrl(disp.last_mod) ? "Ctrl" : "Alt";
+                } else preview = "Press a key" + std::string(dots, '.');
 
-                    if (current.ctrl && !s_prev_ctrl)   s_last_mod_down = (GetAsyncKeyState(VK_RCONTROL) & 0x8000) ? ImGuiKey_RightCtrl : ImGuiKey_LeftCtrl;
-                    if (current.shift && !s_prev_shift) s_last_mod_down = (GetAsyncKeyState(VK_RSHIFT)   & 0x8000) ? ImGuiKey_RightShift : ImGuiKey_LeftShift;
-                    if (current.alt && !s_prev_alt)     s_last_mod_down = (GetAsyncKeyState(VK_RMENU)    & 0x8000) ? ImGuiKey_RightAlt : ImGuiKey_LeftAlt;
+                ImGui::TextColored(ImVec4(1, 1, 1, 1), "%s", preview.c_str());
+                ImGui::SameLine();
+                ImGui::TextDisabled("Esc to cancel");
 
-                    s_prev_ctrl  = current.ctrl;
-                    s_prev_shift = current.shift;
-                    s_prev_alt   = current.alt;
-
-                    for (int kk = static_cast<int>(ImGuiKey_NamedKey_BEGIN); kk < static_cast<int>(ImGuiKey_NamedKey_END); ++kk) {
-                        ImGuiKey k = static_cast<ImGuiKey>(kk);
-                        if (k == ImGuiKey_Escape) continue;
-                        if (k >= ImGuiKey_MouseLeft && k <= ImGuiKey_MouseMiddle) continue;
-                        if (is_modifier_key(k)) continue;
-                        if (k >= ImGuiKey_ReservedForModCtrl && k <= ImGuiKey_ReservedForModSuper) continue;
-
-                        if (ImGui::IsKeyDown(k)) {
-                            current.normal_key = k;
-                            break;
-                        }
+                // commit when all keys released
+                if (s_has_peak && cur.empty() && ImGui::GetFrameCount() > s_cap_frame + 2) {
+                    ImGuiKey pk = ImGuiKey_None; bool bc = false, bs = false, ba = false;
+                    if (s_peak.normal != ImGuiKey_None) {
+                        pk = s_peak.normal; bc = s_peak.ctrl; bs = s_peak.shift; ba = s_peak.alt;
+                    } else if (s_peak.count() > 0) {
+                        ImGuiKey m = s_peak.last_mod != ImGuiKey_None ? s_peak.last_mod :
+                            s_peak.shift ? ImGuiKey_LeftShift : s_peak.ctrl ? ImGuiKey_LeftCtrl : ImGuiKey_LeftAlt;
+                        pk = m;
+                        if (!is_ctrl(m))  bc = s_peak.ctrl;
+                        if (!is_shift(m)) bs = s_peak.shift;
+                        if (!is_alt(m))   ba = s_peak.alt;
                     }
-                    current.last_mod_key = s_last_mod_down;
-
-                    uint64_t now = GetTickCount64();
-                    constexpr uint64_t kReleaseBufferMs = 250;
-                    int cur_count = current.count();
-                    int peak_count = s_has_peak ? s_peak_chord.count() : 0;
-
-                    if (cur_count > 0) {
-                        if (cur_count >= peak_count || (current.normal_key != ImGuiKey_None && s_peak_chord.normal_key == ImGuiKey_None)) {
-                            s_peak_chord = current;
-                            s_has_peak = true;
-                            s_in_release = false;
-                            s_release_start_ms = 0;
-                        } else {
-                            if (!s_in_release) {
-                                s_in_release = true;
-                                s_release_start_ms = now;
-                            } else if (now - s_release_start_ms > kReleaseBufferMs) {
-                                s_peak_chord = current;
-                                s_in_release = false;
-                                s_release_start_ms = 0;
-                            }
-                        }
+                    if (pk != ImGuiKey_None) {
+                        g_bindings[a] = {pk, bc, bs, ba};
+                        save_binding(act);
                     }
-
-                    int anim_dots = 1 + static_cast<int>(fmod(ImGui::GetTime() * 3.0, 3.0));
-                    std::string dots_str(anim_dots, '.');
-                    std::string preview;
-
-                    if (!current.empty()) {
-                        if (current.ctrl)  preview += "Ctrl+";
-                        if (current.shift) preview += "Shift+";
-                        if (current.alt)   preview += "Alt+";
-                        if (current.normal_key != ImGuiKey_None) {
-                            preview += ImGui::GetKeyName(current.normal_key);
-                        } else {
-                            preview += dots_str;
-                        }
-                    } else if (s_has_peak && !s_peak_chord.empty()) {
-                        if (s_peak_chord.ctrl)  preview += "Ctrl+";
-                        if (s_peak_chord.shift) preview += "Shift+";
-                        if (s_peak_chord.alt)   preview += "Alt+";
-                        if (s_peak_chord.normal_key != ImGuiKey_None) {
-                            preview += ImGui::GetKeyName(s_peak_chord.normal_key);
-                        } else if (s_peak_chord.last_mod_key != ImGuiKey_None) {
-                            preview += (is_shift_key(s_peak_chord.last_mod_key) ? "Shift" :
-                                        is_ctrl_key(s_peak_chord.last_mod_key) ? "Ctrl" : "Alt");
-                        }
-                    } else {
-                        preview = "Press a key" + dots_str;
-                    }
-
-                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", preview.c_str());
-
-                    // commit once all keys released
-                    if (s_has_peak && current.empty() && ImGui::GetFrameCount() > s_capturing_start_frame + 2) {
-                        ImGuiKey primary_key = ImGuiKey_None;
-                        bool req_ctrl = false;
-                        bool req_shift = false;
-                        bool req_alt = false;
-
-                        if (s_peak_chord.normal_key != ImGuiKey_None) {
-                            primary_key = s_peak_chord.normal_key;
-                            req_ctrl  = s_peak_chord.ctrl;
-                            req_shift = s_peak_chord.shift;
-                            req_alt   = s_peak_chord.alt;
-                        } else if (s_peak_chord.count() > 0) {
-                            ImGuiKey mod = s_peak_chord.last_mod_key;
-                            if (mod == ImGuiKey_None) {
-                                if (s_peak_chord.shift) mod = ImGuiKey_LeftShift;
-                                else if (s_peak_chord.ctrl) mod = ImGuiKey_LeftCtrl;
-                                else if (s_peak_chord.alt) mod = ImGuiKey_LeftAlt;
-                            }
-                            primary_key = mod;
-                            if (is_ctrl_key(mod)) {
-                                req_shift = s_peak_chord.shift;
-                                req_alt   = s_peak_chord.alt;
-                            } else if (is_shift_key(mod)) {
-                                req_ctrl = s_peak_chord.ctrl;
-                                req_alt  = s_peak_chord.alt;
-                            } else if (is_alt_key(mod)) {
-                                req_ctrl  = s_peak_chord.ctrl;
-                                req_shift = s_peak_chord.shift;
-                            }
-                        }
-
-                        if (primary_key != ImGuiKey_None) {
-                            Binding &b = g_bindings[a];
-                            b.key = primary_key;
-                            b.ctrl = req_ctrl;
-                            b.shift = req_shift;
-                            b.alt = req_alt;
-                            save_binding(act);
-                        }
-
-                        s_capturing = -1;
-                        s_peak_chord = HeldState{};
-                        s_has_peak = false;
-                        s_in_release = false;
-                        s_release_start_ms = 0;
-                        s_prev_ctrl = false;
-                        s_prev_shift = false;
-                        s_prev_alt = false;
-                        s_last_mod_down = ImGuiKey_None;
-                    }
-                }
-            } else {
-                char b[96];
-                describe_binding(act, b, sizeof(b));
-                char id[104];
-                snprintf(id, sizeof(id), "%s###kb%d", b, a);
-                if (ImGui::Button(id, ImVec2(120.0f, 0))) {
-                    s_capturing = a;
-                    s_capturing_start_frame = ImGui::GetFrameCount();
-                    s_peak_chord = HeldState{};
-                    s_has_peak = false;
-                    s_in_release = false;
-                    s_release_start_ms = 0;
-                    s_prev_ctrl = false;
-                    s_prev_shift = false;
-                    s_prev_alt = false;
-                    s_last_mod_down = ImGuiKey_None;
+                    s_capturing = -1; s_peak = {}; s_has_peak = false;
+                    s_in_rel = false; s_pc = s_ps = s_pa = false; s_lm = ImGuiKey_None;
                 }
             }
+        } else {
+            char b[96]; describe_binding(act, b, sizeof(b));
+            char id[104]; snprintf(id, sizeof(id), "%s###kb%d", b, a);
+            if (ImGui::Button(id, ImVec2(btn_w, 0))) {
+                s_capturing = a; s_cap_frame = s_cap_seen = ImGui::GetFrameCount();
+                s_peak = {}; s_has_peak = false; s_in_rel = false;
+                s_pc = s_ps = s_pa = false; s_lm = ImGuiKey_None;
+            }
         }
+    }
+
+    const Binding &u = g_bindings[0], &r = g_bindings[1];
+    if (u.key == r.key && u.ctrl == r.ctrl && u.shift == r.shift && u.alt == r.alt)
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Undo and Redo share a binding. Redo won't trigger from it.");
+
+    ImGui::Spacing();
+    if (ImGui::Button("Reset keybinds to defaults")) reset_keybinds();
+}
+
+void on_draw_overlay(reshade::api::effect_runtime *rt) {
+    try {
+        ContextManager &cm = ContextManager::instance();
 
         ImGui::Spacing();
-        if (ImGui::Button("Reset Keybinds to Defaults")) {
-            reset_keybinds();
-        }
+        ImGui::SeparatorText("History");
 
+        size_t uc = g_global_mode ? cm.global_undo_count() : cm.get_domain(cm.active_domain()).undo_count();
+        size_t rc = g_global_mode ? cm.global_redo_count() : cm.get_domain(cm.active_domain()).redo_count();
+        note("Click an entry to jump. %zu undoable, %zu redoable (%s).", uc, rc, g_global_mode ? "all tabs" : "this tab");
         ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
 
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("Undo / Redo v1.0.0  -  by NotRayST");
-        ImGui::PopTextWrapPos();
-
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 4.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
-
-        if (ImGui::Button("GitHub")) {
-            ShellExecuteW(nullptr, L"open", L"https://github.com/NotRayST/ShaderLab", nullptr, nullptr, SW_SHOW);
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("https://github.com/NotRayST/ShaderLab");
+        if (AuditionStateMachine::instance().is_active()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.2f, 1.0f));
+            ImGui::TextWrapped("[Auditioning: %s - %.1fs remaining]",
+                               AuditionStateMachine::instance().target_label().c_str(),
+                               AuditionStateMachine::instance().time_remaining_sec());
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
         }
 
+        char ub[64], rb[64], ud[32], rd[32];
+        describe_binding(Action::Undo, ud, sizeof(ud));
+        describe_binding(Action::Redo, rd, sizeof(rd));
+        snprintf(ub, sizeof(ub), "Undo (%s)###undo", ud);
+        snprintf(rb, sizeof(rb), "Redo (%s)###redo", rd);
+
+        float btn_w = (std::max)(60.0f, (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f);
+        { ScopedDisabled off(uc == 0); if (ImGui::Button(ub, ImVec2(btn_w, 0))) step(rt, false); }
         ImGui::SameLine();
+        { ScopedDisabled off(rc == 0); if (ImGui::Button(rb, ImVec2(btn_w, 0))) step(rt, true); }
+        ImGui::Spacing();
 
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.18f, 0.18f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.10f, 0.10f, 0.10f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.35f, 0.35f, 0.35f, 1.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+        // timeline scrubber
+        size_t total = g_global_mode ? cm.global_size() : cm.get_domain(cm.active_domain()).size();
+        if (total > 0) {
+            int cur = static_cast<int>(uc), mx = static_cast<int>(total);
+            char sfmt[48]; snprintf(sfmt, sizeof(sfmt), "Step %%d of %d", mx);
+            ImGui::SetNextItemWidth(-1.0f);
+            bool scrub_changed = ImGui::SliderInt("##HistoryScrub", &cur, 0, mx, sfmt);
+            bool scrub_active = ImGui::IsItemActive();
+            bool scrub_deactivated = ImGui::IsItemDeactivated();
 
-        if (ImGui::Button("Support me on Patreon")) {
+            if (scrub_active) {
+                WindowTransformCommand::set_defer_transforms(true);
+                g_suppress_tracking_frames = 2;
+            }
+
+            if (scrub_changed) {
+                flush_pending();
+                size_t tp = static_cast<size_t>(mx - cur);
+                g_global_mode ? cm.jump_global(tp, rt) : cm.jump_domain(cm.active_domain(), tp, rt);
+            }
+
+            if (scrub_deactivated || (!scrub_active && WindowTransformCommand::has_deferred_transforms())) {
+                WindowTransformCommand::set_defer_transforms(false);
+                g_suppress_tracking_frames = 2;
+            }
+            ImGui::Spacing();
+        }
+
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##HistoryFilter", "Filter history...", g_filter, sizeof(g_filter));
+        ImGui::Spacing();
+
+        if (ImGui::BeginTabBar("UndoRedoTabs")) {
+            if (ImGui::BeginTabItem("Shaders")) {
+                cm.set_active_domain(CommandDomain::ShaderState);
+                render_queue_viewer(rt, CommandDomain::ShaderState, "ShaderHistoryChild"); ImGui::EndTabItem(); }
+#if UNDOREDO_WINDOW_LAYOUT
+            if (ImGui::BeginTabItem("Window Layout")) {
+                cm.set_active_domain(CommandDomain::WindowLayout);
+                render_queue_viewer(rt, CommandDomain::WindowLayout, "WindowHistoryChild"); ImGui::EndTabItem(); }
+#endif
+            if (ImGui::BeginTabItem("Combined Timeline")) {
+                render_combined_timeline(rt); ImGui::EndTabItem(); }
+            ImGui::EndTabBar();
+        }
+
+        ImGui::Spacing();
+        {
+            ScopedDisabled off(cm.global_size() == 0);
+            if (ImGui::Button("Clear all history")) ImGui::OpenPopup("Clear history?");
+        }
+        if (ImGui::BeginPopupModal("Clear history?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Remove all %zu entries from every tab? This can't be undone.", cm.global_size());
+            if (ImGui::Button("Clear")) { cm.clear_all(); ImGui::CloseCurrentPopup(); }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        ImGui::Spacing();
+
+        if (ImGui::CollapsingHeader("Settings")) {
+            if (ImGui::Checkbox("Show as its own ReShade tab", &g_standalone_tab)) {
+                if (rt) reshade::set_config_value(rt, "UndoRedo", "StandaloneTab", g_standalone_tab);
+                reshade::unregister_overlay(g_standalone_tab ? nullptr : "Undo / Redo", &on_draw_overlay);
+                reshade::register_overlay(g_standalone_tab ? "Undo / Redo" : nullptr, &on_draw_overlay);
+            }
+            tip("When enabled, registers as a dedicated top-level tab in ReShade alongside Home, Settings, and Statistics.\nWhen disabled, docks inside ReShade's Add-ons tab.");
+
+            if (ImGui::Checkbox("Capture all hidden uniforms", &g_allow_all_hidden))
+                if (rt) reshade::set_config_value(rt, "UndoRedo", "CaptureAllHiddenUniforms", g_allow_all_hidden);
+            tip("By default, hidden and nosave uniforms are excluded.\nEnabling this captures hidden uniform changes across all shaders.");
+
+            if (ImGui::Checkbox("Log captured uniforms to ReShade.log", &g_log_addon_uniforms))
+                if (rt) reshade::set_config_value(rt, "UndoRedo", "LogAddonUniforms", g_log_addon_uniforms);
+            tip("Logs every uniform change captured by Undo/Redo into ReShade.log for diagnostic analysis.");
+
+            if (ImGui::Checkbox("Hotkeys use combined history", &g_global_mode))
+                if (rt) reshade::set_config_value(rt, "UndoRedo", "GlobalUndoMode", g_global_mode);
+            tip("When enabled, pressing Undo/Redo acts on the latest global action across all tabs.\nWhen disabled, acts only on the currently active tab.");
+        }
+
+        if (ImGui::CollapsingHeader("Keybindings")) draw_keybindings();
+
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        ImGui::TextDisabled("Undo / Redo v1.1.0 by NotRayST");
+
+        if (ImGui::Button("GitHub"))
+            ShellExecuteW(nullptr, L"open", L"https://github.com/NotRayST/ShaderLab", nullptr, nullptr, SW_SHOW);
+        tip("https://github.com/NotRayST/ShaderLab");
+        ImGui::SameLine();
+        if (ImGui::Button("Support on Patreon"))
             ShellExecuteW(nullptr, L"open", L"https://www.patreon.com/cw/RayST", nullptr, nullptr, SW_SHOW);
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("https://www.patreon.com/cw/RayST");
-        }
+        tip("https://www.patreon.com/cw/RayST");
 
-        ImGui::PopStyleColor(5);
-        ImGui::PopStyleVar(1);
-        ImGui::PopStyleVar(2);
     } catch (...) {
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Error rendering Undo/Redo overlay");
-        ImGui::PopTextWrapPos();
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Error rendering Undo/Redo overlay");
     }
 }
 
 } // namespace
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
+// --- inter-addon c abi ---
+
+extern "C" {
+
+__declspec(dllexport) bool ReShadeUndoRedo_RegisterAddon(const char *id, ReShadeUndoRedo_ActionHandler h, void *ud) {
+    return AddonRegistry::instance().register_addon(id, h, ud);
+}
+
+__declspec(dllexport) void ReShadeUndoRedo_UnregisterAddon(const char *id) {
+    AddonRegistry::instance().unregister_addon(id);
+}
+
+__declspec(dllexport) bool ReShadeUndoRedo_PushCustomAction(
+    const char *id, const char *tag, const char *label,
+    const uint8_t *before, const uint8_t *after, uint32_t sz)
 {
+    if (!id || !tag) return false;
+    std::vector<uint8_t> bv, av;
+    if (before && sz) bv.assign(before, before + sz);
+    if (after && sz)  av.assign(after, after + sz);
+    return ContextManager::instance().push_command(
+        std::make_unique<ExternalAddonCommand>(id, tag, label ? label : "", std::move(bv), std::move(av)));
+}
+
+__declspec(dllexport) bool ReShadeUndoRedo_PushWindowTransform(
+    const char *name, const float bp[2], const float bs[2], const float ap[2], const float as[2])
+{
+#if !UNDOREDO_WINDOW_LAYOUT
+    (void)name; (void)bp; (void)bs; (void)ap; (void)as;
+    return false;
+#else
+    if (!name || !bp || !bs || !ap || !as) return false;
+    return ContextManager::instance().push_command(
+        std::make_unique<WindowTransformCommand>(name, bp, bs, ap, as));
+#endif
+}
+
+} // extern "C"
+
+// --- addon lifecycle ---
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*lpReserved*/) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
-        if (!reshade::register_addon(hModule))
-            return FALSE;
-
+        if (!reshade::register_addon(hModule)) return FALSE;
         init_keybinds(nullptr);
-        load_history_from_file();
-
+        reshade::get_config_value(nullptr, "UndoRedo", "StandaloneTab", g_standalone_tab);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(&on_runtime_init);
+        reshade::register_event<reshade::addon_event::destroy_effect_runtime>(&on_runtime_destroy);
         reshade::register_event<reshade::addon_event::reshade_set_current_preset_path>(&on_preset_changed);
         reshade::register_event<reshade::addon_event::reshade_set_uniform_value>(&on_set_uniform_value);
         reshade::register_event<reshade::addon_event::reshade_set_technique_state>(&on_set_technique_state);
         reshade::register_event<reshade::addon_event::reshade_overlay>(&on_overlay_frame);
-        reshade::register_overlay(nullptr, &on_draw_overlay);
+        reshade::register_overlay(g_standalone_tab ? "Undo / Redo" : nullptr, &on_draw_overlay);
         break;
-
     case DLL_PROCESS_DETACH:
-        reshade::unregister_overlay(nullptr, &on_draw_overlay);
+        reshade::unregister_overlay(g_standalone_tab ? "Undo / Redo" : nullptr, &on_draw_overlay);
         reshade::unregister_event<reshade::addon_event::reshade_overlay>(&on_overlay_frame);
         reshade::unregister_event<reshade::addon_event::reshade_set_technique_state>(&on_set_technique_state);
         reshade::unregister_event<reshade::addon_event::reshade_set_uniform_value>(&on_set_uniform_value);
         reshade::unregister_event<reshade::addon_event::reshade_set_current_preset_path>(&on_preset_changed);
+        reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(&on_runtime_destroy);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(&on_runtime_init);
-
-        delete_history_file();
         reshade::unregister_addon(hModule);
         break;
     }

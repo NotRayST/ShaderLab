@@ -669,7 +669,7 @@ void WelcomeHud::render(ID3D11DeviceContext *context, uint32_t width, uint32_t h
         BYTE va = static_cast<BYTE>(120.0f * m_fade_alpha);
         SolidBrush ver_brush(Color(va, 130, 130, 135));
         RectF ver_rect(0, static_cast<float>(height) - (ver_font_size * 2.5f + 8.0f), static_cast<float>(width), ver_font_size * 2.0f);
-        g.DrawString(L"V1.2.1 - By NotRayST", -1, version_font.get(), ver_rect, &center_sf, &ver_brush);
+        g.DrawString(L"V1.2.2 - By NotRayST", -1, version_font.get(), ver_rect, &center_sf, &ver_brush);
     }
 
     upload_bitmap(context, bitmap, width, height);

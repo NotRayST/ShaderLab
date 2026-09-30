@@ -35,8 +35,24 @@ static void set_host_status(SharedControlBlock *block, const std::wstring &msg) 
     std::wcout << L"[Host] " << msg << L"\n";
 }
 
+static bool path_is_within(const fs::path &child, const fs::path &parent) {
+    auto child_it = child.begin();
+    auto parent_it = parent.begin();
+    for (; parent_it != parent.end(); ++parent_it, ++child_it) {
+        if (child_it == child.end() || *child_it != *parent_it)
+            return false;
+    }
+    return true;
+}
+
+static bool is_erase_stage_path(const std::wstring &path) {
+    std::wstring p = path;
+    for (auto &c : p) c = towlower(c);
+    return p.find(L"erase_stages") != std::wstring::npos;
+}
+
 static std::wstring prepare_working_copy(const std::wstring &source_path) {
-    if (source_path.empty() || !fs::exists(source_path)) {
+    if (source_path.empty() || !fs::exists(source_path) || is_erase_stage_path(source_path)) {
         return source_path;
     }
 
@@ -50,7 +66,7 @@ static std::wstring prepare_working_copy(const std::wstring &source_path) {
     fs::create_directories(ws_dir, ec);
 
     fs::path src(source_path);
-    if (src.parent_path() == ws_dir) {
+    if (path_is_within(src, ws_dir)) {
         return source_path;
     }
 
@@ -58,7 +74,9 @@ static std::wstring prepare_working_copy(const std::wstring &source_path) {
 
     // clean previous workspace contents so stale sidecars or leftover files dont stick around
     for (const auto &entry : fs::directory_iterator(ws_dir, ec)) {
-        fs::remove(entry.path(), ec);
+        if (entry.path().filename() != L"erase_stages") {
+            fs::remove_all(entry.path(), ec);
+        }
     }
 
     fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
@@ -232,11 +250,9 @@ static void setup_cli_console() {
     if (hOut && hOut != INVALID_HANDLE_VALUE && GetFileType(hOut) != FILE_TYPE_UNKNOWN) {
         int fd = _open_osfhandle((intptr_t)hOut, _O_TEXT);
         if (fd >= 0) {
-            FILE *fp = _fdopen(fd, "w");
-            if (fp) {
-                *stdout = *fp;
-                setvbuf(stdout, nullptr, _IONBF, 0);
-            }
+            _dup2(fd, _fileno(stdout));
+            _close(fd);
+            setvbuf(stdout, nullptr, _IONBF, 0);
         }
     } else if (has_parent_console) {
         FILE *fp = nullptr;
@@ -247,11 +263,9 @@ static void setup_cli_console() {
     if (hErr && hErr != INVALID_HANDLE_VALUE && GetFileType(hErr) != FILE_TYPE_UNKNOWN) {
         int fd = _open_osfhandle((intptr_t)hErr, _O_TEXT);
         if (fd >= 0) {
-            FILE *fp = _fdopen(fd, "w");
-            if (fp) {
-                *stderr = *fp;
-                setvbuf(stderr, nullptr, _IONBF, 0);
-            }
+            _dup2(fd, _fileno(stderr));
+            _close(fd);
+            setvbuf(stderr, nullptr, _IONBF, 0);
         }
     } else if (has_parent_console) {
         FILE *fp = nullptr;
@@ -279,6 +293,46 @@ struct GdiplusScope {
     }
 };
 
+static void register_host_path_in_registry() {
+    wchar_t exe_path[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH) > 0) {
+        HKEY hKey = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\ShaderLab", 0, nullptr,
+                            REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+            RegSetValueExW(hKey, L"ExecutablePath", 0, REG_SZ,
+                           reinterpret_cast<const BYTE *>(exe_path),
+                           static_cast<DWORD>((wcslen(exe_path) + 1) * sizeof(wchar_t)));
+
+            fs::path parent = fs::path(exe_path).parent_path();
+            std::wstring parent_str = parent.wstring();
+            RegSetValueExW(hKey, L"InstallPath", 0, REG_SZ,
+                           reinterpret_cast<const BYTE *>(parent_str.c_str()),
+                           static_cast<DWORD>((parent_str.length() + 1) * sizeof(wchar_t)));
+            RegCloseKey(hKey);
+        }
+
+        // Register shaderlab:// protocol handler under HKCU\Software\Classes\shaderlab
+        HKEY hProto = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Classes\\shaderlab", 0, nullptr,
+                            REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hProto, nullptr) == ERROR_SUCCESS) {
+            const wchar_t protoDesc[] = L"URL:ShaderLab Protocol";
+            RegSetValueExW(hProto, nullptr, 0, REG_SZ, reinterpret_cast<const BYTE *>(protoDesc), sizeof(protoDesc));
+            RegSetValueExW(hProto, L"URL Protocol", 0, REG_SZ, reinterpret_cast<const BYTE *>(L""), sizeof(wchar_t));
+
+            HKEY hCmd = nullptr;
+            if (RegCreateKeyExW(hProto, L"shell\\open\\command", 0, nullptr,
+                                REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hCmd, nullptr) == ERROR_SUCCESS) {
+                std::wstring cmd = L"\"" + std::wstring(exe_path) + L"\" \"%1\"";
+                RegSetValueExW(hCmd, nullptr, 0, REG_SZ,
+                               reinterpret_cast<const BYTE *>(cmd.c_str()),
+                               static_cast<DWORD>((cmd.length() + 1) * sizeof(wchar_t)));
+                RegCloseKey(hCmd);
+            }
+            RegCloseKey(hProto);
+        }
+    }
+}
+
 static int run_app(int argc, wchar_t **argv) {
     if (!argv || argc <= 0) return 1;
 
@@ -288,6 +342,7 @@ static int run_app(int argc, wchar_t **argv) {
         return CliDispatcher::dispatch(argc, argv);
     }
 
+    register_host_path_in_registry();
     GdiplusScope gdiplus_scope;
 
     // set up the shared block first, before any gpu stuff, so the addon can latch onto it asap
@@ -366,6 +421,8 @@ static int run_app(int argc, wchar_t **argv) {
     }
 
     LoadedImage active_image;
+    LoadedImage original_image;
+    std::wstring display_image_name;
     ViewportController viewport;
     SettleDetector settle_detector;
     CompassHud compass_hud;
@@ -415,11 +472,14 @@ static int run_app(int argc, wchar_t **argv) {
     uint32_t export_canvas_w = 0;
     uint32_t export_canvas_h = 0;
     bool export_wysiwyg = true;
+    ViewportTransform export_transform = {};
     uint32_t flush_frames_remaining = 0;  // extra frames rendered after convergence detected
     uint32_t export_start_effects_ready = 0;
     bool export_effects_initialized = false;
     uint32_t export_reload_wait_frames = 0;
     uint32_t export_capture_wait_frames = 0;
+    uint32_t export_loading_frames = 0;
+    auto last_export_tick = std::chrono::steady_clock::now();
 
     // external hud composite tracking
     uint32_t last_addon_heartbeat = 0;
@@ -465,11 +525,28 @@ static int run_app(int argc, wchar_t **argv) {
     };
 
     // check if launched with an image or project file argument
-    if (argc > 1 && argv[1] && argv[1][0] != L'-' && fs::exists(argv[1])) {
+    std::wstring launch_path;
+    if (argc > 1 && argv[1] && argv[1][0] != L'-') {
+        std::wstring raw_arg = argv[1];
+        if (raw_arg.rfind(L"shaderlab://", 0) == 0) {
+            raw_arg = raw_arg.substr(12);
+            if (raw_arg.rfind(L"open?path=", 0) == 0) {
+                raw_arg = raw_arg.substr(10);
+            }
+            if (raw_arg.size() >= 2 && raw_arg.front() == L'"' && raw_arg.back() == L'"') {
+                raw_arg = raw_arg.substr(1, raw_arg.size() - 2);
+            }
+        }
+        if (fs::exists(raw_arg)) {
+            launch_path = raw_arg;
+        }
+    }
+
+    if (!launch_path.empty()) {
         active_image.srv = nullptr;
-        wcsncpy_s(control_block->dropped_file_path, kMaxPathW, argv[1], _TRUNCATE);
+        wcsncpy_s(control_block->dropped_file_path, kMaxPathW, launch_path.c_str(), _TRUNCATE);
         control_block->dropped_file_counter = 1;
-        wcsncpy_s(control_block->preview_path, kMaxPathW, argv[1], _TRUNCATE);
+        wcsncpy_s(control_block->preview_path, kMaxPathW, launch_path.c_str(), _TRUNCATE);
         control_block->preview_counter = 1;
         last_preview_counter = 0;
     } else {
@@ -491,6 +568,19 @@ static int run_app(int argc, wchar_t **argv) {
     int nudge_stage = 0; // 0 = idle, 1 = shrunk (restore next frame)
 
     while (running) {
+        if (control_block) {
+            viewport.set_erase_active((control_block->view_interaction_flags & VIEW_FLAG_ERASE_ACTIVE) != 0);
+            if (control_block->export_state == ExportState::Idle && control_block->view_transform_version != last_synced_xform_ver) {
+                last_synced_xform_ver = control_block->view_transform_version;
+                viewport.sync_from_block(control_block);
+            }
+            static uint32_t s_last_synced_ba_ver = 0;
+            if (control_block->before_after_version != s_last_synced_ba_ver) {
+                s_last_synced_ba_ver = control_block->before_after_version;
+                viewport.sync_from_block(control_block);
+            }
+        }
+
         MSG msg = {};
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
@@ -594,7 +684,8 @@ static int run_app(int argc, wchar_t **argv) {
             }
 
             DWORD fg_pid = 0;
-            GetWindowThreadProcessId(GetForegroundWindow(), &fg_pid);
+            HWND fg_hwnd = GetForegroundWindow();
+            if (fg_hwnd) GetWindowThreadProcessId(fg_hwnd, &fg_pid);
             bool is_app_focused = (fg_pid == GetCurrentProcessId());
             bool want_text = (control_block->view_interaction_flags & VIEW_FLAG_TEXT_INPUT) != 0;
             bool is_d_pressed = (GetAsyncKeyState('D') & 0x8000) != 0;
@@ -655,7 +746,7 @@ static int run_app(int argc, wchar_t **argv) {
         };
 
         // sync the view transform if the addon modified it, e.g. while the reshade overlay is open
-        if (control_block->view_transform_version != last_synced_xform_ver) {
+        if (control_block->export_state == ExportState::Idle && control_block->view_transform_version != last_synced_xform_ver) {
             last_synced_xform_ver = control_block->view_transform_version;
             viewport.sync_from_block(control_block);
         }
@@ -695,8 +786,13 @@ static int run_app(int argc, wchar_t **argv) {
         // detect before/after toggle or lock flag changes to show top notification
         static uint32_t s_last_ba_flag = 0;
         uint32_t cur_ba_flag = control_block->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER;
+        static uint32_t s_last_erase_flag = 0;
+        uint32_t cur_erase_flag = control_block->view_interaction_flags & VIEW_FLAG_ERASE_ACTIVE;
         uint32_t cur_lock_flags = control_block->view_interaction_flags & (VIEW_FLAG_LOCK_PAN | VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT);
-        if (cur_ba_flag != s_last_ba_flag) {
+        if (cur_erase_flag != s_last_erase_flag) {
+            s_last_erase_flag = cur_erase_flag;
+            toast_hud.show(cur_erase_flag ? L"Erase Mode Active" : L"Erase Mode Disabled");
+        } else if (cur_ba_flag != s_last_ba_flag) {
             s_last_ba_flag = cur_ba_flag;
             toast_hud.show(cur_ba_flag ? L"Before / After Comparison Active" : L"Before / After Disabled");
             last_lock_flags = cur_lock_flags;
@@ -765,22 +861,22 @@ static int run_app(int argc, wchar_t **argv) {
                     last_synced_xform_ver = control_block->view_transform_version;
 
                 } else if (action_id == static_cast<uint32_t>(IpcAction::LockPan)) {
-                    control_block->view_interaction_flags ^= VIEW_FLAG_LOCK_PAN;
+                    ipc_toggle_view_flag(&control_block->view_interaction_flags, VIEW_FLAG_LOCK_PAN);
                 } else if (action_id == static_cast<uint32_t>(IpcAction::LockZoom)) {
-                    control_block->view_interaction_flags ^= VIEW_FLAG_LOCK_ZOOM;
+                    ipc_toggle_view_flag(&control_block->view_interaction_flags, VIEW_FLAG_LOCK_ZOOM);
                 } else if (action_id == static_cast<uint32_t>(IpcAction::LockRotate)) {
-                    control_block->view_interaction_flags ^= VIEW_FLAG_LOCK_ROT;
+                    ipc_toggle_view_flag(&control_block->view_interaction_flags, VIEW_FLAG_LOCK_ROT);
                 } else if (action_id == static_cast<uint32_t>(IpcAction::LockView)) {
                     uint32_t all_mask = (VIEW_FLAG_LOCK_PAN | VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT);
                     if ((control_block->view_interaction_flags & all_mask) == all_mask) {
-                        control_block->view_interaction_flags &= ~all_mask;
+                        ipc_clear_view_flag(&control_block->view_interaction_flags, all_mask);
                     } else {
-                        control_block->view_interaction_flags |= all_mask;
+                        ipc_set_view_flag(&control_block->view_interaction_flags, all_mask);
                     }
                 } else if (action_id == static_cast<uint32_t>(IpcAction::ToggleFullscreen)) {
                     toggle_fullscreen_safe(gfx, &toast_hud, control_block);
                 } else if (action_id == static_cast<uint32_t>(IpcAction::FineTune)) {
-                    control_block->view_interaction_flags ^= VIEW_FLAG_FINE;
+                    ipc_toggle_view_flag(&control_block->view_interaction_flags, VIEW_FLAG_FINE);
                 } else if (action_id == static_cast<uint32_t>(IpcAction::NudgeLeft)) {
                     if (!(control_block->view_interaction_flags & VIEW_FLAG_LOCK_PAN)) {
                         float step = (control_block->view_interaction_flags & VIEW_FLAG_FINE) ? 2.0f : 15.0f;
@@ -811,8 +907,8 @@ static int run_app(int argc, wchar_t **argv) {
                 control_block->mailbox.seq_handled = control_block->mailbox.seq_request;
             } else if (cmd == static_cast<uint32_t>(IpcCmd::SetDepthPeek)) {
                 bool peek = (control_block->mailbox.values[0] > 0.5f);
-                if (peek) control_block->view_interaction_flags |= VIEW_FLAG_DEPTH_PEEK;
-                else control_block->view_interaction_flags &= ~VIEW_FLAG_DEPTH_PEEK;
+                if (peek) ipc_set_view_flag(&control_block->view_interaction_flags, VIEW_FLAG_DEPTH_PEEK);
+                else ipc_clear_view_flag(&control_block->view_interaction_flags, VIEW_FLAG_DEPTH_PEEK);
                 control_block->mailbox.status = 1;
                 control_block->mailbox.seq_handled = control_block->mailbox.seq_request;
             } else if (cmd == static_cast<uint32_t>(IpcCmd::ResizeWindow)) {
@@ -899,6 +995,10 @@ static int run_app(int argc, wchar_t **argv) {
                         LoadedImage new_preview;
                         if (ImageLoader::load_from_file(gfx.get_device(), out_img_path.c_str(), new_preview)) {
                             active_image = new_preview;
+                            original_image = active_image;
+                            control_block->erase_history_step = 0;
+                            control_block->erase_history_count = 0;
+                            display_image_name = fs::path(proj_src_path).filename().wstring();
                             if (manifest.depth.has_depth && manifest.depth.far_plane > 0.0f) {
                                 active_image.far_plane = manifest.depth.far_plane;
                             }
@@ -917,7 +1017,8 @@ static int run_app(int argc, wchar_t **argv) {
                             if (manifest.view.lock_zoom) flags |= VIEW_FLAG_LOCK_ZOOM;
                             if (manifest.view.lock_rot)  flags |= VIEW_FLAG_LOCK_ROT;
                             if (manifest.view.lock_pan)  flags |= VIEW_FLAG_LOCK_PAN;
-                            control_block->view_interaction_flags = flags;
+                            constexpr uint32_t kProjectLockMask = VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT | VIEW_FLAG_LOCK_PAN;
+                            ipc_update_view_flags(&control_block->view_interaction_flags, kProjectLockMask, flags);
                             control_block->view_transform_version++;
                             viewport.sync_from_block(control_block);
 
@@ -931,15 +1032,15 @@ static int run_app(int argc, wchar_t **argv) {
                             control_block->active_project_version++;
 
                             // restore reshade preset if present
-                            if (!out_preset_path.empty() && fs::exists(out_preset_path)) {
+                            if (control_block->export_state == ExportState::Idle && !out_preset_path.empty() && fs::exists(out_preset_path)) {
                                 fs::path abs_preset = fs::absolute(out_preset_path);
                                 wcsncpy_s(control_block->requested_preset_path, kMaxPathW, abs_preset.wstring().c_str(), _TRUNCATE);
                                 control_block->requested_preset_version++;
                             }
 
                             std::wstring depth_info = active_image.has_depth ? (L" [Depth Active, F=" + std::to_wstring(static_cast<int>(active_image.far_plane)) + L"]") : L" [2D]";
-                            set_host_status(control_block, L"Loaded Project: " + fs::path(proj_src_path).filename().wstring() + depth_info);
-                            update_window_title(L"ShaderLab - " + fs::path(proj_src_path).filename().wstring());
+                            set_host_status(control_block, L"Loaded Project: " + display_image_name + depth_info);
+                            update_window_title(L"ShaderLab - " + display_image_name);
                         } else {
                             set_host_status(control_block, L"Project error: failed to decode image inside " + fs::path(proj_src_path).filename().wstring());
                         }
@@ -952,25 +1053,33 @@ static int run_app(int argc, wchar_t **argv) {
                     if (work_path != control_block->preview_path) {
                         wcsncpy_s(control_block->preview_path, kMaxPathW, work_path.c_str(), _TRUNCATE);
                     }
-                    wcsncpy_s(control_block->dropped_file_path, kMaxPathW, orig_source_path.c_str(), _TRUNCATE);
-                    control_block->dropped_file_counter++;
+                    if (orig_source_path != work_path) {
+                        wcsncpy_s(control_block->dropped_file_path, kMaxPathW, orig_source_path.c_str(), _TRUNCATE);
+                        control_block->dropped_file_counter++;
+                    }
 
                     LoadedImage new_preview;
                     if (ImageLoader::load_from_file(gfx.get_device(), control_block->preview_path, new_preview)) {
                         active_image = new_preview;
+                        if (!is_erase_stage_path(control_block->preview_path)) {
+                            original_image = active_image;
+                            control_block->erase_history_step = 0;
+                            control_block->erase_history_count = 0;
+                            display_image_name = fs::path(control_block->preview_path).filename().wstring();
+
+                            // reset active project since a raw image was opened
+                            control_block->active_project_path[0] = L'\0';
+                            control_block->project_dirty = 0;
+                            control_block->active_project_version++;
+                        }
                         control_block->view_image_width = active_image.width;
                         control_block->view_image_height = active_image.height;
                         sync_depth_to_ipc();
 
-                        // reset active project since a raw image was opened
-                        control_block->active_project_path[0] = L'\0';
-                        control_block->project_dirty = 0;
-                        control_block->active_project_version++;
-
                         std::wstring depth_info = active_image.has_depth ? (L" [Depth Active, F=" + std::to_wstring(static_cast<int>(active_image.far_plane)) + L"]") : L" [2D]";
-                        set_host_status(control_block, L"Loaded: " + std::wstring(control_block->preview_path) +
+                        set_host_status(control_block, L"Loaded: " + display_image_name +
                                         L" (" + std::to_wstring(active_image.width) + L"x" + std::to_wstring(active_image.height) + L")" + depth_info);
-                        update_window_title(L"ShaderLab - " + fs::path(control_block->preview_path).filename().wstring());
+                        update_window_title(L"ShaderLab - " + display_image_name);
                     }
                 }
             }
@@ -979,12 +1088,16 @@ static int run_app(int argc, wchar_t **argv) {
         sync_depth_to_ipc();
 
         if (control_block && control_block->export_state != ExportState::Idle) {
-            control_block->view_interaction_flags &= ~VIEW_FLAG_DEPTH_PEEK;
+            ipc_clear_view_flag(&control_block->view_interaction_flags, VIEW_FLAG_DEPTH_PEEK);
         }
 
         // export state machine
         switch (control_block->export_state) {
         case ExportState::Requested: {
+            export_capture_wait_frames = 0;
+            export_loading_frames = 0;
+            last_export_tick = std::chrono::steady_clock::now();
+
             control_block->export_state = ExportState::Loading;
             update_window_title(L"ShaderLab - Loading Image for Export...");
             set_host_status(control_block, L"Export: loading image " + std::wstring(control_block->export_input_path));
@@ -1000,6 +1113,7 @@ static int run_app(int argc, wchar_t **argv) {
             gfx.set_processing_image(true);
 
             export_wysiwyg = (control_block->export_flags & EXPORT_FLAG_WYSIWYG) != 0;
+            export_transform = viewport.get_transform();
             if (export_wysiwyg) {
                 ViewportController::get_rotated_aabb(
                     active_image.width,
@@ -1040,11 +1154,11 @@ static int run_app(int argc, wchar_t **argv) {
             flush_frames_remaining = 0;
             settle_detector.reset();
 
-            control_block->export_state = ExportState::Rendering;
+            // stay in loading: next loop iterations present warmup frames so reshade and
+            // the d3d pipeline settle before convergence and rendering begin
             break;
         }
         case ExportState::Rendering: {
-            // depth canvas
             gfx.set_depth_render_target();
             gfx.clear_depth_canvas(1.0f);
             if (active_image.has_depth && active_image.depth_srv) {
@@ -1052,7 +1166,7 @@ static int run_app(int argc, wchar_t **argv) {
                     blit.render_depth_transformed(
                         gfx.get_context(),
                         active_image.depth_srv.Get(),
-                        viewport.get_transform(),
+                        export_transform,
                         static_cast<float>(export_canvas_w),
                         static_cast<float>(export_canvas_h),
                         static_cast<float>(active_image.width),
@@ -1064,7 +1178,6 @@ static int run_app(int argc, wchar_t **argv) {
                 }
             }
 
-            // color canvas
             gfx.set_render_target();
             gfx.clear(idle_color);
 
@@ -1072,7 +1185,7 @@ static int run_app(int argc, wchar_t **argv) {
                 blit.render_transformed(
                     gfx.get_context(),
                     active_image.srv.Get(),
-                    viewport.get_transform(),
+                    export_transform,
                     static_cast<float>(export_canvas_w),
                     static_cast<float>(export_canvas_h),
                     static_cast<float>(active_image.width),
@@ -1087,22 +1200,20 @@ static int run_app(int argc, wchar_t **argv) {
 
             bool unsynced = (control_block->export_flags & EXPORT_FLAG_UNSYNCED) != 0;
             if (!unsynced) {
-                static auto s_last_export_tick = std::chrono::steady_clock::now();
                 auto now_export = std::chrono::steady_clock::now();
-                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now_export - s_last_export_tick).count();
-                if (elapsed_ms < 16) {
+                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now_export - last_export_tick).count();
+                if (elapsed_ms >= 0 && elapsed_ms < 16) {
                     Sleep(static_cast<DWORD>(16 - elapsed_ms));
                 }
-                s_last_export_tick = std::chrono::steady_clock::now();
+                last_export_tick = std::chrono::steady_clock::now();
             }
 
             // wait until reshade_finish_effects fires so effects are fully loaded on new canvas.
             // only require effects_ready to advance past the snapshot: once finish_effects has
             // fired at least one frame the runtime is live and effects rendered cleanly.
-            // we no longer check effects_compiling == 0 here because the preset sync inside
-            // on_reshade_finish_effects can set effects_compiling back to 1 in the same
-            // callback that cleared it, which made the host spin through a whole second
-            // recompile cycle even though effects were already rendering fine
+            // don't gate on effects_compiling == 0: preset sync inside on_reshade_finish_effects
+            // can set it back to 1 in the same callback that cleared it, which spins a whole
+            // second recompile cycle even though effects were already rendering fine
             bool effects_enabled = has_reshade && addon_alive && (control_block->effects_enabled != 0);
             if (effects_enabled && !export_effects_initialized) {
                 bool finish_effects_fired = (control_block->effects_ready > export_start_effects_ready);
@@ -1189,7 +1300,6 @@ static int run_app(int argc, wchar_t **argv) {
             swprintf_s(cap_title, L"ShaderLab - Capturing Native %ux%u...", export_canvas_w, export_canvas_h);
             update_window_title(cap_title);
 
-            // depth canvas
             gfx.set_depth_render_target();
             gfx.clear_depth_canvas(1.0f);
             if (active_image.has_depth && active_image.depth_srv) {
@@ -1209,7 +1319,6 @@ static int run_app(int argc, wchar_t **argv) {
                 }
             }
 
-            // color canvas
             gfx.set_render_target();
             gfx.clear(idle_color);
 
@@ -1229,74 +1338,85 @@ static int run_app(int argc, wchar_t **argv) {
 
             export_capture_wait_frames++;
 
-            // if reshade effects are disabled or addon is not connected,
-            // or if addon has not captured within 15 frames, host captures clean frame directly
+            // addon already completed or failed export in on_reshade_finish_effects: skip
+            // host fallback capture so we never overwrite the addon's output
+            if (control_block->export_state == ExportState::Done || control_block->export_state == ExportState::Failed) {
+                export_capture_wait_frames = 0;
+                gfx.present(1, 0);
+                break;
+            }
+
+            // addon owns the capture in on_reshade_finish_effects while effects are active
+            // and connected; host captures directly only when effects are inactive, or as a
+            // safety fallback after 180 frames (~3s at 60fps)
             bool reshade_effects_active = has_reshade && addon_alive && (control_block->effects_enabled != 0);
-            if (!reshade_effects_active || export_capture_wait_frames >= 15) {
-                bool ok = BackbufferDump::capture_to_file(gfx, control_block->export_output_path, export_canvas_w, export_canvas_h);
-                if (ok) {
-                    bool req_embed = (control_block->export_flags & EXPORT_FLAG_EMBED_DEPTH) != 0;
-                    bool req_sidecar = (control_block->export_flags & EXPORT_FLAG_DEPTH_SIDECAR) != 0;
-                    if ((req_embed || req_sidecar) && active_image.has_depth && !active_image.depth_pixels.empty()) {
-                        std::string out_utf8 = wide_to_utf8(control_block->export_output_path);
-                        std::string ext = std::filesystem::path(control_block->export_output_path).extension().string();
-                        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(::tolower(c)); });
-                        bool is_png = (ext == ".png");
-                        if (!is_png && req_embed) {
-                            req_sidecar = true; // non-PNG fallback
-                        }
-                        if (is_png && req_embed) {
-                            DepthMapHeader c_hdr = {};
-                            c_hdr.magic = kDepthMagicSLD1;
-                            c_hdr.version = kDepthVersion1;
-                            c_hdr.encoding = 0;
-                            c_hdr.width = active_image.depth_width;
-                            c_hdr.height = active_image.depth_height;
-                            c_hdr.flags = kDepthFlagValid;
-                            c_hdr.near_plane = 1.0f;
-                            c_hdr.far_plane = active_image.far_plane;
-                            c_hdr.raw_byte_size = static_cast<uint32_t>(active_image.depth_pixels.size() * sizeof(float));
-                            c_hdr.timestamp = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch()).count());
-                            strcpy_s(c_hdr.game_name, "ShaderLab");
-                            std::string inj_err;
-                            depth_chunk::inject_sldp(out_utf8, c_hdr, active_image.depth_pixels.data(), active_image.depth_pixels.size(), inj_err);
-                        }
-                        if (req_sidecar) {
+            if (!reshade_effects_active || export_capture_wait_frames >= 180) {
+                if (control_block->export_state == ExportState::Capturing) {
+                    bool ok = BackbufferDump::capture_to_file(gfx, control_block->export_output_path, export_canvas_w, export_canvas_h);
+                    if (ok) {
+                        bool req_embed = (control_block->export_flags & EXPORT_FLAG_EMBED_DEPTH) != 0;
+                        bool req_sidecar = (control_block->export_flags & EXPORT_FLAG_DEPTH_SIDECAR) != 0;
+                        if ((req_embed || req_sidecar) && active_image.has_depth && !active_image.depth_pixels.empty()) {
+                            std::string out_utf8 = wide_to_utf8(control_block->export_output_path);
+                            std::string ext = std::filesystem::path(control_block->export_output_path).extension().string();
+                            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+                            bool is_png = (ext == ".png");
+                            if (!is_png && req_embed) {
+                                req_sidecar = true; // non-PNG fallback
+                            }
+                            if (is_png && req_embed) {
+                                DepthMapHeader c_hdr = {};
+                                c_hdr.magic = kDepthMagicSLD1;
+                                c_hdr.version = kDepthVersion1;
+                                c_hdr.encoding = 0;
+                                c_hdr.width = active_image.depth_width;
+                                c_hdr.height = active_image.depth_height;
+                                c_hdr.flags = kDepthFlagValid;
+                                c_hdr.near_plane = 1.0f;
+                                c_hdr.far_plane = active_image.far_plane;
+                                c_hdr.raw_byte_size = static_cast<uint32_t>(active_image.depth_pixels.size() * sizeof(float));
+                                c_hdr.timestamp = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count());
+                                strcpy_s(c_hdr.game_name, "ShaderLab");
+                                std::string inj_err;
+                                depth_chunk::inject_sldp(out_utf8, c_hdr, active_image.depth_pixels.data(), active_image.depth_pixels.size(), inj_err);
+                            }
+                            if (req_sidecar) {
+                                std::filesystem::path sidecar_p(control_block->export_output_path);
+                                sidecar_p.replace_extension(".sldepth");
+                                SidecarDepthHeader s_hdr = {};
+                                s_hdr.magic = kSidecarMagic;
+                                s_hdr.version = kSidecarVersion;
+                                s_hdr.encoding = 0;
+                                s_hdr.width = active_image.depth_width;
+                                s_hdr.height = active_image.depth_height;
+                                s_hdr.flags = kSidecarFlagValid;
+                                s_hdr.far_plane_used = active_image.far_plane;
+                                s_hdr.raw_byte_size = static_cast<uint32_t>(active_image.depth_pixels.size() * sizeof(float));
+                                s_hdr.timestamp = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count());
+                                strcpy_s(s_hdr.game_name, "ShaderLab");
+                                std::string side_err;
+                                depth_file::write_sidecar(wide_to_utf8(sidecar_p.wstring().c_str()), s_hdr, active_image.depth_pixels.data(), active_image.depth_pixels.size(), side_err);
+                            }
+                        } else {
+                            // clean up stale sidecar if depth was disabled
                             std::filesystem::path sidecar_p(control_block->export_output_path);
                             sidecar_p.replace_extension(".sldepth");
-                            SidecarDepthHeader s_hdr = {};
-                            s_hdr.magic = kSidecarMagic;
-                            s_hdr.version = kSidecarVersion;
-                            s_hdr.encoding = 0;
-                            s_hdr.width = active_image.depth_width;
-                            s_hdr.height = active_image.depth_height;
-                            s_hdr.flags = kSidecarFlagValid;
-                            s_hdr.far_plane_used = active_image.far_plane;
-                            s_hdr.raw_byte_size = static_cast<uint32_t>(active_image.depth_pixels.size() * sizeof(float));
-                            s_hdr.timestamp = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch()).count());
-                            strcpy_s(s_hdr.game_name, "ShaderLab");
-                            std::string side_err;
-                            depth_file::write_sidecar(wide_to_utf8(sidecar_p.wstring().c_str()), s_hdr, active_image.depth_pixels.data(), active_image.depth_pixels.size(), side_err);
+                            if (std::filesystem::exists(sidecar_p)) {
+                                std::error_code ec;
+                                std::filesystem::remove(sidecar_p, ec);
+                            }
                         }
+                        control_block->export_error = IPC_OK;
+                        std::wstring status_msg = L"Export complete: " + std::filesystem::path(control_block->export_output_path).filename().wstring();
+                        wcsncpy_s(control_block->export_status, kMaxPathW, status_msg.c_str(), _TRUNCATE);
+                        control_block->export_state = ExportState::Done;
                     } else {
-                        // clean up stale sidecar if depth was disabled
-                        std::filesystem::path sidecar_p(control_block->export_output_path);
-                        sidecar_p.replace_extension(".sldepth");
-                        if (std::filesystem::exists(sidecar_p)) {
-                            std::error_code ec;
-                            std::filesystem::remove(sidecar_p, ec);
-                        }
+                        control_block->export_error = IPC_ERR_WRITE_FAILED;
+                        wcsncpy_s(control_block->export_status, kMaxPathW, L"Export failed (file write error)", _TRUNCATE);
+                        control_block->export_state = ExportState::Failed;
                     }
-                    control_block->export_error = IPC_OK;
-                    std::wstring status_msg = L"Export complete: " + std::filesystem::path(control_block->export_output_path).filename().wstring();
-                    wcsncpy_s(control_block->export_status, kMaxPathW, status_msg.c_str(), _TRUNCATE);
-                    control_block->export_state = ExportState::Done;
-                } else {
-                    control_block->export_error = IPC_ERR_WRITE_FAILED;
-                    wcsncpy_s(control_block->export_status, kMaxPathW, L"Export failed (file write error)", _TRUNCATE);
-                    control_block->export_state = ExportState::Failed;
                 }
                 export_capture_wait_frames = 0;
             }
@@ -1307,6 +1427,7 @@ static int run_app(int argc, wchar_t **argv) {
         case ExportState::Done:
         case ExportState::Failed: {
             export_capture_wait_frames = 0;
+            export_loading_frames = 0;
             if (control_block->export_state == ExportState::Done) {
                 update_window_title(L"ShaderLab - Export Complete!");
             } else {
@@ -1320,58 +1441,86 @@ static int run_app(int argc, wchar_t **argv) {
             break;
         }
         case ExportState::Loading: {
-            // depth canvas
+            export_loading_frames++;
+            if (export_loading_frames > 300) {
+                control_block->export_error = IPC_ERR_TIMEOUT;
+                control_block->export_state = ExportState::Failed;
+                set_host_status(control_block, L"Export failed: loading timed out");
+                break;
+            }
+
             gfx.set_depth_render_target();
             gfx.clear_depth_canvas(1.0f);
             if (active_image.has_depth && active_image.depth_srv) {
-                blit.render_depth_transformed(
-                    gfx.get_context(),
-                    active_image.depth_srv.Get(),
-                    viewport.get_transform(),
-                    static_cast<float>(gfx.get_render_width()),
-                    static_cast<float>(gfx.get_render_height()),
-                    static_cast<float>(active_image.width),
-                    static_cast<float>(active_image.height),
-                    active_image.far_plane
-                );
+                if (export_wysiwyg) {
+                    blit.render_depth_transformed(
+                        gfx.get_context(),
+                        active_image.depth_srv.Get(),
+                        viewport.get_transform(),
+                        static_cast<float>(export_canvas_w),
+                        static_cast<float>(export_canvas_h),
+                        static_cast<float>(active_image.width),
+                        static_cast<float>(active_image.height),
+                        active_image.far_plane
+                    );
+                } else {
+                    blit.render_depth(gfx.get_context(), active_image.depth_srv.Get(), active_image.far_plane);
+                }
             }
 
-            // color canvas
             gfx.set_render_target();
             gfx.clear(idle_color);
 
             if (active_image.srv) {
-                blit.render_transformed(
-                    gfx.get_context(),
-                    active_image.srv.Get(),
-                    viewport.get_transform(),
-                    static_cast<float>(gfx.get_render_width()),
-                    static_cast<float>(gfx.get_render_height()),
-                    static_cast<float>(active_image.width),
-                    static_cast<float>(active_image.height)
-                );
+                if (export_wysiwyg) {
+                    blit.render_transformed(
+                        gfx.get_context(),
+                        active_image.srv.Get(),
+                        viewport.get_transform(),
+                        static_cast<float>(export_canvas_w),
+                        static_cast<float>(export_canvas_h),
+                        static_cast<float>(active_image.width),
+                        static_cast<float>(active_image.height)
+                    );
+                } else {
+                    blit.render(gfx.get_context(), active_image.srv.Get());
+                }
             }
-
-            // hud layers
-            render_hud_layers();
 
             UINT sync = (control_block->export_flags & EXPORT_FLAG_UNSYNCED) ? 0 : 1;
             gfx.present(sync, 0);
+
+            // Present 2 warmup frames so ReShade and the swapchain settle onto the new canvas size
+            if (export_loading_frames >= 2) {
+                export_start_effects_ready = control_block->effects_ready;
+                export_reload_wait_frames = 0;
+                export_effects_initialized = false;
+                control_block->export_frame_index = 0;
+                control_block->export_converged = 0;
+                control_block->export_last_delta = 1.0f;
+                flush_frames_remaining = 0;
+                settle_detector.reset();
+                control_block->export_state = ExportState::Rendering;
+            }
             break;
         }
         case ExportState::Idle:
         default: {
+            export_capture_wait_frames = 0;
+            export_loading_frames = 0;
+
             DWORD fg_pid = 0;
-            GetWindowThreadProcessId(GetForegroundWindow(), &fg_pid);
+            HWND fg_hwnd = GetForegroundWindow();
+            if (fg_hwnd) GetWindowThreadProcessId(fg_hwnd, &fg_pid);
             bool is_app_focused = (fg_pid == GetCurrentProcessId());
             bool want_text = (control_block->view_interaction_flags & VIEW_FLAG_TEXT_INPUT) != 0;
             bool is_d_pressed = (GetAsyncKeyState('D') & 0x8000) != 0;
             bool depth_peek = active_image.has_depth && active_image.depth_srv && is_d_pressed && is_app_focused && !want_text;
             if (control_block) {
                 if (depth_peek) {
-                    control_block->view_interaction_flags |= VIEW_FLAG_DEPTH_PEEK;
+                    ipc_set_view_flag(&control_block->view_interaction_flags, VIEW_FLAG_DEPTH_PEEK);
                 } else {
-                    control_block->view_interaction_flags &= ~VIEW_FLAG_DEPTH_PEEK;
+                    ipc_clear_view_flag(&control_block->view_interaction_flags, VIEW_FLAG_DEPTH_PEEK);
                 }
             }
 
@@ -1382,8 +1531,12 @@ static int run_app(int argc, wchar_t **argv) {
                     fs::path p(control_block->active_project_path);
                     fname = p.filename().wstring();
                 } else {
-                    fs::path p(control_block->preview_path);
-                    fname = p.filename().wstring();
+                    if (!display_image_name.empty()) {
+                        fname = display_image_name;
+                    } else {
+                        fs::path p(control_block->preview_path);
+                        fname = p.filename().wstring();
+                    }
                 }
                 if (fname.empty()) fname = L"Image";
 
@@ -1411,7 +1564,25 @@ static int run_app(int argc, wchar_t **argv) {
                 update_window_title(L"ShaderLab");
             }
 
-            // depth canvas
+            // before canvas (for un-erased comparison in before/after split)
+            bool ba_enabled = (control_block->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER) != 0;
+            if (ba_enabled && original_image.srv && control_block->erase_history_step > 0 && !depth_peek) {
+                gfx.set_before_render_target();
+                gfx.clear_before_canvas(idle_color);
+                blit.render_transformed(
+                    gfx.get_context(),
+                    original_image.srv.Get(),
+                    viewport.get_transform(),
+                    static_cast<float>(gfx.get_render_width()),
+                    static_cast<float>(gfx.get_render_height()),
+                    static_cast<float>(original_image.width),
+                    static_cast<float>(original_image.height)
+                );
+                control_block->before_canvas_srv_ptr = reinterpret_cast<uint64_t>(gfx.get_before_canvas_srv());
+            } else {
+                control_block->before_canvas_srv_ptr = 0;
+            }
+
             gfx.set_depth_render_target();
             gfx.clear_depth_canvas(1.0f);
             if (active_image.has_depth && active_image.depth_srv) {
@@ -1427,7 +1598,6 @@ static int run_app(int argc, wchar_t **argv) {
                 );
             }
 
-            // color canvas
             gfx.set_render_target();
             gfx.clear(idle_color);
 

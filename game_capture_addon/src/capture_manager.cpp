@@ -10,6 +10,7 @@
 #include <sstream>
 #include <algorithm>
 #include <windows.h>
+#include <shellapi.h>
 
 namespace fs = std::filesystem;
 
@@ -146,6 +147,11 @@ void CaptureManager::on_reshade_begin_effects(
     reshade::api::resource_view /*rtv_srgb*/)
 {
     if (!runtime) return;
+    if (!m_enabled) {
+        m_depth_resource = { 0 };
+        m_technique_found = false;
+        return;
+    }
 
     reshade::api::device* device = runtime->get_device();
     if (!device) return;
@@ -256,17 +262,28 @@ bool CaptureManager::embed_depth_in_png(reshade::api::effect_runtime* runtime, c
             try { far_plane = std::stof(far_str); } catch (...) { far_plane = 1000.0f; }
         }
 
+        uint32_t raw_size = 0;
+        if (m_depth_bit_depth == 1) {
+            raw_size = d_w * d_h * sizeof(uint16_t);
+        } else if (m_depth_bit_depth == 2) {
+            raw_size = d_w * d_h * sizeof(uint8_t);
+        } else if (m_depth_bit_depth == 3) {
+            raw_size = (d_w * d_h + 1) / 2;
+        } else {
+            raw_size = d_w * d_h * sizeof(float);
+        }
+
         auto now = std::chrono::system_clock::now();
         DepthMapHeader header = {};
         header.magic = kDepthMagicSLD1;
         header.version = kDepthVersion1;
-        header.encoding = m_export_16bit ? 1 : 0;
+        header.encoding = static_cast<uint16_t>(m_depth_bit_depth);
         header.width = d_w;
         header.height = d_h;
         header.flags = is_flat ? 0 : kDepthFlagValid;
         header.near_plane = 1.0f;
         header.far_plane = far_plane;
-        header.raw_byte_size = static_cast<uint32_t>(d_w * d_h * (m_export_16bit ? sizeof(uint16_t) : sizeof(float)));
+        header.raw_byte_size = raw_size;
         header.timestamp = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
         strcpy_s(header.game_name, "GameCapture");
 
@@ -391,7 +408,7 @@ bool CaptureManager::save_depth_sidecar(reshade::api::effect_runtime* runtime, c
 
         auto now = std::chrono::system_clock::now();
         SidecarDepthHeader header = {};
-        header.encoding = m_export_16bit ? 1 : 0;
+        header.encoding = static_cast<uint16_t>(m_depth_bit_depth);
         header.width = d_w;
         header.height = d_h;
         header.flags = is_flat ? (kSidecarFlagValid | kSidecarFlagFlat) : kSidecarFlagValid;
@@ -431,14 +448,37 @@ bool CaptureManager::save_depth_sidecar(reshade::api::effect_runtime* runtime, c
 }
 
 void CaptureManager::on_reshade_finish_effects(
-    reshade::api::effect_runtime* /*runtime*/,
+    reshade::api::effect_runtime* runtime,
     reshade::api::command_list* /*cmd_list*/,
     reshade::api::resource_view /*rtv*/,
     reshade::api::resource_view /*rtv_srgb*/)
 {
+    if (!runtime) return;
+
+    load_notice_state(runtime);
+
+    if (!m_notice_dismissed && !m_overlay_opened_once) {
+        static uint32_t s_frame_delay = 0;
+        s_frame_delay++;
+        if (s_frame_delay > 90) { // wait ~1.5s after game loads
+            m_overlay_opened_once = true;
+            runtime->open_overlay(true, reshade::api::input_source::keyboard);
+        }
+    }
+}
+
+void CaptureManager::set_enabled(reshade::api::effect_runtime* runtime, bool enabled) {
+    m_enabled = enabled;
+    if (runtime) {
+        reshade::set_config_value<bool>(runtime, "ShaderLabCapture", "Enabled", m_enabled);
+    }
 }
 
 void CaptureManager::on_reshade_screenshot(reshade::api::effect_runtime* runtime, const char* path) {
+    if (!m_enabled) {
+        log("INFO", "ReShade screenshot ignored because ShaderLab Capture add-on is disabled");
+        return;
+    }
     if (!path || !*path) return;
 
     log("INFO", "ReShade screenshot event received for: " + std::string(path));
@@ -447,22 +487,243 @@ void CaptureManager::on_reshade_screenshot(reshade::api::effect_runtime* runtime
     embed_depth_in_png(runtime, path);
 }
 
-void CaptureManager::on_draw_overlay(reshade::api::effect_runtime* /*runtime*/) {
+void CaptureManager::load_notice_state(reshade::api::effect_runtime* runtime) {
+    if (m_notice_checked) return;
+    m_notice_checked = true;
+    reshade::get_config_value<bool>(runtime, "ShaderLabCapture", "NoticeDismissed", m_notice_dismissed);
+    m_notice_open = !m_notice_dismissed;
+    reshade::get_config_value<bool>(runtime, "ShaderLabCapture", "Enabled", m_enabled);
+    if (!reshade::get_config_value<int>(runtime, "ShaderLabCapture", "BitDepth", m_depth_bit_depth)) {
+        bool export_16bit = true;
+        if (reshade::get_config_value<bool>(runtime, "ShaderLabCapture", "Export16Bit", export_16bit)) {
+            m_depth_bit_depth = export_16bit ? 1 : 0;
+        }
+    }
+    m_depth_bit_depth = std::clamp(m_depth_bit_depth, 0, 3);
+
+    bool standalone = true;
+    if (reshade::get_config_value<bool>(runtime, "ShaderLabCapture", "StandaloneTab", standalone)) {
+        if (standalone != is_standalone_tab()) {
+            set_standalone_tab(runtime, standalone);
+        }
+    }
+}
+
+void CaptureManager::on_reshade_overlay_frame(reshade::api::effect_runtime* runtime) {
+    if (!runtime) return;
+
+    load_notice_state(runtime);
+    if (!m_notice_open) return;
+
+    // shown once, save it on first draw, so close counts as seen
+    if (!m_notice_dismissed) {
+        m_notice_dismissed = true;
+        reshade::set_config_value<bool>(runtime, "ShaderLabCapture", "NoticeDismissed", true);
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2((std::min)(ImGui::GetFontSize() * 32.0f, io.DisplaySize.x - 40.0f), 0.0f), ImGuiCond_Appearing);
+
+    bool open = true;
+    if (ImGui::Begin("ShaderLab Capture - Depth Data##FirstRunNotice", &open,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "Screenshots taken with this add-on embed full 3D scene depth data. "
+            "To view, relight, or edit it, you need ShaderLab, a free image editor using ReShade shaders.\n\n"
+            "Even without it, your screenshots still open normally anywhere, they just have an extra few MBs."
+        );
+        ImGui::Spacing();
+
+        if (ImGui::Button("Download ShaderLab (.zip)")) {
+            ShellExecuteW(nullptr, L"open", L"https://github.com/NotRayST/ShaderLab/releases/latest/download/ShaderLab_Windows.zip", nullptr, nullptr, SW_SHOW);
+            open = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("ShaderLab GitHub")) {
+            ShellExecuteW(nullptr, L"open", L"https://github.com/NotRayST/ShaderLab#readme", nullptr, nullptr, SW_SHOW);
+        }
+    }
+    ImGui::End();  // must run even when Begin() returns false
+
+    if (!open) m_notice_open = false;
+}
+
+static std::wstring find_shaderlab_executable() {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\ShaderLab", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t buf[MAX_PATH] = {};
+        DWORD sz = sizeof(buf);
+        DWORD type = REG_SZ;
+        if (RegQueryValueExW(hKey, L"ExecutablePath", nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS) {
+            RegCloseKey(hKey);
+            if (buf[0] != L'\0' && fs::exists(buf)) {
+                return buf;
+            }
+        } else {
+            RegCloseKey(hKey);
+        }
+    }
+    return L"";
+}
+
+static std::string get_screenshot_key_name(reshade::api::effect_runtime* runtime) {
+    if (!runtime) return "PrintScreen key or your configured key";
+
+    char buf[128] = { 0 };
+    size_t sz = sizeof(buf);
+    // reshade::get_config_value returns elements separated by '\0'
+    if (!reshade::get_config_value(runtime, "INPUT", "KeyScreenshot", buf, &sz) || sz == 0) {
+        return "Print Screen"; // Default ReShade key
+    }
+
+    unsigned int keys[4] = { 0, 0, 0, 0 };
+    const char* p = buf;
+    for (int i = 0; i < 4 && p < buf + sz && *p; ++i) {
+        try {
+            keys[i] = static_cast<unsigned int>(std::stoul(p));
+        } catch (...) {
+            keys[i] = 0;
+        }
+        p += strlen(p) + 1;
+    }
+
+    if (keys[0] == 0) {
+        return "PrintScreen key or your configured key";
+    }
+
+    static const char* const keyboard_keys[256] = {
+        "", "Left Mouse", "Right Mouse", "Cancel", "Middle Mouse", "X1 Mouse", "X2 Mouse", "", "Backspace", "Tab", "", "", "Clear", "Enter", "", "",
+        "Shift", "Control", "Alt", "Pause", "Caps Lock", "", "", "", "", "", "", "Escape", "", "", "", "",
+        "Space", "Page Up", "Page Down", "End", "Home", "Left Arrow", "Up Arrow", "Right Arrow", "Down Arrow", "Select", "", "", "Print Screen", "Insert", "Delete", "Help",
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "", "", "", "", "", "",
+        "", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+        "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "Left Windows", "Right Windows", "Apps", "", "Sleep",
+        "Numpad 0", "Numpad 1", "Numpad 2", "Numpad 3", "Numpad 4", "Numpad 5", "Numpad 6", "Numpad 7", "Numpad 8", "Numpad 9", "Numpad *", "Numpad +", "", "Numpad -", "Numpad Decimal", "Numpad /",
+        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14", "F15", "F16",
+        "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24", "", "", "", "", "", "", "", "",
+        "Num Lock", "Scroll Lock", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+        "Left Shift", "Right Shift", "Left Control", "Right Control", "Left Menu", "Right Menu", "Browser Back", "Browser Forward", "Browser Refresh", "Browser Stop", "Browser Search", "Browser Favorites", "Browser Home", "Volume Mute", "Volume Down", "Volume Up",
+        "Next Track", "Previous Track", "Media Stop", "Media Play/Pause", "Mail", "Media Select", "Launch App 1", "Launch App 2", "", "", "OEM ;", "OEM +", "OEM ,", "OEM -", "OEM .", "OEM /",
+        "OEM ~", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+        "", "", "", "", "", "", "", "", "", "", "", "OEM [", "OEM \\", "OEM ]", "OEM '", "OEM 8",
+        "", "", "OEM <", "", "", "", "", "", "", "", "", "", "", "", "", "",
+        "", "", "", "", "", "", "Attn", "CrSel", "ExSel", "Erase EOF", "Play", "Zoom", "", "PA1", "OEM Clear", ""
+    };
+
+    std::string key_str;
+    if (keys[1]) key_str += "Ctrl + ";
+    if (keys[2]) key_str += "Shift + ";
+    if (keys[3]) key_str += "Alt + ";
+
+    if (keys[0] < 256 && keyboard_keys[keys[0]][0] != '\0') {
+        key_str += keyboard_keys[keys[0]];
+    } else {
+        char name[64] = { 0 };
+        UINT scanCode = MapVirtualKeyA(keys[0], MAPVK_VK_TO_VSC);
+        if (scanCode != 0 && GetKeyNameTextA(scanCode << 16, name, sizeof(name)) > 0) {
+            key_str += name;
+        } else {
+            key_str += "Key(" + std::to_string(keys[0]) + ")";
+        }
+    }
+
+    return key_str;
+}
+
+void CaptureManager::on_draw_overlay(reshade::api::effect_runtime* runtime) {
+    load_notice_state(runtime);
+
     ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "ShaderLab Capture");
     ImGui::Separator();
     ImGui::Spacing();
 
-    ImGui::TextWrapped("How to capture: Press Printscreen or F12, or what you changed the reshade screenshot button to, screenshotting using other methods won't work.");
+    bool enabled = m_enabled;
+    if (ImGui::Checkbox("Enabled", &enabled)) {
+        set_enabled(runtime, enabled);
+    }
 
     ImGui::Spacing();
-    ImGui::Checkbox("Export 16-Bit Depth (Recommended for file size)", &m_export_16bit);
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // Screenshot Key detection & instructions
+    std::string key_str = get_screenshot_key_name(runtime);
+    ImGui::TextWrapped("How to capture: Press %s to capture with embedded 3D depth.", key_str.c_str());
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.65f, 0.65f, 1.0f));
+    ImGui::TextWrapped("Capturing via external overlay software (Steam, Nvidia, Windows Game Bar) will not embed depth.");
+    ImGui::PopStyleColor();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // Dropdown for bit definition
+    const char* bit_depth_items[] = {
+        "32-Bit Float (Lossless, ~4 B/px)",
+        "16-Bit Int (High Quality, ~2 B/px)",
+        "8-Bit Int (Standard, ~1 B/px)",
+        "4-Bit Int (Compact, ~0.5 B/px)"
+    };
+    ImGui::Text("Depth Bit Definition:");
+    if (ImGui::Combo("##DepthBitDepth", &m_depth_bit_depth, bit_depth_items, IM_ARRAYSIZE(bit_depth_items))) {
+        reshade::set_config_value<int>(runtime, "ShaderLabCapture", "BitDepth", m_depth_bit_depth);
+    }
+
+    static const char* const bit_depth_descriptions[] = {
+        "Lossless 32-bit floating point. Maximum precision, largest file size (~4x).",
+        "16-bit quantized (65,536 levels). Visually indistinguishable from 32-bit (~2x size).",
+        "8-bit normalized (256 levels). Balanced quality with small file size (~1x size).",
+        "4-bit quantized (16 levels). Extremely compact depth payload (~0.5x size)."
+    };
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+    ImGui::TextWrapped("%s", bit_depth_descriptions[m_depth_bit_depth]);
+    ImGui::PopStyleColor();
+
+    ImGui::Spacing();
+    bool embed_in_addons = !is_standalone_tab();
+    if (ImGui::Checkbox("Embed into Add-ons tab", &embed_in_addons)) {
+        set_standalone_tab(runtime, !embed_in_addons);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (!m_last_saved_png_path.empty() && m_last_capture_success) {
+        fs::path p(m_last_saved_png_path);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.9f, 0.4f, 1.0f));
+        ImGui::Text("Depth saved to %s.", p.filename().string().c_str());
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+
+    std::wstring exe = find_shaderlab_executable();
+    if (exe.empty()) {
+        // Not downloaded yet: auto-download link
+        if (ImGui::Button("Download ShaderLab (.zip)", ImVec2(-1, 32))) {
+            ShellExecuteW(nullptr, L"open", L"https://github.com/NotRayST/ShaderLab/releases/latest/download/ShaderLab_Windows.zip", nullptr, nullptr, SW_SHOW);
+        }
+    } else if (m_last_saved_png_path.empty()) {
+        // Downloaded, but no capture yet
+        if (ImGui::Button("Open ShaderLab", ImVec2(-1, 32))) {
+            ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr, nullptr, SW_SHOW);
+        }
+    } else {
+        // Downloaded and captured: open last captured image
+        if (ImGui::Button("Open Last Captured Image in ShaderLab", ImVec2(-1, 32))) {
+            std::wstring arg = L"\"" + fs::path(m_last_saved_png_path).wstring() + L"\"";
+            ShellExecuteW(nullptr, L"open", exe.c_str(), arg.c_str(), nullptr, SW_SHOW);
+        }
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
     ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextDisabled("ShaderLab Capture v1.2.1  -  by NotRayST");
+    ImGui::TextDisabled("ShaderLab Capture v1.2.2  -  by NotRayST");
     ImGui::PopTextWrapPos();
 }
 

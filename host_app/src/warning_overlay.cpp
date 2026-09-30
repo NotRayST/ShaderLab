@@ -75,7 +75,6 @@ void WarningOverlay::render_gdiplus(ID3D11DeviceContext *context, uint32_t width
     SolidBrush backdrop(Color(a, 0, 0, 0));
     g.FillRectangle(&backdrop, 0, 0, (INT)width, (INT)height);
 
-    // centered card
     float cw = (std::min)(500.0f, width * 0.88f);
     float ch = 200.0f;
     float cx = (width  - cw) * 0.5f;
@@ -98,7 +97,6 @@ void WarningOverlay::render_gdiplus(ID3D11DeviceContext *context, uint32_t width
 
     BYTE ta = static_cast<BYTE>(255.0f * m_fade_alpha);
 
-    // title
     auto font_title = HudFontManager::get().create_font(15.0f, FontStyleBold);
     SolidBrush white(Color(ta, 230, 230, 230));
     RectF title_rect(cx + 24.0f, cy + 24.0f, cw - 48.0f, 22.0f);

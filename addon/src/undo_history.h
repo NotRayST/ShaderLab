@@ -26,11 +26,12 @@ void init();
 // unregisters everything init() registered
 void shutdown();
 
-// --- counts ------------------------------------------------------------
 size_t undo_count(); // steps that can be undone right now
 size_t redo_count(); // steps that can be redone right now
 
-// --- history browsing (index 0 = most recent change) -------------------
+void undo(reshade::api::effect_runtime *runtime);
+void redo(reshade::api::effect_runtime *runtime);
+
 size_t history_size();
 
 // fills a short human-readable label for the change at index (0 = most recent).
@@ -47,5 +48,12 @@ void jump_to(reshade::api::effect_runtime *runtime, size_t index);
 
 // drops the whole history, used on runtime teardown
 void clear();
+
+// drops only the erase-step entries (used when the erase history is reset
+// for a new image / project so stale undo entries can't restore old stages)
+void clear_erase_entries();
+
+// records an erase operation in the undo/redo history
+void record_erase_step(uint32_t step);
 
 } // namespace undo_history

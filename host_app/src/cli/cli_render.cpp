@@ -1,4 +1,5 @@
 #include "cli_render.h"
+#include "cli_reshade_utils.h"
 #include "../gfx_device.h"
 #include "../image_loader.h"
 #include "../blit_renderer.h"
@@ -14,82 +15,15 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <regex>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
-
-#include "../../../common/str_utils.h"
 
 using str_utils::wide_to_utf8;
 using str_utils::utf8_to_wide;
 
 #include "../../third_party/stb/stb_image.h"
-
-#include <regex>
-#include <unordered_map>
-
-static std::vector<std::string> extract_techniques_from_shader(const fs::path &shader_file) {
-    std::vector<std::string> techniques;
-    std::ifstream in(shader_file);
-    if (!in.is_open()) return techniques;
-
-    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    std::regex tech_regex(R"(\btechnique\s+([A-Za-z0-9_]+))");
-    auto words_begin = std::sregex_iterator(content.begin(), content.end(), tech_regex);
-    auto words_end = std::sregex_iterator();
-
-    for (auto it = words_begin; it != words_end; ++it) {
-        std::smatch match = *it;
-        std::string name = match[1].str();
-        if (std::find(techniques.begin(), techniques.end(), name) == techniques.end()) {
-            techniques.push_back(name);
-        }
-    }
-    return techniques;
-}
-
-static fs::path synthesize_shader_preset(const fs::path &shader_path, const std::wstring &technique_name, const std::vector<std::pair<std::string, std::string>> &uniforms) {
-    std::string filename = shader_path.filename().string();
-    std::vector<std::string> techniques;
-    if (!technique_name.empty()) {
-        techniques.push_back(wide_to_utf8(technique_name.c_str()));
-    } else {
-        techniques = extract_techniques_from_shader(shader_path);
-        if (techniques.empty()) {
-            techniques.push_back(shader_path.stem().string());
-        }
-    }
-
-    std::string tech_str;
-    for (size_t i = 0; i < techniques.size(); ++i) {
-        if (i > 0) tech_str += ",";
-        tech_str += techniques[i] + "@" + filename;
-    }
-
-    wchar_t temp_dir[MAX_PATH] = {};
-    GetTempPathW(MAX_PATH, temp_dir);
-    fs::path temp_preset = fs::path(temp_dir) / ("ShaderLab_temp_" + std::to_string(GetCurrentProcessId()) + "_" + filename + ".ini");
-
-    std::ofstream out(temp_preset, std::ios::trunc);
-    out << "Techniques=" << tech_str << "\n";
-    out << "TechniqueSorting=" << tech_str << "\n\n";
-    out << "[" << filename << "]\n";
-    for (const auto &kv : uniforms) {
-        if (kv.first.find(':') == std::string::npos) {
-            out << kv.first << "=" << kv.second << "\n";
-        }
-    }
-    for (const auto &kv : uniforms) {
-        size_t colon_pos = kv.first.find(':');
-        if (colon_pos != std::string::npos) {
-            std::string sec = kv.first.substr(0, colon_pos);
-            std::string var = kv.first.substr(colon_pos + 1);
-            out << "\n[" << sec << "]\n" << var << "=" << kv.second << "\n";
-        }
-    }
-    out.close();
-
-    return temp_preset;
-}
 
 static fs::path create_preset_with_overrides(const fs::path &base_preset, const std::string &default_section, const std::vector<std::pair<std::string, std::string>> &uniforms) {
     std::ifstream in(base_preset);
@@ -195,126 +129,11 @@ static fs::path create_preset_with_overrides(const fs::path &base_preset, const 
     return temp_preset;
 }
 
-static void set_reshade_preset_in_ini(const fs::path &preset_path, const fs::path &extra_shader_dir = {}) {
-    wchar_t exe_path[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-    fs::path ini_path = fs::path(exe_path).parent_path() / "ReShade.ini";
-    if (!fs::exists(ini_path)) {
-        if (fs::exists("ReShade.ini")) {
-            ini_path = "ReShade.ini";
-        } else {
-            return;
-        }
-    }
-
-    std::ifstream in(ini_path);
-    if (!in.is_open()) return;
-
-    std::vector<std::string> lines;
-    std::string line;
-    bool in_general = false;
-    bool in_overlay = false;
-    bool preset_set = false;
-    bool had_general = false;
-    bool had_effect_paths = false;
-    std::string abs_preset = fs::absolute(preset_path).string();
-    std::string abs_extra_dir = extra_shader_dir.empty() ? "" : fs::absolute(extra_shader_dir).string();
-
-    while (std::getline(in, line)) {
-        std::string trimmed = line;
-        trimmed.erase(0, trimmed.find_first_not_of(" \t\r\n"));
-        trimmed.erase(trimmed.find_last_not_of(" \t\r\n") + 1);
-
-        if (trimmed.rfind("[", 0) == 0) {
-            if (in_general) {
-                if (!preset_set) {
-                    lines.push_back("PresetPath=" + abs_preset);
-                    preset_set = true;
-                }
-                if (!abs_extra_dir.empty() && !had_effect_paths) {
-                    lines.push_back("EffectSearchPaths=.\\," + abs_extra_dir);
-                    had_effect_paths = true;
-                }
-            }
-            in_general = (_stricmp(trimmed.c_str(), "[GENERAL]") == 0);
-            if (in_general) had_general = true;
-            in_overlay = (_stricmp(trimmed.c_str(), "[OVERLAY]") == 0);
-        }
-
-        if (in_general && trimmed.rfind("PresetPath=", 0) == 0) {
-            lines.push_back("PresetPath=" + abs_preset);
-            preset_set = true;
-            continue;
-        }
-
-        if (in_general && trimmed.rfind("EffectSearchPaths=", 0) == 0) {
-            had_effect_paths = true;
-            if (!abs_extra_dir.empty()) {
-                std::string lower_line = line;
-                std::transform(lower_line.begin(), lower_line.end(), lower_line.begin(), [](unsigned char c) { return (char)::tolower(c); });
-                std::string lower_dir = abs_extra_dir;
-                std::transform(lower_dir.begin(), lower_dir.end(), lower_dir.begin(), [](unsigned char c) { return (char)::tolower(c); });
-                if (lower_line.find(lower_dir) == std::string::npos) {
-                    line += "," + abs_extra_dir;
-                }
-            }
-            lines.push_back(line);
-            continue;
-        }
-
-        if (in_general && trimmed.rfind("PreprocessorDefinitions=", 0) == 0) {
-            // sanitize any double commas that break reshade macro definitions
-            std::string defs = line;
-            size_t pos = 0;
-            while ((pos = defs.find(",,")) != std::string::npos) {
-                defs.replace(pos, 2, ",");
-            }
-            lines.push_back(defs);
-            continue;
-        }
-
-        if (in_overlay) {
-            if (trimmed.rfind("ShowFPS=", 0) == 0) { lines.push_back("ShowFPS=0"); continue; }
-            if (trimmed.rfind("ShowClock=", 0) == 0) { lines.push_back("ShowClock=0"); continue; }
-            if (trimmed.rfind("ShowFrameTime=", 0) == 0) { lines.push_back("ShowFrameTime=0"); continue; }
-            if (trimmed.rfind("ShowPresetName=", 0) == 0) { lines.push_back("ShowPresetName=0"); continue; }
-            if (trimmed.rfind("TutorialProgress=", 0) == 0) { lines.push_back("TutorialProgress=4"); continue; }
-            if (trimmed.rfind("ShowPresetTransitionMessage=", 0) == 0) { lines.push_back("ShowPresetTransitionMessage=0"); continue; }
-            if (trimmed.rfind("ShowScreenshotMessage=", 0) == 0) { lines.push_back("ShowScreenshotMessage=0"); continue; }
-        }
-
-        lines.push_back(line);
-    }
-    in.close();
-
-    if (in_general) {
-        if (!preset_set) {
-            lines.push_back("PresetPath=" + abs_preset);
-            preset_set = true;
-        }
-        if (!abs_extra_dir.empty() && !had_effect_paths) {
-            lines.push_back("EffectSearchPaths=.\\," + abs_extra_dir);
-            had_effect_paths = true;
-        }
-    }
-    if (!had_general) {
-        lines.push_back("[GENERAL]");
-        lines.push_back("PresetPath=" + abs_preset);
-        if (!abs_extra_dir.empty()) {
-            lines.push_back("EffectSearchPaths=.\\," + abs_extra_dir);
-        }
-    }
-
-    std::ofstream out(ini_path, std::ios::trunc);
-    for (const auto &l : lines) {
-        out << l << "\n";
-    }
-}
-
 int CliRender::execute(const CliOptions &opts) {
     fs::path active_preset;
     fs::path temp_preset_to_delete;
     fs::path extra_shader_dir;
+    std::vector<std::string> target_shaders;
 
     if (!opts.shader_path.empty()) {
         if (!fs::exists(opts.shader_path)) {
@@ -322,6 +141,8 @@ int CliRender::execute(const CliOptions &opts) {
             return 1;
         }
         extra_shader_dir = fs::absolute(opts.shader_path).parent_path();
+        target_shaders.push_back(fs::path(opts.shader_path).filename().string());
+
         if (!opts.preset_path.empty() && fs::exists(opts.preset_path)) {
             std::string sec = fs::path(opts.shader_path).filename().string();
             temp_preset_to_delete = create_preset_with_overrides(opts.preset_path, sec, opts.uniform_overrides);
@@ -341,6 +162,7 @@ int CliRender::execute(const CliOptions &opts) {
         } else {
             active_preset = opts.preset_path;
         }
+        target_shaders = extract_shaders_from_preset(active_preset);
     } else {
         std::cerr << "Error: Neither --preset nor --shader specified for 'render'.\n";
         std::cerr << "Usage: ShaderLab.exe render (--preset <preset.ini> | --shader <shader.fx>) --input <file_or_dir> [--output <out>] [--set var=val]\n";
@@ -367,10 +189,14 @@ int CliRender::execute(const CliOptions &opts) {
         return 1;
     }
 
-    // update reshade preset in ini
-    set_reshade_preset_in_ini(active_preset, extra_shader_dir);
+    // configure reshade preset and search paths in ini with RAII guard to restore on exit
+    fs::path ini_path = find_reshade_ini_path();
+    ReShadeIniGuard ini_guard(ini_path);
+    configure_reshade_ini(ini_path, active_preset, extra_shader_dir);
 
-    // collect input files
+    // clear previous log so we only inspect current invocation
+    clear_reshade_log_files(extra_shader_dir.empty() ? ini_path : extra_shader_dir);
+
     std::vector<fs::path> images;
     if (fs::is_directory(opts.input_path)) {
         for (const auto &entry : fs::directory_iterator(opts.input_path)) {
@@ -391,7 +217,6 @@ int CliRender::execute(const CliOptions &opts) {
         return 1;
     }
 
-    // destination directory
     fs::path out_dir;
     if (!opts.output_path.empty()) {
         out_dir = opts.output_path;
@@ -486,6 +311,7 @@ int CliRender::execute(const CliOptions &opts) {
     GfxDevice gfx;
     if (!gfx.initialize(L"ShaderLab - Batch Renderer", 640, 360, init_w, init_h, false)) {
         std::cerr << "Error: Failed to initialize D3D11 graphics device\n";
+        ini_guard.restore();
         UnmapViewOfFile(control_block);
         CloseHandle(hMap);
         return 1;
@@ -494,6 +320,8 @@ int CliRender::execute(const CliOptions &opts) {
     BlitRenderer blit;
     if (!blit.initialize(gfx.get_device())) {
         std::cerr << "Error: Failed to initialize BlitRenderer\n";
+        gfx.shutdown();
+        ini_guard.restore();
         UnmapViewOfFile(control_block);
         CloseHandle(hMap);
         return 1;
@@ -523,6 +351,8 @@ int CliRender::execute(const CliOptions &opts) {
     MSG msg = {};
     auto warm_start = std::chrono::steady_clock::now();
     uint32_t warm_frames = 0;
+    bool compile_failed = false;
+    std::string compile_error_summary;
 
     while (warm_frames < 60 || control_block->effects_ready == 0) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -549,10 +379,57 @@ int CliRender::execute(const CliOptions &opts) {
         warm_frames++;
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
 
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - warm_start).count() >= 30) {
+        // monitor ReShade.log during warm-up to fail immediately on compile errors
+        std::string log_content = read_reshade_log(extra_shader_dir.empty() ? ini_path : extra_shader_dir);
+        if (!log_content.empty()) {
+            if (!target_shaders.empty()) {
+                for (const auto &sh : target_shaders) {
+                    bool failed = false, succeeded = false;
+                    std::string err_text;
+                    if (check_shader_compile_in_log(log_content, sh, failed, succeeded, err_text)) {
+                        if (failed) {
+                            compile_failed = true;
+                            compile_error_summary = err_text;
+                            break;
+                        }
+                    }
+                }
+            } else if (log_content.find("Failed to compile") != std::string::npos) {
+                compile_failed = true;
+                auto errors = parse_reshade_log_errors(log_content);
+                std::stringstream ss;
+                for (const auto &e : errors) {
+                    if (!e.is_warning) {
+                        ss << "  " << e.file << "(" << e.line << "," << e.column << "): [ERROR] "
+                           << e.code << ": " << e.message << "\n";
+                    }
+                }
+                compile_error_summary = ss.str();
+            }
+        }
+
+        if (compile_failed) {
             break;
         }
+
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - warm_start).count() >= 10) {
+            break;
+        }
+    }
+
+    if (compile_failed || control_block->effects_ready == 0) {
+        if (!opts.quiet && !opts.json_output) {
+            std::cerr << "\n[ShaderLab] Error: Shader compilation failed or timed out.\n";
+            if (!compile_error_summary.empty()) {
+                std::cerr << compile_error_summary << "\n";
+            }
+        }
+        gfx.shutdown();
+        ini_guard.restore();
+        UnmapViewOfFile(control_block);
+        CloseHandle(hMap);
+        return 1;
     }
 
     if (!opts.quiet && !opts.json_output) {
@@ -620,8 +497,20 @@ int CliRender::execute(const CliOptions &opts) {
                 gfx.present(1, 0);
                 std::this_thread::sleep_for(std::chrono::milliseconds(16));
 
+                std::string re_log = read_reshade_log(extra_shader_dir.empty() ? ini_path : extra_shader_dir);
+                if (!target_shaders.empty()) {
+                    bool re_failed = false, re_succ = false;
+                    std::string re_err;
+                    for (const auto &sh : target_shaders) {
+                        if (check_shader_compile_in_log(re_log, sh, re_failed, re_succ, re_err) && re_failed) {
+                            break;
+                        }
+                    }
+                    if (re_failed) break;
+                }
+
                 auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - recompile_start).count() >= 30) {
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - recompile_start).count() >= 15) {
                     break;
                 }
             }
@@ -712,11 +601,12 @@ int CliRender::execute(const CliOptions &opts) {
             std::this_thread::sleep_for(std::chrono::milliseconds(16));
         }
 
+        // strictly require addon capture: do NOT save raw unshaded backbuffer on capture failure
         bool ok = false;
         if (captured_by_addon && fs::exists(dest_file)) {
             ok = true;
         } else {
-            ok = BackbufferDump::capture_to_file(gfx, dest_file.c_str(), img.width, img.height);
+            ok = false;
         }
 
         control_block->export_state = ExportState::Idle;
@@ -725,7 +615,7 @@ int CliRender::execute(const CliOptions &opts) {
             ++success_count;
             if (!opts.quiet && !opts.json_output) std::cout << "DONE -> " << dest_file.filename().string() << "\n";
         } else {
-            if (!opts.quiet && !opts.json_output) std::cout << "FAILED (Render error)\n";
+            if (!opts.quiet && !opts.json_output) std::cout << "FAILED (Shader effect capture failed)\n";
         }
     }
 
@@ -733,6 +623,7 @@ int CliRender::execute(const CliOptions &opts) {
     double elapsed_sec = std::chrono::duration<double>(t_end - t_start).count();
 
     gfx.shutdown();
+    ini_guard.restore();
     UnmapViewOfFile(control_block);
     CloseHandle(hMap);
 

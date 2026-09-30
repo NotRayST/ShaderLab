@@ -24,7 +24,7 @@ struct DepthState {
 
 struct ProjectManifest {
     std::string format_version = "1.0";
-    std::string app_version = "v1.2.1";
+    std::string app_version = "v1.2.2";
     uint64_t timestamp = 0;
     std::string original_image_name;
     uint32_t image_width = 0;

@@ -8,6 +8,7 @@ struct SharedControlBlock;
 class JobQueueManager;
 
 void on_overlay(reshade::api::effect_runtime *runtime);
+void on_reshade_overlay_frame(reshade::api::effect_runtime *runtime);
 
 bool execute_project_save(
     reshade::api::effect_runtime *runtime,

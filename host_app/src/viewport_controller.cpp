@@ -22,6 +22,7 @@ static void init_default_keybinds(IpcKeybind *kb) {
     kb[static_cast<uint32_t>(IpcAction::ExportImage)]   = { 'E', 1, 0, 0, 0 };
     kb[static_cast<uint32_t>(IpcAction::ExportImageAs)] = { 'E', 1, 1, 0, 0 };
     kb[static_cast<uint32_t>(IpcAction::ToggleBeforeAfter)] = { 'B', 0, 0, 0, 0 };
+    kb[static_cast<uint32_t>(IpcAction::ToggleErase)]       = { 'E', 0, 0, 0, 0 };
 }
 
 bool ViewportController::matches_keybind(IpcAction action, WPARAM vk, bool ctrl, bool shift, bool alt) const {
@@ -257,6 +258,22 @@ bool ViewportController::handle_input(
     m_is_fine = shift_down;
 
     switch (msg) {
+    case WM_KILLFOCUS:
+    case WM_CAPTURECHANGED:
+    case WM_CANCELMODE: {
+        if (m_is_panning || m_is_rotating || m_is_pan_locked_attempt || m_is_rotate_locked_attempt ||
+            m_is_dragging_split_pos || m_is_dragging_split_rot) {
+            m_is_panning = false;
+            m_is_rotating = false;
+            m_is_pan_locked_attempt = false;
+            m_is_rotate_locked_attempt = false;
+            m_is_dragging_split_pos = false;
+            m_is_dragging_split_rot = false;
+            ReleaseCapture();
+        }
+        return false;
+    }
+
     case WM_MOUSEWHEEL: {
         if (m_lock_zoom) return false;
         short wheel_delta = GET_WHEEL_DELTA_WPARAM(wParam);
@@ -299,6 +316,7 @@ bool ViewportController::handle_input(
     }
 
     case WM_LBUTTONDOWN: {
+        if (m_erase_active) return false;
         int client_x = GET_X_LPARAM(lParam);
         int client_y = GET_Y_LPARAM(lParam);
         m_last_mouse_client = { client_x, client_y };
@@ -356,7 +374,24 @@ bool ViewportController::handle_input(
         }
     }
 
+    case WM_MBUTTONDOWN: {
+        if (m_lock_pan) {
+            m_is_pan_locked_attempt = true;
+            SetCapture(hwnd);
+            return true;
+        }
+        m_is_pan_locked_attempt = false;
+        m_is_panning = true;
+        m_is_rotating = false;
+        int client_x = GET_X_LPARAM(lParam);
+        int client_y = GET_Y_LPARAM(lParam);
+        m_last_mouse_client = { client_x, client_y };
+        SetCapture(hwnd);
+        return true;
+    }
+
     case WM_RBUTTONDOWN: {
+        if (m_erase_active) return false;
         int client_x = GET_X_LPARAM(lParam);
         int client_y = GET_Y_LPARAM(lParam);
         m_last_mouse_client = { client_x, client_y };
@@ -401,6 +436,34 @@ bool ViewportController::handle_input(
     case WM_MOUSEMOVE: {
         int client_x = GET_X_LPARAM(lParam);
         int client_y = GET_Y_LPARAM(lParam);
+
+        if (m_is_panning) {
+            float delta_client_x = static_cast<float>(client_x - m_last_mouse_client.x);
+            float delta_client_y = static_cast<float>(client_y - m_last_mouse_client.y);
+            m_last_mouse_client = { client_x, client_y };
+
+            float dx = delta_client_x * scale_x;
+            float dy = delta_client_y * scale_y;
+
+            float rad = m_transform.angle * (kPi / 180.0f);
+            float cos_a = std::cos(rad);
+            float sin_a = std::sin(rad);
+
+            float rot_dx = dx * cos_a + dy * sin_a;
+            float rot_dy = -dx * sin_a + dy * cos_a;
+
+            if (m_is_fine) {
+                rot_dx *= 0.25f;
+                rot_dy *= 0.25f;
+            }
+
+            m_transform.pan_x -= rot_dx / m_transform.zoom;
+            m_transform.pan_y -= rot_dy / m_transform.zoom;
+
+            clamp_pan(render_w, render_h, img_w, img_h);
+            SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+            return true;
+        }
 
         if (m_before_after_enabled) {
             float cur_render_x = static_cast<float>(client_x) * scale_x;
@@ -487,33 +550,6 @@ bool ViewportController::handle_input(
             m_last_mouse_client = { client_x, client_y };
             return true;
         }
-
-        if (m_is_panning) {
-            float delta_client_x = static_cast<float>(client_x - m_last_mouse_client.x);
-            float delta_client_y = static_cast<float>(client_y - m_last_mouse_client.y);
-            m_last_mouse_client = { client_x, client_y };
-
-            float dx = delta_client_x * scale_x;
-            float dy = delta_client_y * scale_y;
-
-            float rad = m_transform.angle * (kPi / 180.0f);
-            float cos_a = std::cos(rad);
-            float sin_a = std::sin(rad);
-
-            float rot_dx = dx * cos_a + dy * sin_a;
-            float rot_dy = -dx * sin_a + dy * cos_a;
-
-            if (m_is_fine) {
-                rot_dx *= 0.25f;
-                rot_dy *= 0.25f;
-            }
-
-            m_transform.pan_x -= rot_dx / m_transform.zoom;
-            m_transform.pan_y -= rot_dy / m_transform.zoom;
-
-            clamp_pan(render_w, render_h, img_w, img_h);
-            return true;
-        }
         break;
     }
 
@@ -557,9 +593,24 @@ bool ViewportController::handle_input(
         break;
     }
 
+    case WM_MBUTTONUP: {
+        if (m_is_pan_locked_attempt) {
+            m_is_pan_locked_attempt = false;
+            ReleaseCapture();
+            return true;
+        }
+        if (m_is_panning) {
+            m_is_panning = false;
+            ReleaseCapture();
+            return true;
+        }
+        break;
+    }
+
     case WM_LBUTTONDBLCLK: {
         if (m_before_after_enabled) {
             m_before_after_split = 0.0f;
+            m_split_changed = true;
             return true;
         }
         reset();
@@ -570,6 +621,7 @@ bool ViewportController::handle_input(
         if (m_before_after_enabled) {
             m_before_after_angle = 0.0f;
             m_raw_split_angle = 0.0f;
+            m_angle_changed = true;
             return true;
         }
         break;
@@ -694,11 +746,19 @@ void ViewportController::sync_to_block(SharedControlBlock *block) {
     if (m_is_pan_locked_attempt) flags |= VIEW_FLAG_PAN_LOCKED_ATTEMPT;
     if (m_before_after_enabled)  flags |= VIEW_FLAG_BEFORE_AFTER;
     if (m_is_dragging_split_pos) flags |= VIEW_FLAG_BEFORE_AFTER_DRAG;
-    block->before_after_angle = m_before_after_angle;
-    block->before_after_split = m_before_after_split;
-    // preserve flags owned outside viewport controller like depth peek and text input
-    uint32_t preserved = block->view_interaction_flags & (VIEW_FLAG_DEPTH_PEEK | VIEW_FLAG_TEXT_INPUT);
-    block->view_interaction_flags = flags | preserved;
+    if (m_is_dragging_split_rot || m_angle_changed) {
+        block->before_after_angle = m_before_after_angle;
+        block->before_after_version++;
+        m_angle_changed = false;
+    }
+    if (m_is_dragging_split_pos || m_split_changed) {
+        block->before_after_split = m_before_after_split;
+        block->before_after_version++;
+        m_split_changed = false;
+    }
+    // preserve flags owned outside viewport controller like depth peek, text input, and erase active
+    constexpr uint32_t kPreservedMask = VIEW_FLAG_DEPTH_PEEK | VIEW_FLAG_TEXT_INPUT | VIEW_FLAG_ERASE_ACTIVE;
+    ipc_update_view_flags(&block->view_interaction_flags, ~kPreservedMask, flags);
     block->view_last_lock_ms = m_last_lock_ms;
     block->view_transform_version++;
 }
@@ -718,15 +778,16 @@ void ViewportController::sync_from_block(const SharedControlBlock *block) {
     m_lock_zoom   = (block->view_interaction_flags & VIEW_FLAG_LOCK_ZOOM) != 0;
     m_lock_rotate = (block->view_interaction_flags & VIEW_FLAG_LOCK_ROT) != 0;
     m_lock_pan    = (block->view_interaction_flags & VIEW_FLAG_LOCK_PAN) != 0;
+    m_erase_active = (block->view_interaction_flags & VIEW_FLAG_ERASE_ACTIVE) != 0;
 
     bool ext_ba = (block->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER) != 0;
     if (ext_ba != m_before_after_enabled) {
         set_before_after_enabled(ext_ba);
     }
-    if (!m_is_dragging_split_rot) {
+    if (!m_is_dragging_split_rot && !m_angle_changed) {
         m_before_after_angle = block->before_after_angle;
     }
-    if (!m_is_dragging_split_pos) {
+    if (!m_is_dragging_split_pos && !m_split_changed) {
         m_before_after_split = block->before_after_split;
     }
 

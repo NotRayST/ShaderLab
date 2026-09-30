@@ -124,15 +124,33 @@ void composite_hud(
     reshade::api::command_list *cmd_list,
     reshade::api::resource_view rtv)
 {
-    if (!block || !runtime || !cmd_list) return;
+    if (!block || !runtime) return;
     if (block->export_state != ExportState::Idle) return;
 
     reshade::api::device *api_device = runtime->get_device();
     if (!api_device || api_device->get_api() != reshade::api::device_api::d3d11) return;
 
     ID3D11Device *device = reinterpret_cast<ID3D11Device *>(static_cast<uintptr_t>(api_device->get_native()));
-    ID3D11DeviceContext *context = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(cmd_list->get_native()));
-    ID3D11RenderTargetView *bb_rtv = reinterpret_cast<ID3D11RenderTargetView *>(static_cast<uintptr_t>(rtv.handle));
+    ID3D11DeviceContext *context = nullptr;
+    ComPtr<ID3D11DeviceContext> imm_ctx;
+    if (cmd_list) {
+        context = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(cmd_list->get_native()));
+    } else {
+        device->GetImmediateContext(&imm_ctx);
+        context = imm_ctx.Get();
+    }
+
+    ComPtr<ID3D11RenderTargetView> temp_rtv;
+    ID3D11RenderTargetView *bb_rtv = nullptr;
+    if (rtv.handle != 0) {
+        bb_rtv = reinterpret_cast<ID3D11RenderTargetView *>(static_cast<uintptr_t>(rtv.handle));
+    } else {
+        reshade::api::resource bb_res = runtime->get_current_back_buffer();
+        if (bb_res.handle != 0) {
+            device->CreateRenderTargetView(reinterpret_cast<ID3D11Resource *>(static_cast<uintptr_t>(bb_res.handle)), nullptr, &temp_rtv);
+            bb_rtv = temp_rtv.Get();
+        }
+    }
 
     if (!device || !context || !bb_rtv) return;
     if (!ensure_pipeline(device, g_pipeline)) return;
@@ -145,7 +163,7 @@ void composite_hud(
     }
     if (!any) return;
 
-    reshade::api::resource bb_res = api_device->get_resource_from_view(rtv);
+    reshade::api::resource bb_res = (rtv.handle != 0) ? api_device->get_resource_from_view(rtv) : runtime->get_current_back_buffer();
     reshade::api::resource_desc desc = api_device->get_resource_desc(bb_res);
 
     D3D11_VIEWPORT vp = {};

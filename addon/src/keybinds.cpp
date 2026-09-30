@@ -38,7 +38,9 @@ Binding defaults[] = {
     { ImGuiKey_E,             true,  false, false }, // ExportImage (Ctrl+E)
     { ImGuiKey_E,             true,  true,  false }, // ExportImageAs (Ctrl+Shift+E)
     { ImGuiKey_B,             false, false, false }, // ToggleBeforeAfter (B)
+    { ImGuiKey_E,             false, false, false }, // ToggleErase (E)
 };
+static_assert(sizeof(defaults) / sizeof(defaults[0]) == static_cast<size_t>(keybinds::Action::Count), "defaults array size must match Action::Count");
 
 Binding current[static_cast<int>(keybinds::Action::Count)];
 reshade::api::effect_runtime *g_runtime = nullptr;
@@ -193,6 +195,7 @@ const char *name(Action action)
     case Action::ExportImage: return "Export Image";
     case Action::ExportImageAs: return "Export Image As...";
     case Action::ToggleBeforeAfter: return "Before / After Split";
+    case Action::ToggleErase: return "Erase Mode";
     default: return "?";
     }
 }

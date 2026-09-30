@@ -123,9 +123,22 @@ static bool get_d3d(reshade::api::effect_runtime *rt, reshade::api::command_list
     auto *ad = rt ? rt->get_device() : nullptr;
     if (!ad || ad->get_api() != reshade::api::device_api::d3d11) return false;
     dev = reinterpret_cast<ID3D11Device *>(static_cast<uintptr_t>(ad->get_native()));
-    ctx = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(cmd->get_native()));
-    auto r = ad->get_resource_from_view(rtv);
-    res = r.handle ? reinterpret_cast<ID3D11Resource *>(static_cast<uintptr_t>(r.handle)) : nullptr;
+    static ComPtr<ID3D11DeviceContext> s_imm_ctx;
+    if (cmd) {
+        ctx = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(cmd->get_native()));
+    } else {
+        if (!s_imm_ctx || dev != g_pipe.device) dev->GetImmediateContext(&s_imm_ctx);
+        ctx = s_imm_ctx.Get();
+    }
+    if (rtv.handle != 0) {
+        auto r = ad->get_resource_from_view(rtv);
+        res = r.handle ? reinterpret_cast<ID3D11Resource *>(static_cast<uintptr_t>(r.handle)) : nullptr;
+    } else if (rt) {
+        auto bb = rt->get_current_back_buffer();
+        res = bb.handle ? reinterpret_cast<ID3D11Resource *>(static_cast<uintptr_t>(bb.handle)) : nullptr;
+    } else {
+        res = nullptr;
+    }
     return dev && ctx && res;
 }
 
@@ -215,18 +228,36 @@ void before_after_capture_pre(SharedControlBlock *b, reshade::api::effect_runtim
                               reshade::api::command_list *cmd, reshade::api::resource_view rtv) {
     g_before_valid = false;
     if (b) {
-        if (!s_state.is_dragging_pos && !s_state.is_dragging_rot) {
+        static uint32_t s_last_ba_ver_pre = 0;
+        if (s_state.is_dragging_pos || s_state.is_dragging_rot) {
+            b->before_after_angle = s_state.angle;
+            b->before_after_split = s_state.split_offset;
+            b->before_after_version++;
+            s_last_ba_ver_pre = b->before_after_version;
+        } else if (b->before_after_version != s_last_ba_ver_pre) {
+            s_last_ba_ver_pre = b->before_after_version;
             s_state.enabled = (b->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER) != 0;
             s_state.angle = b->before_after_angle;
             s_state.split_offset = b->before_after_split;
         } else {
-            b->before_after_angle = s_state.angle;
-            b->before_after_split = s_state.split_offset;
+            s_state.enabled = (b->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER) != 0;
         }
     }
     if (!s_state.enabled || (b && b->export_state != ExportState::Idle)) return;
     ID3D11Device *dev; ID3D11DeviceContext *ctx; ID3D11Resource *bb;
     if (!get_d3d(rt, cmd, rtv, dev, ctx, bb) || !ensure_textures(dev, bb)) return;
+
+    if (b && b->before_canvas_srv_ptr != 0) {
+        auto *before_srv = reinterpret_cast<ID3D11ShaderResourceView *>(static_cast<uintptr_t>(b->before_canvas_srv_ptr));
+        ComPtr<ID3D11Resource> before_res;
+        before_srv->GetResource(&before_res);
+        if (before_res) {
+            ctx->CopyResource(g_before_tex.Get(), before_res.Get());
+            g_before_valid = true;
+            return;
+        }
+    }
+
     ctx->CopyResource(g_before_tex.Get(), bb);
     g_before_valid = true;
 }
@@ -234,13 +265,19 @@ void before_after_capture_pre(SharedControlBlock *b, reshade::api::effect_runtim
 void before_after_composite(SharedControlBlock *b, reshade::api::effect_runtime *rt,
                             reshade::api::command_list *cmd, reshade::api::resource_view rtv) {
     if (b) {
-        if (!s_state.is_dragging_pos && !s_state.is_dragging_rot) {
+        static uint32_t s_last_ba_ver = 0;
+        if (s_state.is_dragging_pos || s_state.is_dragging_rot) {
+            b->before_after_angle = s_state.angle;
+            b->before_after_split = s_state.split_offset;
+            b->before_after_version++;
+            s_last_ba_ver = b->before_after_version;
+        } else if (b->before_after_version != s_last_ba_ver) {
+            s_last_ba_ver = b->before_after_version;
             s_state.enabled = (b->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER) != 0;
             s_state.angle = b->before_after_angle;
             s_state.split_offset = b->before_after_split;
         } else {
-            b->before_after_angle = s_state.angle;
-            b->before_after_split = s_state.split_offset;
+            s_state.enabled = (b->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER) != 0;
         }
     }
     if (!g_before_valid || !s_state.enabled || (b && b->export_state != ExportState::Idle)) return;
@@ -257,8 +294,59 @@ void before_after_composite(SharedControlBlock *b, reshade::api::effect_runtime 
     SplitCBData cb{ nx, ny, s_state.split_offset * extent, 1.25f, (float)g_tex_w, (float)g_tex_h, 0, 0 };
     ctx->UpdateSubresource(g_pipe.cb.Get(), 0, nullptr, &cb, 0, 0);
 
+    // Save previous D3D11 state to prevent leaking into ReShade and other add-ons
+    ComPtr<ID3D11RenderTargetView> prev_rtv;
+    ComPtr<ID3D11DepthStencilView> prev_dsv;
+    ctx->OMGetRenderTargets(1, prev_rtv.GetAddressOf(), prev_dsv.GetAddressOf());
+
+    ComPtr<ID3D11RenderTargetView> temp_rtv;
+    ID3D11RenderTargetView *active_rtv = nullptr;
+    if (rtv.handle != 0) {
+        active_rtv = reinterpret_cast<ID3D11RenderTargetView *>(static_cast<uintptr_t>(rtv.handle));
+    } else if (prev_rtv) {
+        active_rtv = prev_rtv.Get();
+    } else if (bb) {
+        dev->CreateRenderTargetView(bb, nullptr, &temp_rtv);
+        active_rtv = temp_rtv.Get();
+    }
+    if (!active_rtv) return;
+
+    UINT num_viewports = 1;
+    D3D11_VIEWPORT prev_vp = {};
+    ctx->RSGetViewports(&num_viewports, &prev_vp);
+
+    ComPtr<ID3D11RasterizerState> prev_rs;
+    ctx->RSGetState(prev_rs.GetAddressOf());
+
+    ComPtr<ID3D11DepthStencilState> prev_ds;
+    UINT prev_stencil_ref = 0;
+    ctx->OMGetDepthStencilState(prev_ds.GetAddressOf(), &prev_stencil_ref);
+
+    ComPtr<ID3D11BlendState> prev_blend;
+    FLOAT prev_blend_factor[4] = {};
+    UINT prev_sample_mask = 0;
+    ctx->OMGetBlendState(prev_blend.GetAddressOf(), prev_blend_factor, &prev_sample_mask);
+
+    ComPtr<ID3D11InputLayout> prev_il;
+    ctx->IAGetInputLayout(prev_il.GetAddressOf());
+
+    D3D11_PRIMITIVE_TOPOLOGY prev_topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ctx->IAGetPrimitiveTopology(&prev_topo);
+
+    ComPtr<ID3D11VertexShader> prev_vs;
+    ctx->VSGetShader(prev_vs.GetAddressOf(), nullptr, nullptr);
+
+    ComPtr<ID3D11PixelShader> prev_ps;
+    ctx->PSGetShader(prev_ps.GetAddressOf(), nullptr, nullptr);
+
+    ComPtr<ID3D11SamplerState> prev_sampler;
+    ctx->PSGetSamplers(0, 1, prev_sampler.GetAddressOf());
+
+    ComPtr<ID3D11Buffer> prev_cb;
+    ctx->PSGetConstantBuffers(0, 1, prev_cb.GetAddressOf());
+
     D3D11_VIEWPORT vp{ 0.0f, 0.0f, (float)g_tex_w, (float)g_tex_h, 0.0f, 1.0f };
-    ID3D11RenderTargetView *rtvs[] = { reinterpret_cast<ID3D11RenderTargetView *>(static_cast<uintptr_t>(rtv.handle)) };
+    ID3D11RenderTargetView *rtvs[] = { active_rtv };
     ctx->OMSetRenderTargets(1, rtvs, nullptr);
     ctx->RSSetViewports(1, &vp);
     ctx->RSSetState(nullptr);
@@ -280,6 +368,22 @@ void before_after_composite(SharedControlBlock *b, reshade::api::effect_runtime 
 
     ID3D11ShaderResourceView *null_srvs[] = { nullptr, nullptr };
     ctx->PSSetShaderResources(0, 2, null_srvs);
+
+    // Restore previous D3D11 state
+    ID3D11RenderTargetView *restore_rtv = prev_rtv.Get();
+    ctx->OMSetRenderTargets(1, &restore_rtv, prev_dsv.Get());
+    if (num_viewports > 0) ctx->RSSetViewports(num_viewports, &prev_vp);
+    ctx->RSSetState(prev_rs.Get());
+    ctx->OMSetDepthStencilState(prev_ds.Get(), prev_stencil_ref);
+    ctx->OMSetBlendState(prev_blend.Get(), prev_blend_factor, prev_sample_mask);
+    ctx->IASetInputLayout(prev_il.Get());
+    ctx->IASetPrimitiveTopology(prev_topo);
+    ctx->VSSetShader(prev_vs.Get(), nullptr, 0);
+    ctx->PSSetShader(prev_ps.Get(), nullptr, 0);
+    ID3D11SamplerState *restore_sampler = prev_sampler.Get();
+    ctx->PSSetSamplers(0, 1, &restore_sampler);
+    ID3D11Buffer *restore_cb = prev_cb.Get();
+    ctx->PSSetConstantBuffers(0, 1, &restore_cb);
 }
 
 void on_before_after_destroy_device(reshade::api::device *) {

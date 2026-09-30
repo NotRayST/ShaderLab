@@ -1,8 +1,8 @@
 #include <windows.h>
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,0,0,0
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     1,1,0,0
+PRODUCTVERSION  1,1,0,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0x0L
 FILEOS          VOS_NT_WINDOWS32
@@ -15,12 +15,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "NotRayST\0"
             VALUE "FileDescription",  "Undo / Redo by NotRayST (Advanced Undo/Redo for ReShade)\0"
-            VALUE "FileVersion",      "1.0.0.0\0"
+            VALUE "FileVersion",      "1.1.0.0\0"
             VALUE "InternalName",     "UndoRedo.addon\0"
             VALUE "LegalCopyright",   "NotRayST (https://github.com/NotRayST)\0"
             VALUE "OriginalFilename", "UndoRedo.addon\0"
             VALUE "ProductName",      "Undo / Redo by NotRayST\0"
-            VALUE "ProductVersion",   "1.0.0.0\0"
+            VALUE "ProductVersion",   "1.1.0.0\0"
             VALUE "Comments",         "Developer: NotRayST (https://x.com/NotRay_st)\0"
         END
     END

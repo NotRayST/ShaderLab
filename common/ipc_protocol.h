@@ -24,7 +24,8 @@ enum class IpcAction : uint32_t {
     ExportImage      = 14,
     ExportImageAs    = 15,
     ToggleBeforeAfter = 16,
-    Count            = 17
+    ToggleErase       = 17,
+    Count             = 18
 };
 
 enum class IpcCmd : uint32_t {
@@ -98,6 +99,7 @@ static constexpr uint32_t IPC_ERR_WRITE_FAILED     = 4;
 static constexpr uint32_t IPC_ERR_FILE_NOT_FOUND   = 5;
 static constexpr uint32_t IPC_ERR_UNSUPPORTED_FMT  = 6;
 static constexpr uint32_t IPC_ERR_IMAGE_TOO_LARGE  = 7;
+static constexpr uint32_t IPC_ERR_TIMEOUT          = 8;
 
 // export flags (bitfield)
 static constexpr uint32_t EXPORT_FLAG_UNSYNCED        = (1 << 0); // bit0: present unsynced (sync_interval 0) during export
@@ -126,6 +128,32 @@ static constexpr uint32_t VIEW_FLAG_DEPTH_PEEK        = (1 << 8);
 static constexpr uint32_t VIEW_FLAG_TEXT_INPUT         = (1 << 9); // text input active in reshade overlay
 static constexpr uint32_t VIEW_FLAG_BEFORE_AFTER       = (1 << 10); // before/after split comparison active
 static constexpr uint32_t VIEW_FLAG_BEFORE_AFTER_DRAG  = (1 << 11); // actively dragging divider line
+static constexpr uint32_t VIEW_FLAG_ERASE_ACTIVE       = (1 << 12); // erase tool active
+
+inline uint32_t ipc_set_view_flag(volatile uint32_t* flags, uint32_t mask) {
+    return static_cast<uint32_t>(InterlockedOr(reinterpret_cast<volatile LONG*>(flags), static_cast<LONG>(mask)));
+}
+
+inline uint32_t ipc_clear_view_flag(volatile uint32_t* flags, uint32_t mask) {
+    return static_cast<uint32_t>(InterlockedAnd(reinterpret_cast<volatile LONG*>(flags), ~static_cast<LONG>(mask)));
+}
+
+inline uint32_t ipc_toggle_view_flag(volatile uint32_t* flags, uint32_t mask) {
+    return static_cast<uint32_t>(InterlockedXor(reinterpret_cast<volatile LONG*>(flags), static_cast<LONG>(mask)));
+}
+
+inline void ipc_update_view_flags(volatile uint32_t* flags, uint32_t mask_to_clear, uint32_t mask_to_set) {
+    uint32_t cur = *flags;
+    for (;;) {
+        uint32_t desired = (cur & ~mask_to_clear) | mask_to_set;
+        uint32_t prev = static_cast<uint32_t>(InterlockedCompareExchange(
+            reinterpret_cast<volatile LONG*>(flags),
+            static_cast<LONG>(desired),
+            static_cast<LONG>(cur)));
+        if (prev == cur) break;
+        cur = prev;
+    }
+}
 
 struct alignas(64) SharedControlBlock {
     uint32_t magic;
@@ -175,10 +203,12 @@ struct alignas(64) SharedControlBlock {
 
     // 3D Depth Canvas (host -> addon)
     // host publishes native ID3D11ShaderResourceView* handle for the re-encoded hyperbolic depth canvas
+    // texture used by ReShade depth effects. 0 means depth unavailable.
     uint64_t depth_srv_ptr;
-    volatile uint32_t depth_version;
-    uint32_t depth_valid;               // 1 if active image has 3D depth, 0 if 2D
-    float    depth_far_plane;           // far plane used for linearization (e.g. 1000.0f)
+    volatile uint32_t depth_version;    // increments when depth texture changes or is invalidated
+    uint32_t depth_valid;               // 1 if active image has a valid depth map, 0 otherwise
+    float    depth_near_plane;          // near clipping plane (usually 1.0)
+    float    depth_far_plane;           // far clipping plane (configurable)
     uint32_t depth_width;               // depth canvas width
     uint32_t depth_height;              // depth canvas height
 
@@ -194,10 +224,13 @@ struct alignas(64) SharedControlBlock {
     uint32_t view_image_width;           // active image native width
     uint32_t view_image_height;          // active image native height
     volatile uint32_t view_transform_version; // incremented whenever transform changes
-    uint32_t view_interaction_flags;     // VIEW_FLAG_*
+    volatile uint32_t view_interaction_flags; // VIEW_FLAG_*
     float    before_after_angle;         // separator angle in degrees (0 = vertical L/R, 90 = horizontal T/B)
     float    before_after_split;         // separator split offset [-0.5..0.5] along normal
-    uint32_t pad_ba;                     // 8-byte alignment pad for uint64_t below
+    volatile uint32_t before_after_version;
+    uint32_t erase_history_step;         // current erase step (0 if at pristine base image, >0 if erase edits exist)
+    uint32_t erase_history_count;        // total erase steps recorded
+    uint64_t before_canvas_srv_ptr;      // D3D11 SRV pointer of host-rendered un-erased before canvas
 
     // per-gesture idle timestamps, host <-> addon, same process so GetTickCount64
     // stays consistent on both sides. each HUD fades on its own timer so a zoom

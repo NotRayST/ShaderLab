@@ -152,9 +152,16 @@ bool extract_sldp(
         return false;
     }
 
-    size_t expected_raw_size = (out_header.encoding == 1)
-        ? (static_cast<size_t>(w) * h * sizeof(uint16_t))
-        : (static_cast<size_t>(w) * h * sizeof(float));
+    size_t expected_raw_size = 0;
+    if (out_header.encoding == 1) {
+        expected_raw_size = static_cast<size_t>(w) * h * sizeof(uint16_t);
+    } else if (out_header.encoding == 2) {
+        expected_raw_size = static_cast<size_t>(w) * h * sizeof(uint8_t);
+    } else if (out_header.encoding == 3) {
+        expected_raw_size = (static_cast<size_t>(w) * h + 1) / 2;
+    } else {
+        expected_raw_size = static_cast<size_t>(w) * h * sizeof(float);
+    }
 
     if (out_header.raw_byte_size != expected_raw_size) {
         out_error = "raw_byte_size header mismatch";
@@ -185,9 +192,49 @@ bool extract_sldp(
             uint32_t row_start = y * w;
             uint16_t running = 0;
             for (uint32_t x = 0; x < w; ++x) {
-                running += u16_data[row_start + x];
+                running = static_cast<uint16_t>(static_cast<uint32_t>(running) + static_cast<uint32_t>(u16_data[row_start + x]));
                 out_floats[row_start + x] = running / 65535.0f;
             }
+        }
+    } else if (out_header.encoding == 2) {
+        std::vector<uint8_t> u8_data(w * h);
+        int status = mz_uncompress(
+            reinterpret_cast<unsigned char *>(u8_data.data()),
+            &uncomp_len,
+            comp_data,
+            static_cast<mz_ulong>(comp_size)
+        );
+        if (status != MZ_OK || uncomp_len != expected_raw_size) {
+            out_floats.clear();
+            out_error = "Decompression failed (error " + std::to_string(status) + ")";
+            return false;
+        }
+        for (uint32_t y = 0; y < h; ++y) {
+            uint32_t row_start = y * w;
+            uint8_t running = 0;
+            for (uint32_t x = 0; x < w; ++x) {
+                running = static_cast<uint8_t>(static_cast<uint32_t>(running) + static_cast<uint32_t>(u8_data[row_start + x]));
+                out_floats[row_start + x] = running / 255.0f;
+            }
+        }
+    } else if (out_header.encoding == 3) {
+        std::vector<uint8_t> u4_data(expected_raw_size);
+        int status = mz_uncompress(
+            reinterpret_cast<unsigned char *>(u4_data.data()),
+            &uncomp_len,
+            comp_data,
+            static_cast<mz_ulong>(comp_size)
+        );
+        if (status != MZ_OK || uncomp_len != expected_raw_size) {
+            out_floats.clear();
+            out_error = "Decompression failed (error " + std::to_string(status) + ")";
+            return false;
+        }
+        size_t total = static_cast<size_t>(w) * h;
+        for (size_t i = 0; i < total; ++i) {
+            uint8_t b = u4_data[i / 2];
+            uint8_t q = (i % 2 == 0) ? ((b >> 4) & 0x0F) : (b & 0x0F);
+            out_floats[i] = q / 15.0f;
         }
     } else {
         int status = mz_uncompress(
@@ -238,8 +285,19 @@ bool splice_sldp_bytes(
     }
 
     // deflate depth payload
-    size_t raw_size = (header.encoding == 1) ? (count * sizeof(uint16_t)) : (count * sizeof(float));
+    size_t raw_size = 0;
+    if (header.encoding == 1) {
+        raw_size = count * sizeof(uint16_t);
+    } else if (header.encoding == 2) {
+        raw_size = count * sizeof(uint8_t);
+    } else if (header.encoding == 3) {
+        raw_size = (count + 1) / 2;
+    } else {
+        raw_size = count * sizeof(float);
+    }
+
     std::vector<uint16_t> u16_buf;
+    std::vector<uint8_t> u8_buf;
     const void *src_ptr = depth_floats;
 
     if (header.encoding == 1) {
@@ -252,11 +310,38 @@ bool splice_sldp_bytes(
             for (uint32_t x = 0; x < width; ++x) {
                 float v = std::clamp(depth_floats[row_start + x], 0.0f, 1.0f);
                 uint16_t curr = static_cast<uint16_t>(v * 65535.0f + 0.5f);
-                u16_buf[row_start + x] = curr - prev;
+                u16_buf[row_start + x] = static_cast<uint16_t>(static_cast<uint32_t>(curr) - static_cast<uint32_t>(prev));
                 prev = curr;
             }
         }
         src_ptr = u16_buf.data();
+    } else if (header.encoding == 2) {
+        uint32_t width = header.width;
+        uint32_t height = header.height;
+        u8_buf.resize(count);
+        for (uint32_t y = 0; y < height; ++y) {
+            uint32_t row_start = y * width;
+            uint8_t prev = 0;
+            for (uint32_t x = 0; x < width; ++x) {
+                float v = std::clamp(depth_floats[row_start + x], 0.0f, 1.0f);
+                uint8_t curr = static_cast<uint8_t>(v * 255.0f + 0.5f);
+                u8_buf[row_start + x] = static_cast<uint8_t>(static_cast<uint32_t>(curr) - static_cast<uint32_t>(prev));
+                prev = curr;
+            }
+        }
+        src_ptr = u8_buf.data();
+    } else if (header.encoding == 3) {
+        u8_buf.assign(raw_size, 0);
+        for (size_t i = 0; i < count; ++i) {
+            float v = std::clamp(depth_floats[i], 0.0f, 1.0f);
+            uint8_t q = static_cast<uint8_t>(v * 15.0f + 0.5f) & 0x0F;
+            if (i % 2 == 0) {
+                u8_buf[i / 2] |= (q << 4);
+            } else {
+                u8_buf[i / 2] |= q;
+            }
+        }
+        src_ptr = u8_buf.data();
     }
 
     mz_ulong comp_bound = mz_compressBound(static_cast<mz_ulong>(raw_size));

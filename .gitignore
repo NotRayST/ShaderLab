@@ -1,10 +1,10 @@
-#trash folder
+#trash/testing folders
 /trash
-
+undo_redo_addon/tests
 # build output
 /build/
 /build_*/
-
+undo_redo_addon/build
 # cmake / msbuild junk
 CMakeCache.txt
 CMakeFiles/
@@ -30,6 +30,7 @@ ReShade.ini
 ReShade.log
 ReShadeGUI.ini
 Preset.ini
+*.log
 
 # export / output folders
 out/
@@ -45,3 +46,20 @@ _selftest.png
 *.user
 .DS_Store
 Thumbs.db
+
+#model weights & checkpoints
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.bin
+*.engine
+*.ckpt
+*.torchscript
+checkpoints/
+common/*.pt
+common/*.pth
+common/*.onnx
+/tools/lama/__pycache__
+/tools/depth_anything_v2/dinov2_layers/__pycache__
+/tools/depth_anything_v2/util/__pycache__

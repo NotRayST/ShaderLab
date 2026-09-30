@@ -111,10 +111,10 @@ def write_sldepth(path, width, height, linear_floats, far_plane=1000.0):
         0x534C4431,            # magic 'SLD1'
         1,                     # version
         0,                     # encoding (0 = R32F)
-        width,
-        height,
+        int(width),
+        int(height),
         1,                     # flags (kSidecarFlagValid)
-        far_plane,
+        float(far_plane),
         len(raw_data),
         len(compressed),
         timestamp,
@@ -143,7 +143,7 @@ def main():
         print(f"Error: input file '{args.input}' not found", file=sys.stderr, flush=True)
         sys.exit(1)
         
-    print("[PROGRESS] 10: Loading image...", flush=True)
+    print("[PROGRESS 10%] [PROGRESS] 10: Loading input image...", flush=True)
     print(f"[DepthAnythingV2] Loading image: {args.input}", flush=True)
     raw_img = cv2.imread(args.input)
     if raw_img is None:
@@ -153,7 +153,7 @@ def main():
     h, w, _ = raw_img.shape
     print(f"[DepthAnythingV2] Image dimensions: {w}x{h}", flush=True)
     
-    print("[PROGRESS] 25: Initializing neural network...", flush=True)
+    print("[PROGRESS 20%] [PROGRESS] 20: Initializing neural network...", flush=True)
     device, device_desc = resolve_device(args.device)
     print(f"[DepthAnythingV2] Hardware Device: {device_desc}", flush=True)
     print(f"[DepthAnythingV2] Initializing model ({args.encoder})...", flush=True)
@@ -164,7 +164,7 @@ def main():
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]}
     }
     
-    print("[PROGRESS] 45: Loading model weights...", flush=True)
+    print("[PROGRESS 35%] [PROGRESS] 35: Loading model weights...", flush=True)
     model = DepthAnythingV2(**model_configs[args.encoder])
     state_dict = torch.load(model_path, map_location="cpu")
     model.load_state_dict(state_dict)
@@ -175,11 +175,22 @@ def main():
     if device.type == "cuda":
         torch.cuda.empty_cache()
     
-    print("[PROGRESS] 60: Running inference...", flush=True)
+    print("[PROGRESS 45%] [PROGRESS] 45: Preparing neural inference...", flush=True)
     print(f"[DepthAnythingV2] Running depth estimation (resolution={args.input_size}px)...", flush=True)
     t0 = time.perf_counter()
     raw_depth = None
     cur_size = args.input_size
+
+    hook_handles = []
+    total_blocks = len(model.pretrained.blocks) if hasattr(model, "pretrained") and hasattr(model.pretrained, "blocks") else 0
+    if total_blocks > 0:
+        for idx, blk in enumerate(model.pretrained.blocks):
+            def make_hook(i):
+                def hook(mod, inp, out):
+                    pct = int(46 + (i + 1) / total_blocks * 38)
+                    print(f"[PROGRESS {pct}%] [PROGRESS] {pct}: Depth estimation ({i + 1}/{total_blocks})...", flush=True)
+                return hook
+            hook_handles.append(blk.register_forward_hook(make_hook(idx)))
     
     while raw_depth is None and cur_size >= 392:
         try:
@@ -204,11 +215,14 @@ def main():
                 print(f"Error during neural inference: {e}", file=sys.stderr, flush=True)
                 sys.exit(1)
 
+    for hook_handle in hook_handles:
+        hook_handle.remove()
+
     t1 = time.perf_counter()
     if device.type == "cuda":
         torch.cuda.empty_cache()
     print(f"[DepthAnythingV2] Depth estimation completed in {(t1 - t0)*1000:.1f} ms", flush=True)
-    print("[PROGRESS] 85: Post-processing depth map...", flush=True)
+    print("[PROGRESS 88%] [PROGRESS] 88: Post-processing depth map...", flush=True)
     
     # Invert disparity so 0.0 is near and 1.0 is far (linear depth representation in ShaderLab)
     d_min = float(raw_depth.min())
@@ -256,25 +270,22 @@ def main():
         
     linear_depth = np.clip(linear_depth, 0.0, 1.0).astype(np.float32)
     
-    print("[PROGRESS] 95: Saving depth outputs...", flush=True)
-    # Export PNG if requested
+    print("[PROGRESS 95%] [PROGRESS] 95: Saving depth outputs...", flush=True)
     if args.output_png:
         u16_depth = (linear_depth * 65535.0 + 0.5).astype(np.uint16)
         cv2.imwrite(args.output_png, u16_depth)
         print(f"[DepthAnythingV2] Saved 16-bit PNG depth map: {args.output_png}", flush=True)
         
-    # Export sidecar if requested
     if args.output_sidecar:
         write_sldepth(args.output_sidecar, w, h, linear_depth, args.far_plane)
         print(f"[DepthAnythingV2] Saved .sldepth sidecar: {args.output_sidecar}", flush=True)
         
-    # Export raw floats if requested
     if args.output_raw:
         with open(args.output_raw, "wb") as f:
             f.write(linear_depth.tobytes())
         print(f"[DepthAnythingV2] Saved raw depth: {args.output_raw}", flush=True)
         
-    print("[PROGRESS] 100: Done!", flush=True)
+    print("[PROGRESS 100%] [PROGRESS] 100: Done!", flush=True)
     print("[DepthAnythingV2] Complete!", flush=True)
 
 

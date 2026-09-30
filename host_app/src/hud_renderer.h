@@ -11,19 +11,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-// ----------------------------------------------------------------------------
-// Global UI Font Configuration
-// Change this line or drop a font into common/fonts/active_font.ttf to test any
-// font across the entire application!
-// Examples:
-// - L"common/fonts/Silkscreen-Regular.ttf"
-// - L"common/fonts/ProggyClean.ttf"
-// - L"common/fonts/Roboto-Medium.ttf"
-// - L"common/fonts/PressStart2P-Regular.ttf"
-// - L"Segoe UI" (native Windows default)
-// - L"Consolas"
-// - L"Cascadia Code"
-// ----------------------------------------------------------------------------
+// app-wide font: family name, or a ttf path like L"common/fonts/ProggyClean.ttf"
 static const wchar_t *kGlobalAppFont = L"Segoe UI";
 
 class HudFontManager {

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <mutex>
 
 using Microsoft::WRL::ComPtr;
 
@@ -31,6 +32,8 @@ public:
     void reset_viewport();
     void clear(const float color[4]);
     void clear_depth_canvas(float clear_value = 1.0f);
+    void clear_before_canvas(const float color[4]);
+    void set_before_render_target();
     HRESULT present(UINT sync_interval = 1, UINT flags = 0);
 
     bool get_and_clear_dropped_file(std::wstring &out_path, int &out_x, int &out_y);
@@ -55,6 +58,8 @@ public:
     ID3D11RenderTargetView *get_rtv() const { return m_rtv.Get(); }
     ID3D11RenderTargetView *get_depth_canvas_rtv() const { return m_depth_canvas_rtv.Get(); }
     ID3D11ShaderResourceView *get_depth_canvas_srv() const { return m_depth_canvas_srv.Get(); }
+    ID3D11RenderTargetView *get_before_canvas_rtv() const { return m_before_canvas_rtv.Get(); }
+    ID3D11ShaderResourceView *get_before_canvas_srv() const { return m_before_canvas_srv.Get(); }
     uint32_t get_render_width() const { return m_render_width; }
     uint32_t get_render_height() const { return m_render_height; }
     uint32_t get_win_width() const { return m_win_width; }
@@ -65,6 +70,7 @@ private:
     bool create_device_and_swap_chain(uint32_t width, uint32_t height);
     bool create_rtv();
     bool create_depth_canvas(uint32_t width, uint32_t height);
+    bool create_before_canvas(uint32_t width, uint32_t height);
 
     HWND m_hwnd = nullptr;
     uint32_t m_win_width = 1280;
@@ -80,6 +86,7 @@ private:
     WINDOWPLACEMENT m_prev_placement = { sizeof(WINDOWPLACEMENT) };
     DWORD m_prev_style = 0;
 
+    std::mutex m_dropped_mutex;
     std::wstring m_dropped_file;
     int m_dropped_x = 0;
     int m_dropped_y = 0;
@@ -99,4 +106,9 @@ private:
     ComPtr<ID3D11Texture2D> m_depth_canvas_tex;
     ComPtr<ID3D11RenderTargetView> m_depth_canvas_rtv;
     ComPtr<ID3D11ShaderResourceView> m_depth_canvas_srv;
+
+    // Before/After Canvas
+    ComPtr<ID3D11Texture2D> m_before_canvas_tex;
+    ComPtr<ID3D11RenderTargetView> m_before_canvas_rtv;
+    ComPtr<ID3D11ShaderResourceView> m_before_canvas_srv;
 };

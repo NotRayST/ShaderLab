@@ -194,7 +194,7 @@ CliOptions CliParser::parse(int argc, wchar_t **argv) {
 }
 
 void CliParser::print_version() {
-    std::cout << "ShaderLab CLI v1.2.1 (Direct3D 11 / ReShade FX Pipeline)\n";
+    std::cout << "ShaderLab CLI v1.2.2 (Direct3D 11 / ReShade FX Pipeline)\n";
     std::cout << "Copyright (c) 2026 NotRayST. All rights reserved.\n";
 }
 

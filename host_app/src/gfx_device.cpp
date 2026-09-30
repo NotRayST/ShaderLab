@@ -4,11 +4,26 @@
 
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto *self = reinterpret_cast<GfxDevice *>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
-    if (self && self->dispatch_input_hook(msg, wParam, lParam)) {
-        return 0;
+
+    // Never allow input hooks to intercept non-client window messages (dragging titlebar, close button, etc.)
+    if (msg == WM_NCHITTEST || msg == WM_SYSCOMMAND || msg == WM_CLOSE || msg == WM_DESTROY ||
+        (msg >= WM_NCMOUSEMOVE && msg <= WM_NCXBUTTONDBLCLK)) {
+        if (GetCapture() == hWnd) {
+            ReleaseCapture();
+        }
+    } else {
+        if (self && self->dispatch_input_hook(msg, wParam, lParam)) {
+            return 0;
+        }
     }
 
     switch (msg) {
+    case WM_KILLFOCUS:
+    case WM_CAPTURECHANGED:
+        if (GetCapture() == hWnd) {
+            ReleaseCapture();
+        }
+        break;
     case WM_CLOSE:
         if (self) self->save_window_placement();
         break;
@@ -298,6 +313,10 @@ bool GfxDevice::create_rtv() {
         std::wcerr << L"[GfxDevice] Warning: Failed to create depth canvas\n";
     }
 
+    if (!create_before_canvas(m_render_width, m_render_height)) {
+        std::wcerr << L"[GfxDevice] Warning: Failed to create before canvas\n";
+    }
+
     set_render_target();
     return true;
 }
@@ -345,6 +364,50 @@ bool GfxDevice::create_depth_canvas(uint32_t width, uint32_t height) {
     return true;
 }
 
+bool GfxDevice::create_before_canvas(uint32_t width, uint32_t height) {
+    m_before_canvas_srv.Reset();
+    m_before_canvas_rtv.Reset();
+    m_before_canvas_tex.Reset();
+
+    if (!m_device || width == 0 || height == 0) return false;
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = 0;
+
+    HRESULT hr = m_device->CreateTexture2D(&desc, nullptr, &m_before_canvas_tex);
+    if (FAILED(hr)) return false;
+
+    D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+    rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    rtv_desc.Texture2D.MipSlice = 0;
+
+    hr = m_device->CreateRenderTargetView(m_before_canvas_tex.Get(), &rtv_desc, &m_before_canvas_rtv);
+    if (FAILED(hr)) return false;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MostDetailedMip = 0;
+    srv_desc.Texture2D.MipLevels = 1;
+
+    hr = m_device->CreateShaderResourceView(m_before_canvas_tex.Get(), &srv_desc, &m_before_canvas_srv);
+    if (FAILED(hr)) return false;
+
+    float color[4] = { 0.1f, 0.1f, 0.1f, 1.0f };
+    clear_before_canvas(color);
+    return true;
+}
+
 bool GfxDevice::resize_buffers(uint32_t width, uint32_t height) {
     if (width == 0 || height == 0) return false;
     uint32_t target_w = (std::max)(width, 64u);
@@ -365,6 +428,9 @@ bool GfxDevice::resize_buffers(uint32_t width, uint32_t height) {
     m_depth_canvas_srv.Reset();
     m_depth_canvas_rtv.Reset();
     m_depth_canvas_tex.Reset();
+    m_before_canvas_srv.Reset();
+    m_before_canvas_rtv.Reset();
+    m_before_canvas_tex.Reset();
 
     HRESULT hr = m_swap_chain->ResizeBuffers(2, target_w, target_h, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
     if (FAILED(hr)) {
@@ -531,18 +597,34 @@ void GfxDevice::clear(const float color[4]) {
     }
 }
 
+void GfxDevice::set_before_render_target() {
+    if (!m_context || !m_before_canvas_rtv) return;
+
+    ID3D11RenderTargetView *rtvs[] = { m_before_canvas_rtv.Get() };
+    m_context->OMSetRenderTargets(1, rtvs, nullptr);
+    reset_viewport();
+}
+
+void GfxDevice::clear_before_canvas(const float color[4]) {
+    if (m_context && m_before_canvas_rtv) {
+        m_context->ClearRenderTargetView(m_before_canvas_rtv.Get(), color);
+    }
+}
+
 HRESULT GfxDevice::present(UINT sync_interval, UINT flags) {
     if (!m_swap_chain) return E_POINTER;
     return m_swap_chain->Present(sync_interval, flags);
 }
 
 void GfxDevice::set_dropped_file(const std::wstring &path, int x, int y) {
+    std::lock_guard<std::mutex> lock(m_dropped_mutex);
     m_dropped_file = path;
     m_dropped_x = x;
     m_dropped_y = y;
 }
 
 bool GfxDevice::get_and_clear_dropped_file(std::wstring &out_path, int &out_x, int &out_y) {
+    std::lock_guard<std::mutex> lock(m_dropped_mutex);
     if (!m_dropped_file.empty()) {
         out_path = m_dropped_file;
         out_x = m_dropped_x;

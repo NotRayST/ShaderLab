@@ -8,7 +8,7 @@
 struct DepthMapHeader {
     uint32_t magic;                 // 0x534C4431 ('SLD1')
     uint16_t version;               // 1
-    uint16_t encoding;              // 0 = R32F_Deflate, 1 = R16U_Deflate
+    uint16_t encoding;              // 0 = R32F_Deflate, 1 = R16U_Deflate, 2 = R8U_Deflate, 3 = R4U_Deflate
     uint32_t width;                 // Depth width in pixels
     uint32_t height;                // Depth height in pixels
     uint32_t flags;                 // bit0: depth_valid (1 = valid non-flat gradient, 0 = dummy/flat)

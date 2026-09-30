@@ -10,7 +10,7 @@
 #include "undo_history.h"
 
 extern "C" __declspec(dllexport) const char *NAME = "ShaderLab";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "ShaderLab Helper Addon v1.2.1 by NotRaySt";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "ShaderLab Helper Addon v1.2.2 by NotRaySt";
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     switch (reason) {
@@ -26,12 +26,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         reshade::register_event<reshade::addon_event::destroy_device>(&on_hud_destroy_device);
         reshade::register_event<reshade::addon_event::destroy_device>(&on_before_after_destroy_device);
         reshade::register_event<reshade::addon_event::reshade_present>(&on_reshade_present);
+        reshade::register_event<reshade::addon_event::reshade_overlay>(&on_reshade_overlay_frame);
         reshade::register_overlay("ShaderLab Helper", &on_overlay);
         undo_history::init();
         break;
     case DLL_PROCESS_DETACH:
         undo_history::shutdown();
         reshade::unregister_overlay("ShaderLab Helper", &on_overlay);
+        reshade::unregister_event<reshade::addon_event::reshade_overlay>(&on_reshade_overlay_frame);
         reshade::unregister_event<reshade::addon_event::reshade_present>(&on_reshade_present);
         reshade::unregister_event<reshade::addon_event::destroy_device>(&on_before_after_destroy_device);
         reshade::unregister_event<reshade::addon_event::destroy_device>(&on_hud_destroy_device);

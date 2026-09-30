@@ -46,12 +46,12 @@ static inline unsigned char *fast_zlib_compress(unsigned char *data, int data_le
         *o++ = 0xFF; *o++ = 0xFF;
     }
 
-    // adler32
+    // adler32 (batch size 5000 ensures s2 never exceeds UINT32_MAX before modulo 65521)
     uint32_t s1 = 1, s2 = 0;
     const unsigned char *buf = data;
     int len = data_len;
     while (len > 0) {
-        int k = len < 5552 ? len : 5552;
+        int k = len < 5000 ? len : 5000;
         len -= k;
         while (k >= 16) {
             s1 += buf[0];  s2 += s1;

@@ -5,13 +5,17 @@
 #include "undo_history.h"
 #include "keybinds.h"
 #include "job_queue.h"
+#include "depth_manager.h"
+#include "erase_tool.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <list>
+#include <mutex>
 #include <string>
+#include <vector>
 #include <windows.h>
 
 namespace {
@@ -22,6 +26,7 @@ struct HistoryEntry {
     enum class Kind {
         UniformValue,
         TechniqueState,
+        EraseStep,
     };
 
     union Value {
@@ -41,6 +46,7 @@ struct HistoryEntry {
 
     std::string technique_name;
     bool technique_enabled = false;
+    uint32_t erase_step = 0;
 };
 
 struct History {
@@ -48,6 +54,7 @@ struct History {
     size_t position = 0;
     bool suppressing = false;
     std::string last_preset_path;
+    std::mutex mutex;
 };
 
 History &state()
@@ -57,7 +64,7 @@ History &state()
 }
 
 constexpr uint32_t kHistoryFileMagic = 0x53485421; // "SHT!"
-constexpr uint32_t kHistoryFileVersion = 1;
+constexpr uint32_t kHistoryFileVersion = 2;
 
 std::wstring history_file_path()
 {
@@ -114,10 +121,12 @@ void save_history_to_file()
             fwrite(&base_type, sizeof(base_type), 1, f);
             fwrite(e.before.as_uint, sizeof(uint32_t), 16, f);
             fwrite(e.after.as_uint, sizeof(uint32_t), 16, f);
-        } else {
+        } else if (e.kind == HistoryEntry::Kind::TechniqueState) {
             write_str(f, e.technique_name);
             uint8_t enabled = e.technique_enabled ? 1 : 0;
             fwrite(&enabled, sizeof(enabled), 1, f);
+        } else if (e.kind == HistoryEntry::Kind::EraseStep) {
+            fwrite(&e.erase_step, sizeof(e.erase_step), 1, f);
         }
     }
 
@@ -171,13 +180,16 @@ bool load_history_from_file()
             if (fread(e.before.as_uint, sizeof(uint32_t), 16, f) != 16 ||
                 fread(e.after.as_uint, sizeof(uint32_t), 16, f) != 16)
                 break;
-        } else {
+        } else if (e.kind == HistoryEntry::Kind::TechniqueState) {
             if (!read_str(f, e.technique_name))
                 break;
             uint8_t enabled = 0;
             if (fread(&enabled, sizeof(enabled), 1, f) != 1)
                 break;
             e.technique_enabled = enabled != 0;
+        } else if (e.kind == HistoryEntry::Kind::EraseStep) {
+            if (fread(&e.erase_step, sizeof(e.erase_step), 1, f) != 1)
+                break;
         }
 
         loaded.push_back(std::move(e));
@@ -298,13 +310,13 @@ reshade::api::effect_technique resolve_technique(reshade::api::effect_runtime *r
     return tech;
 }
 
-void apply(reshade::api::effect_runtime *runtime, const HistoryEntry &entry, bool undo)
+bool apply(reshade::api::effect_runtime *runtime, const HistoryEntry &entry, bool undo)
 {
     switch (entry.kind) {
     case HistoryEntry::Kind::UniformValue: {
         const reshade::api::effect_uniform_variable variable = resolve_uniform(runtime, entry);
         if (variable == reshade::api::effect_uniform_variable{ 0 })
-            return;
+            return false;
         write_uniform_value(runtime, variable, entry.base_type,
                             undo ? entry.before : entry.after);
         break;
@@ -312,14 +324,19 @@ void apply(reshade::api::effect_runtime *runtime, const HistoryEntry &entry, boo
     case HistoryEntry::Kind::TechniqueState: {
         const reshade::api::effect_technique technique = resolve_technique(runtime, entry);
         if (technique == reshade::api::effect_technique{ 0 })
-            return;
+            return false;
         runtime->set_technique_state(technique,
                                      undo ? !entry.technique_enabled : entry.technique_enabled);
         break;
     }
+    case HistoryEntry::Kind::EraseStep: {
+        size_t target = undo ? (entry.erase_step > 0 ? entry.erase_step - 1 : 0) : entry.erase_step;
+        return EraseTool::get().set_stage_index(target);
+    }
     }
 
     runtime->save_current_preset();
+    return true;
 }
 
 static void mark_project_dirty()
@@ -333,6 +350,7 @@ static void mark_project_dirty()
 
 void record(History &history, HistoryEntry entry)
 {
+    std::lock_guard<std::mutex> lock(history.mutex);
     while (history.position > 0) {
         history.entries.pop_front();
         --history.position;
@@ -357,6 +375,7 @@ void record(History &history, HistoryEntry entry)
 void undo(reshade::api::effect_runtime *runtime)
 {
     History &history = state();
+    std::lock_guard<std::mutex> lock(history.mutex);
     if (history.position >= history.entries.size())
         return;
 
@@ -364,8 +383,14 @@ void undo(reshade::api::effect_runtime *runtime)
     std::advance(it, static_cast<std::ptrdiff_t>(history.position));
 
     history.suppressing = true;
-    apply(runtime, *it, true);
-    ++history.position;
+    const bool applied = apply(runtime, *it, true);
+    if (applied) {
+        ++history.position;
+    } else {
+        // a stale stage must not consume an undo slot. this can happen after an
+        // image change or while an inpaint worker still owns the stage cache
+        history.entries.erase(it);
+    }
     history.suppressing = false;
     save_history();
     mark_project_dirty();
@@ -374,6 +399,7 @@ void undo(reshade::api::effect_runtime *runtime)
 void redo(reshade::api::effect_runtime *runtime)
 {
     History &history = state();
+    std::lock_guard<std::mutex> lock(history.mutex);
     if (history.position == 0)
         return;
 
@@ -381,8 +407,13 @@ void redo(reshade::api::effect_runtime *runtime)
     std::advance(it, static_cast<std::ptrdiff_t>(history.position) - 1);
 
     history.suppressing = true;
-    --history.position;
-    apply(runtime, *it, false);
+    const bool applied = apply(runtime, *it, false);
+    if (applied) {
+        --history.position;
+    } else {
+        history.entries.erase(it);
+        --history.position;
+    }
     history.suppressing = false;
     save_history();
     mark_project_dirty();
@@ -391,12 +422,47 @@ void redo(reshade::api::effect_runtime *runtime)
 void jump_to_position(reshade::api::effect_runtime *runtime, size_t target_position)
 {
     History &history = state();
-    target_position = std::min(target_position, history.entries.size());
+    {
+        std::lock_guard<std::mutex> lock(history.mutex);
+        target_position = std::min(target_position, history.entries.size());
+    }
 
-    while (history.position < target_position)
+    for (;;) {
+        bool needs_undo = false;
+        size_t before_size = 0;
+        size_t before_position = 0;
+        {
+            std::lock_guard<std::mutex> lock(history.mutex);
+            needs_undo = history.position < target_position;
+            before_size = history.entries.size();
+            before_position = history.position;
+        }
+        if (!needs_undo) break;
         undo(runtime);
-    while (history.position > target_position)
+        {
+            std::lock_guard<std::mutex> lock(history.mutex);
+            if (history.entries.size() == before_size && history.position == before_position) break;
+            target_position = std::min(target_position, history.entries.size());
+        }
+    }
+    for (;;) {
+        bool needs_redo = false;
+        size_t before_size = 0;
+        size_t before_position = 0;
+        {
+            std::lock_guard<std::mutex> lock(history.mutex);
+            needs_redo = history.position > target_position;
+            before_size = history.entries.size();
+            before_position = history.position;
+        }
+        if (!needs_redo) break;
         redo(runtime);
+        {
+            std::lock_guard<std::mutex> lock(history.mutex);
+            if (history.entries.size() == before_size && history.position == before_position) break;
+            target_position = std::min(target_position, history.entries.size());
+        }
+    }
 }
 
 bool on_set_uniform_value(reshade::api::effect_runtime *runtime,
@@ -458,17 +524,31 @@ void on_overlay_frame(reshade::api::effect_runtime *runtime)
     if (io.WantTextInput)
         return;
 
-    if (keybinds::is_pressed(keybinds::Action::Undo))
-        undo(runtime);
-    else if (keybinds::is_pressed(keybinds::Action::Redo))
-        redo(runtime);
-    else if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, true))
-        redo(runtime);
+    bool is_undo = keybinds::is_pressed(keybinds::Action::Undo);
+    bool is_redo = keybinds::is_pressed(keybinds::Action::Redo) ||
+                   (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, true));
+
+    if (is_undo) {
+        EraseTool &erase_tool = EraseTool::get();
+        if (erase_tool.is_active() && erase_tool.can_undo_stroke()) {
+            erase_tool.undo_stroke();
+        } else {
+            undo(runtime);
+        }
+    } else if (is_redo) {
+        EraseTool &erase_tool = EraseTool::get();
+        if (erase_tool.is_active() && erase_tool.can_redo_stroke()) {
+            erase_tool.redo_stroke();
+        } else {
+            redo(runtime);
+        }
+    }
 }
 
 void on_preset_changed(reshade::api::effect_runtime *, const char *path)
 {
     History &history = state();
+    std::lock_guard<std::mutex> lock(history.mutex);
 
     std::string new_path = path ? path : "";
     if (new_path != history.last_preset_path) {
@@ -514,25 +594,30 @@ void shutdown()
     delete_history_file();
 }
 
-size_t undo_count() { return state().entries.size() - state().position; }
-size_t redo_count() { return state().position; }
-size_t history_size() { return state().entries.size(); }
+size_t undo_count() { std::lock_guard<std::mutex> lock(state().mutex); return state().entries.size() - state().position; }
+size_t redo_count() { std::lock_guard<std::mutex> lock(state().mutex); return state().position; }
+size_t history_size() { std::lock_guard<std::mutex> lock(state().mutex); return state().entries.size(); }
 
 bool history_undone(size_t index)
 {
+    std::lock_guard<std::mutex> lock(state().mutex);
     return index < state().position;
 }
 
 bool history_label(size_t index, char *buf, size_t size)
 {
     History &history = state();
+    std::lock_guard<std::mutex> lock(history.mutex);
     if (index >= history.entries.size() || buf == nullptr || size == 0)
         return false;
 
     auto it = history.entries.begin();
     std::advance(it, static_cast<std::ptrdiff_t>(index));
 
-    if (it->kind == HistoryEntry::Kind::UniformValue) {
+    if (it->kind == HistoryEntry::Kind::EraseStep) {
+        snprintf(buf, size, "Content-Aware Erase (Step %u)", it->erase_step);
+        return true;
+    } else if (it->kind == HistoryEntry::Kind::UniformValue) {
         const char *scope = it->variable_name.c_str();
         if (scope[0] == '\0')
             scope = it->effect_name.c_str();
@@ -565,12 +650,60 @@ void jump_to(reshade::api::effect_runtime *runtime, size_t index)
     jump_to_position(runtime, index);
 }
 
+void undo(reshade::api::effect_runtime *runtime)
+{
+    ::undo(runtime);
+}
+
+void redo(reshade::api::effect_runtime *runtime)
+{
+    ::redo(runtime);
+}
+
 void clear()
 {
     History &history = state();
-    history.entries.clear();
+    {
+        std::lock_guard<std::mutex> lock(history.mutex);
+        history.entries.clear();
+        history.position = 0;
+        save_history();
+    }
+    EraseTool::get().clear_erase_history();
+}
+
+void clear_erase_entries()
+{
+    History &history = state();
+    std::lock_guard<std::mutex> lock(history.mutex);
+    history.entries.remove_if([](const HistoryEntry &e) {
+        return e.kind == HistoryEntry::Kind::EraseStep;
+    });
+    if (history.position > history.entries.size())
+        history.position = history.entries.size();
+    save_history();
+}
+
+void record_erase_step(uint32_t step)
+{
+    History &history = state();
+    std::lock_guard<std::mutex> lock(history.mutex);
+
+    while (history.position > 0) {
+        history.entries.pop_front();
+        --history.position;
+    }
+
+    HistoryEntry entry;
+    entry.kind = HistoryEntry::Kind::EraseStep;
+    entry.erase_step = step;
+
+    history.entries.push_front(std::move(entry));
+    while (history.entries.size() > kHistoryLimit)
+        history.entries.pop_back();
     history.position = 0;
     save_history();
+    mark_project_dirty();
 }
 
 } // namespace undo_history

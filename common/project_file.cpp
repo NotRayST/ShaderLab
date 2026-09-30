@@ -81,7 +81,9 @@ static bool read_entire_file(const fs::path &p, std::vector<uint8_t> &out) {
 bool is_project_file(const std::wstring &path) {
     if (path.empty()) return false;
     std::wstring ext = fs::path(path).extension().wstring();
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+    for (auto &c : ext) {
+        if (c >= L'A' && c <= L'Z') c += (L'a' - L'A');
+    }
     return ext == L".shaderlab" || ext == L".slab";
 }
 
@@ -97,7 +99,7 @@ static std::string build_manifest_json(
     std::ostringstream ss;
     ss << "{\n";
     ss << "  \"format_version\": \"1.0\",\n";
-    ss << "  \"app_version\": \"v1.2.1\",\n";
+    ss << "  \"app_version\": \"v1.2.2\",\n";
     ss << "  \"timestamp\": " << now_ms << ",\n";
     ss << "  \"original_image_name\": \"" << orig_img_name << "\",\n";
     ss << "  \"viewport\": {\n";
@@ -118,10 +120,24 @@ static std::string build_manifest_json(
     return ss.str();
 }
 
+static size_t find_json_key(const std::string &json, const std::string &key) {
+    std::string needle = "\"" + key + "\"";
+    size_t pos = 0;
+    while ((pos = json.find(needle, pos)) != std::string::npos) {
+        size_t colon = pos + needle.length();
+        while (colon < json.length() && (json[colon] == ' ' || json[colon] == '\t' || json[colon] == '\r' || json[colon] == '\n')) {
+            colon++;
+        }
+        if (colon < json.length() && json[colon] == ':') {
+            return colon;
+        }
+        pos += needle.length();
+    }
+    return std::string::npos;
+}
+
 static float parse_float_field(const std::string &json, const std::string &key, float default_val) {
-    size_t pos = json.find("\"" + key + "\"");
-    if (pos == std::string::npos) return default_val;
-    size_t colon = json.find(':', pos);
+    size_t colon = find_json_key(json, key);
     if (colon == std::string::npos) return default_val;
     try {
         return std::stof(json.substr(colon + 1));
@@ -131,21 +147,17 @@ static float parse_float_field(const std::string &json, const std::string &key, 
 }
 
 static bool parse_bool_field(const std::string &json, const std::string &key, bool default_val) {
-    size_t pos = json.find("\"" + key + "\"");
-    if (pos == std::string::npos) return default_val;
-    size_t colon = json.find(':', pos);
+    size_t colon = find_json_key(json, key);
     if (colon == std::string::npos) return default_val;
-    size_t t = json.find("true", colon);
-    size_t f = json.find("false", colon);
-    if (t != std::string::npos && (f == std::string::npos || t < f)) return true;
-    if (f != std::string::npos) return false;
+    size_t end = json.find_first_of(",}\n\r", colon + 1);
+    std::string val_part = json.substr(colon + 1, (end == std::string::npos) ? std::string::npos : (end - (colon + 1)));
+    if (val_part.find("true") != std::string::npos) return true;
+    if (val_part.find("false") != std::string::npos) return false;
     return default_val;
 }
 
 static std::string parse_string_field(const std::string &json, const std::string &key) {
-    size_t pos = json.find("\"" + key + "\"");
-    if (pos == std::string::npos) return "";
-    size_t colon = json.find(':', pos);
+    size_t colon = find_json_key(json, key);
     if (colon == std::string::npos) return "";
     size_t q1 = json.find('\"', colon);
     if (q1 == std::string::npos) return "";
@@ -171,7 +183,6 @@ bool save_project(
     std::error_code ec;
     fs::create_directories(proj_p.parent_path(), ec);
 
-    // 1. Read source image file
     fs::path src_p(source_image_path);
     std::vector<uint8_t> src_image_bytes;
     if (!source_image_path.empty() && fs::exists(src_p)) {
@@ -181,7 +192,6 @@ bool save_project(
         }
     }
 
-    // 2. Read depth sidecar if active
     std::vector<uint8_t> depth_bytes;
     if (depth_state.has_depth && !depth_state.depth_sidecar_path.empty()) {
         fs::path depth_p(depth_state.depth_sidecar_path);
@@ -190,11 +200,9 @@ bool save_project(
         }
     }
 
-    // 3. Build manifest JSON
     std::string orig_img_name = src_p.filename().string();
     std::string manifest_json = build_manifest_json(orig_img_name, view_state, depth_state);
 
-    // 4. Open output zip file
     std::ofstream out(proj_p, std::ios::binary);
     if (!out.is_open()) {
         out_error = L"Failed to create project file: " + project_path;
@@ -232,26 +240,21 @@ bool save_project(
         entries.push_back(entry);
     };
 
-    // pack manifest.json
     write_zip_file("manifest.json", manifest_json.data(), manifest_json.size());
 
-    // pack preset.ini
     if (!preset_ini_bytes.empty()) {
         write_zip_file("preset.ini", preset_ini_bytes.data(), preset_ini_bytes.size());
     }
 
-    // pack source image
     if (!src_image_bytes.empty()) {
         std::string src_entry = "source_image" + src_p.extension().string();
         write_zip_file(src_entry, src_image_bytes.data(), src_image_bytes.size());
     }
 
-    // pack depth sidecar
     if (!depth_bytes.empty()) {
         write_zip_file("depth.sldepth", depth_bytes.data(), depth_bytes.size());
     }
 
-    // 5. Write Central Directory
     uint32_t cd_offset = static_cast<uint32_t>(out.tellp());
     for (const auto &e : entries) {
         ZipCentralHeader ch;
@@ -272,7 +275,6 @@ bool save_project(
     uint32_t cd_end = static_cast<uint32_t>(out.tellp());
     uint32_t cd_size = cd_end - cd_offset;
 
-    // 6. Write End of Central Directory
     ZipEndOfCentralDir eocd;
     eocd.signature = 0x06054b50;
     eocd.disk_number = 0;
@@ -375,7 +377,6 @@ bool load_project(
         in.seekg(next_cd, std::ios::beg);
     }
 
-    // parse manifest fields
     if (!manifest_str.empty()) {
         out_manifest.original_image_name = parse_string_field(manifest_str, "original_image_name");
         out_manifest.view.zoom = parse_float_field(manifest_str, "zoom", 1.0f);
@@ -416,18 +417,24 @@ bool load_project(
             in.read(reinterpret_cast<char *>(payload.data()), lh.uncomp_size);
         }
 
+        fs::path safe_fname = fs::path(fname).filename();
+        if (safe_fname.empty() || safe_fname == "." || safe_fname == "..") {
+            in.seekg(next_cd, std::ios::beg);
+            continue;
+        }
+
         fs::path dest_file;
         if (fname.rfind("source_image", 0) == 0) {
-            std::string save_name = out_manifest.original_image_name.empty() ? fname : out_manifest.original_image_name;
+            std::string save_name = out_manifest.original_image_name.empty() ? safe_fname.string() : fs::path(out_manifest.original_image_name).filename().string();
             dest_file = extract_p / save_name;
             extracted_image_file = dest_file;
             out_image_path = dest_file.wstring();
         } else if (fname == "preset.ini") {
             std::string preset_stem;
             if (!out_manifest.original_image_name.empty()) {
-                preset_stem = fs::path(out_manifest.original_image_name).stem().string();
+                preset_stem = fs::path(out_manifest.original_image_name).filename().stem().string();
             } else {
-                preset_stem = fs::path(project_path).stem().string();
+                preset_stem = fs::path(project_path).filename().stem().string();
             }
             if (preset_stem.empty()) preset_stem = "ShaderLab_Preset";
             dest_file = extract_p / (preset_stem + ".ini");
@@ -435,14 +442,14 @@ bool load_project(
         } else if (fname == "depth.sldepth") {
             std::wstring depth_name = L"depth.sldepth";
             if (!out_manifest.original_image_name.empty()) {
-                depth_name = fs::path(out_manifest.original_image_name).stem().wstring() + L".sldepth";
+                depth_name = fs::path(out_manifest.original_image_name).filename().stem().wstring() + L".sldepth";
             } else if (!extracted_image_file.empty()) {
-                depth_name = extracted_image_file.stem().wstring() + L".sldepth";
+                depth_name = extracted_image_file.filename().stem().wstring() + L".sldepth";
             }
             dest_file = extract_p / depth_name;
             out_manifest.depth.depth_sidecar_path = dest_file.wstring();
         } else {
-            dest_file = extract_p / fname;
+            dest_file = extract_p / safe_fname;
         }
 
         std::ofstream out_f(dest_file, std::ios::binary);

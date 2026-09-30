@@ -7,6 +7,8 @@ set(ADDON_SOURCES
     src/overlay_ui.cpp
     src/depth_manager.h
     src/depth_manager.cpp
+    src/erase_tool.h
+    src/erase_tool.cpp
     src/job_queue.h
     src/job_queue.cpp
     src/capture.h
@@ -61,6 +63,11 @@ set_target_properties(capture PROPERTIES
     OUTPUT_NAME "ShaderLab"
     SUFFIX ".addon"
     PREFIX ""
+)
+
+add_custom_command(TARGET capture POST_BUILD
+    COMMAND powershell.exe -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/../Trash/scripts/reset_capture_notice.ps1"
+    COMMENT "Resetting ShaderLab first-time overlay settings for testing"
 )
 
 # if you pass -DRESHADE_DIR we also drop a fresh dxgi.dll next to the addon for quick testing

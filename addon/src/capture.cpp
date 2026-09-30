@@ -126,7 +126,6 @@ void on_reshade_present(reshade::api::effect_runtime *runtime) {
         } catch (...) {
             queue_mgr.add_log(L"Exception in trigger_save_project_workflow (as)");
         }
-        // resync in case extra increments happened while modal loop ran
         s_last_save_project_as_version = block->request_save_project_as;
     }
 
@@ -166,6 +165,11 @@ void on_reshade_present(reshade::api::effect_runtime *runtime) {
     } else {
         s_is_loading = false;
         block->effects_compiling = 0;
+    }
+    if (!s_finish_effects_fired_this_frame && block->export_state == ExportState::Idle) {
+        before_after_capture_pre(block, runtime, nullptr, {});
+        before_after_composite(block, runtime, nullptr, {});
+        composite_hud(block, runtime, nullptr, {});
     }
     s_finish_effects_fired_this_frame = false;
     sync_depth_peek_state(runtime, block);
@@ -289,6 +293,20 @@ void on_init_effect_runtime(reshade::api::effect_runtime *runtime) {
         reshade::set_config_value(runtime, "GENERAL", "IntermediateCachePath", ".\\common\\ShaderCache");
     }
 
+    bool helper_unattached_done = false;
+    reshade::get_config_value(runtime, "ShaderLab", "FirstRunUnattachedDone", helper_unattached_done);
+    if (!helper_unattached_done) {
+        char win_buf[8192] = {};
+        size_t win_sz = sizeof(win_buf);
+        reshade::get_config_value(runtime, "OVERLAY", "Window", win_buf, &win_sz);
+        std::string s(win_buf);
+        if (s.find("[Window][ShaderLab Helper]") == std::string::npos) {
+            if (!s.empty() && s.back() != ',') s += ",";
+            s += "[Window][ShaderLab Helper],Pos=80,,80,Size=480,,720,Collapsed=0";
+            reshade::set_config_value(runtime, "OVERLAY", "Window", s.c_str());
+        }
+    }
+
     s_finish_effects_fired_this_frame = false;
     s_is_loading = true;
     JobQueueManager &queue_mgr = JobQueueManager::get();
@@ -328,6 +346,8 @@ void on_reshade_reloaded_effects(reshade::api::effect_runtime *runtime) {
     SharedControlBlock *block = queue_mgr.get_control_block();
     if (!block || !queue_mgr.is_connected()) return;
 
+    block->effects_compiling = 0;
+
     if (block->depth_valid != 0 && block->depth_srv_ptr != 0) {
         reshade::api::resource_view depth_srv_view{ block->depth_srv_ptr };
         runtime->update_texture_bindings("DEPTH", depth_srv_view, depth_srv_view);
@@ -359,7 +379,7 @@ void on_reshade_finish_effects(
     block->fine_tune_vk = keybinds::fine_tune_vk();
 
     static uint32_t s_last_preset_version = 0;
-    if (block->requested_preset_version != s_last_preset_version && block->requested_preset_path[0] != L'\0') {
+    if (block->export_state == ExportState::Idle && block->requested_preset_version != s_last_preset_version && block->requested_preset_path[0] != L'\0') {
         s_last_preset_version = block->requested_preset_version;
         std::string target_preset_u8 = wide_to_utf8(block->requested_preset_path);
         if (!target_preset_u8.empty() && runtime) {
@@ -390,6 +410,9 @@ void on_reshade_finish_effects(
 
     static ExportState s_prev_export_state = ExportState::Idle;
     if (s_prev_export_state != block->export_state) {
+        if (block->export_state != ExportState::Idle && runtime) {
+            runtime->open_overlay(false, reshade::api::input_source::keyboard);
+        }
         if (block->export_state == ExportState::Rendering) {
             accelerate_autofocus(runtime);
         } else if (s_prev_export_state == ExportState::Rendering ||
@@ -413,6 +436,8 @@ void on_reshade_finish_effects(
     reshade::api::device *device = runtime->get_device();
     reshade::api::command_queue *queue = runtime->get_command_queue();
     if (!device || !queue || !cmd_list) {
+        block->export_error = IPC_ERR_STAGING_FAILED;
+        MemoryBarrier();
         block->export_state = ExportState::Failed;
         return;
     }
@@ -420,6 +445,7 @@ void on_reshade_finish_effects(
     reshade::api::resource back_buffer = device->get_resource_from_view(rtv);
     if (back_buffer.handle == 0) {
         block->export_error = IPC_ERR_STAGING_FAILED;
+        MemoryBarrier();
         block->export_state = ExportState::Failed;
         queue_mgr.add_log(L"Capture failed: could not resolve back buffer resource from view");
         return;
@@ -438,8 +464,9 @@ void on_reshade_finish_effects(
             nullptr,
             reshade::api::resource_usage::copy_dest,
             &staging)) {
-            // TODO: fails on some drivers and I have no idea why yet, need to actually debug this
+            // TODO: staging resource creation fails on some drivers, log adapter name + HRESULT when this reproduces
             block->export_error = IPC_ERR_STAGING_FAILED;
+            MemoryBarrier();
             block->export_state = ExportState::Failed;
             queue_mgr.add_log(L"Capture failed: create staging resource failed");
             return;
@@ -625,6 +652,7 @@ void on_reshade_finish_effects(
             }
 
             block->export_error = IPC_OK;
+            MemoryBarrier();
             block->export_state = ExportState::Done;
             std::wstring status_msg = L"Export complete: " + fs::path(block->export_output_path).filename().wstring();
             wcsncpy_s(block->export_status, kMaxPathW, status_msg.c_str(), _TRUNCATE);
@@ -639,12 +667,14 @@ void on_reshade_finish_effects(
             queue_mgr.add_log(log_msg);
         } else {
             block->export_error = IPC_ERR_WRITE_FAILED;
+            MemoryBarrier();
             block->export_state = ExportState::Failed;
             wcsncpy_s(block->export_status, kMaxPathW, L"Export failed (PNG write error)", _TRUNCATE);
             queue_mgr.add_log(L"Export failed: stbi_write_png failed for " + std::wstring(block->export_output_path));
         }
     } else {
         block->export_error = IPC_ERR_STAGING_FAILED;
+        MemoryBarrier();
         block->export_state = ExportState::Failed;
         wcsncpy_s(block->export_status, kMaxPathW, L"Export failed (Staging map error)", _TRUNCATE);
         queue_mgr.add_log(L"Export failed: map_texture_region failed");

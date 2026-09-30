@@ -1,12 +1,66 @@
 #define ImTextureID ImU64
 #include <imgui.h>
+
+namespace {
+inline ImGuiContext* get_imgui_context();
+}
+#ifndef GImGui
+#define GImGui (get_imgui_context())
+#endif
+#include <imgui_internal.h>
 #include <reshade.hpp>
+
+enum ImGuiDockRequestType_
+{
+    ImGuiDockRequestType_None = 0,
+    ImGuiDockRequestType_Dock,
+    ImGuiDockRequestType_Undock,
+    ImGuiDockRequestType_Split
+};
+
+struct ImGuiDockRequest
+{
+    int                     Type;
+    ImGuiDockNode*          DockTargetNode;
+    ImGuiWindow*            DockTargetWindow;
+    ImGuiWindow*            DockPayload;
+    ImGuiDockNode*          UndockTargetNode;
+    ImGuiWindow*            UndockTargetWindow;
+    ImGuiDir                DockSplitDir;
+    float                   DockSplitRatio;
+    bool                    DockSplitOuter;
+
+    ImGuiDockRequest()
+    {
+        Type = ImGuiDockRequestType_None;
+        DockTargetNode = UndockTargetNode = nullptr;
+        DockTargetWindow = UndockTargetWindow = DockPayload = nullptr;
+        DockSplitDir = ImGuiDir_None;
+        DockSplitRatio = 0.5f;
+        DockSplitOuter = false;
+    }
+};
+
+namespace {
+inline ImGuiContext* get_imgui_context() {
+    const auto *table = imgui_function_table_instance();
+    if (!table || !table->GetIO) return nullptr;
+    uintptr_t io_addr = reinterpret_cast<uintptr_t>(&table->GetIO());
+    if (io_addr < 0x10000 || io_addr > 0x7FFFFFFFFFFF) return nullptr;
+    uintptr_t ctx_addr = io_addr - offsetof(ImGuiContext, IO);
+    if (ctx_addr < 0x10000 || ctx_addr > 0x7FFFFFFFFFFF) return nullptr;
+    ImGuiContext *ctx = reinterpret_cast<ImGuiContext *>(ctx_addr);
+    return ctx->Initialized ? ctx : nullptr;
+}
+}
+
 #include "overlay_ui.h"
 #include "job_queue.h"
 #include "undo_history.h"
 #include "keybinds.h"
 #include "before_after.h"
 #include "depth_manager.h"
+#include "erase_tool.h"
 #include "project_file.h"
 #include <windows.h>
 #include <commdlg.h>
@@ -218,10 +272,8 @@ static bool DrawProgressButton(const char *id, const char *label, float progress
     ImU32 border_col = ImGui::GetColorU32(ImGuiCol_Border);
     float rounding = 6.0f; // rounded rectangle squircle
 
-    // base fill
     draw_list->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), bg_col, rounding);
 
-    // progress overlay
     if (is_active) {
         if (progress >= 0.0f) {
             float fill_w = std::clamp(progress, 0.0f, 1.0f) * size.x;
@@ -258,7 +310,6 @@ static bool DrawProgressButton(const char *id, const char *label, float progress
         }
     }
 
-    // border
     if (style.FrameBorderSize > 0.0f) {
         draw_list->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y), border_col, rounding, 0, style.FrameBorderSize);
     }
@@ -622,8 +673,52 @@ void trigger_export_as_workflow(reshade::api::effect_runtime *runtime) {
 }
 
 static int s_keybind_capturing = -1;
+static int s_last_overlay_frame = -1;
+
+void on_reshade_overlay_frame(reshade::api::effect_runtime *runtime) {
+    JobQueueManager &queue_mgr = JobQueueManager::get();
+    SharedControlBlock *block = queue_mgr.get_control_block();
+    if (!block || !queue_mgr.is_connected()) return;
+    std::wstring active_path = queue_mgr.get_active_image_path();
+
+    int cur_frame = ImGui::GetFrameCount();
+    bool overlay_open = (s_last_overlay_frame == cur_frame);
+    if (!overlay_open) {
+        EraseTool::get().set_ui_rect(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    EraseTool::get().handle_frame(block, runtime, active_path, true, false, false);
+}
 
 void on_overlay(reshade::api::effect_runtime *runtime) {
+    ImGui::SetWindowSize("ShaderLab Helper", ImVec2(480, 720), ImGuiCond_FirstUseEver);
+    ImGui::SetWindowPos("ShaderLab Helper", ImVec2(80, 80), ImGuiCond_FirstUseEver);
+
+    static bool s_first_run_undock_done = false;
+    if (!s_first_run_undock_done && runtime) {
+        bool first_run_done = false;
+        reshade::get_config_value(runtime, "ShaderLab", "FirstRunUnattachedDone", first_run_done);
+        if (!first_run_done) {
+            ImGuiContext *ctx = get_imgui_context();
+            if (ctx && ctx->CurrentWindow) {
+                ImGuiWindow *w = ctx->CurrentWindow;
+                if (w->DockNode != nullptr) {
+                    ImGuiDockRequest req;
+                    req.Type = ImGuiDockRequestType_Undock;
+                    req.UndockTargetWindow = w;
+                    ctx->DockContext.Requests.push_back(req);
+                }
+                ImGui::SetWindowPos("ShaderLab Helper", ImVec2(80, 80), ImGuiCond_Always);
+                ImGui::SetWindowSize("ShaderLab Helper", ImVec2(480, 720), ImGuiCond_Always);
+                reshade::set_config_value(runtime, "ShaderLab", "FirstRunUnattachedDone", true);
+                s_first_run_undock_done = true;
+            }
+        } else {
+            s_first_run_undock_done = true;
+        }
+    }
+
+    s_last_overlay_frame = ImGui::GetFrameCount();
     JobQueueManager &queue_mgr = JobQueueManager::get();
     queue_mgr.update();
 
@@ -636,10 +731,18 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
 
     SharedControlBlock *block = queue_mgr.get_control_block();
 
+    ImVec2 win_pos = ImGui::GetWindowPos();
+    ImVec2 win_size = ImGui::GetWindowSize();
+    EraseTool::get().set_ui_rect(win_pos.x - 12.0f, win_pos.y - 12.0f, win_pos.x + win_size.x + 12.0f, win_pos.y + win_size.y + 12.0f);
+
     static uint32_t s_last_active_project_version = 0;
     if (block && block->active_project_version != s_last_active_project_version) {
         s_last_active_project_version = block->active_project_version;
-        s_current_project_path = block->active_project_path;
+        std::wstring new_proj = block->active_project_path;
+        if (s_current_project_path != new_proj) {
+            s_current_project_path = new_proj;
+            EraseTool::get().clear_erase_history();
+        }
     }
 
     bool want_text = ImGui::GetIO().WantTextInput;
@@ -667,6 +770,12 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         } else if (keybinds::is_pressed(keybinds::Action::ToggleBeforeAfter) ||
                    (!ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift && !ImGui::GetIO().KeyAlt && ImGui::IsKeyPressed(ImGuiKey_B, false))) {
             before_after_toggle();
+        } else if (keybinds::is_pressed(keybinds::Action::ToggleErase) ||
+                   (!ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift && !ImGui::GetIO().KeyAlt && ImGui::IsKeyPressed(ImGuiKey_E, false))) {
+            EraseTool::get().toggle();
+            if (EraseTool::get().is_active()) {
+                EraseTool::get().prewarm_worker();
+            }
         }
     }
     static bool   s_overlay_panning  = false;
@@ -684,7 +793,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
     static constexpr float kZoomStep   = 0.12f;  // per wheel notch (fractional)
     static constexpr float kZoomStepFine = 0.04f; // per wheel notch while shift held
     static constexpr float kFineFactor    = 0.25f; // drag scale while shift held
-    static constexpr float kDeadZone   = 16.0f;  // pixel²
+    static constexpr float kDeadZone   = 16.0f;  // squared pixels
 
     if (block) {
         ImGuiIO &io = ImGui::GetIO();
@@ -701,9 +810,9 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         const bool any_active  = ImGui::IsAnyItemActive();
         want_text = io.WantTextInput;
         if (want_text) {
-            block->view_interaction_flags |= VIEW_FLAG_TEXT_INPUT;
+            ipc_set_view_flag(&block->view_interaction_flags, VIEW_FLAG_TEXT_INPUT);
         } else {
-            block->view_interaction_flags &= ~VIEW_FLAG_TEXT_INPUT;
+            ipc_clear_view_flag(&block->view_interaction_flags, VIEW_FLAG_TEXT_INPUT);
         }
         // poll the fine-tune key via raw key state, same as the host exe, so it still
         // registers when reshade's imgui backend won't report it
@@ -719,8 +828,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         const bool lock_rotate = (block->view_interaction_flags & VIEW_FLAG_LOCK_ROT) != 0;
         const bool lock_pan    = (block->view_interaction_flags & VIEW_FLAG_LOCK_PAN) != 0;
 
-        // -- zoom (mouse wheel over background) --
-        if (bg_hovered && !any_active && io.MouseWheel != 0.0f) {
+        if (block->export_state == ExportState::Idle && bg_hovered && !any_active && io.MouseWheel != 0.0f) {
             if (lock_zoom) {
                 block->view_last_zoom_ms = GetTickCount64();
             } else {
@@ -755,14 +863,20 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
             ba_state_mut.split_offset = block->before_after_split;
         }
 
-        before_after_handle_input(bg_hovered, any_active, fine);
+        // EraseTool::get().handle_frame is invoked in on_reshade_overlay_frame
+        bool erase_active = EraseTool::get().is_active();
+
+        before_after_handle_input(bg_hovered, any_active || erase_active, fine);
         const auto &ba_state = before_after_get_state();
         if (ba_state.enabled) {
             block->before_after_angle = ba_state.angle;
             block->before_after_split = ba_state.split_offset;
         }
 
-        if (!lock_pan && !ba_state.enabled && io.MouseDown[0] && !s_overlay_rotating && !ba_state.is_dragging_pos) {
+        bool middle_pan = io.MouseDown[2] || (io.MouseDown[0] && ImGui::IsKeyDown(ImGuiKey_Space));
+        bool allow_pan_drag = middle_pan || (!erase_active && io.MouseDown[0] && !alt_down);
+
+        if (block->export_state == ExportState::Idle && !lock_pan && !ba_state.enabled && allow_pan_drag && !s_overlay_rotating && !ba_state.is_dragging_pos) {
             s_pan_locked_attempt = false;
             if (!s_overlay_panning) {
                 if (bg_hovered && !any_active && !alt_down)
@@ -793,9 +907,9 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
             s_overlay_panning = false;
         }
 
-        bool rotate_btn = io.MouseDown[1] || (io.MouseDown[0] && alt_down);
+        bool rotate_btn = (!erase_active && io.MouseDown[1]) || ((!erase_active ? io.MouseDown[0] : (io.MouseDown[0] || io.MouseDown[1])) && alt_down);
 
-        if (!lock_rotate && rotate_btn && !s_overlay_panning && !ba_state.enabled) {
+        if (block->export_state == ExportState::Idle && !lock_rotate && rotate_btn && !s_overlay_panning && !ba_state.enabled) {
             if (!s_overlay_rotating) {
                 if (bg_hovered && !any_active) {
                     s_overlay_rotating = true;
@@ -901,7 +1015,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
             uint64_t now_lock_ms = GetTickCount64();
             if (now_lock_ms - block->view_last_lock_ms >= 200) {
                 if (keybinds::is_pressed(keybinds::Action::LockPan)) {
-                    block->view_interaction_flags ^= VIEW_FLAG_LOCK_PAN;
+                    ipc_toggle_view_flag(&block->view_interaction_flags, VIEW_FLAG_LOCK_PAN);
                     bool locked = (block->view_interaction_flags & VIEW_FLAG_LOCK_PAN) != 0;
                     if (locked) s_overlay_panning = false;
                     char bLock[32];
@@ -914,7 +1028,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
                     block->view_last_lock_ms = now_lock_ms;
                     block->view_transform_version++;
                 } else if (keybinds::is_pressed(keybinds::Action::LockZoom)) {
-                    block->view_interaction_flags ^= VIEW_FLAG_LOCK_ZOOM;
+                    ipc_toggle_view_flag(&block->view_interaction_flags, VIEW_FLAG_LOCK_ZOOM);
                     bool locked = (block->view_interaction_flags & VIEW_FLAG_LOCK_ZOOM) != 0;
                     char bLock[32];
                     keybinds::describe(keybinds::Action::LockZoom, bLock, sizeof(bLock));
@@ -926,7 +1040,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
                     block->view_last_lock_ms = now_lock_ms;
                     block->view_transform_version++;
                 } else if (keybinds::is_pressed(keybinds::Action::LockRotate)) {
-                    block->view_interaction_flags ^= VIEW_FLAG_LOCK_ROT;
+                    ipc_toggle_view_flag(&block->view_interaction_flags, VIEW_FLAG_LOCK_ROT);
                     bool locked = (block->view_interaction_flags & VIEW_FLAG_LOCK_ROT) != 0;
                     if (locked) s_overlay_rotating = false;
                     char bLock[32];
@@ -948,13 +1062,13 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
                     MultiByteToWideChar(CP_UTF8, 0, bLock, -1, wLock, 32);
                     wchar_t msg[64];
                     if (any_unlocked) {
-                        block->view_interaction_flags |= (VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT | VIEW_FLAG_LOCK_PAN);
+                        ipc_set_view_flag(&block->view_interaction_flags, VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT | VIEW_FLAG_LOCK_PAN);
                         s_overlay_panning = false;
                         s_overlay_rotating = false;
                         swprintf_s(msg, L"View locked (Pan, Zoom, & Rotate) (%s)", wLock);
                         queue_mgr.add_log(msg);
                     } else {
-                        block->view_interaction_flags &= ~(VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT | VIEW_FLAG_LOCK_PAN);
+                        ipc_clear_view_flag(&block->view_interaction_flags, VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT | VIEW_FLAG_LOCK_PAN);
                         swprintf_s(msg, L"View unlocked (%s)", wLock);
                         queue_mgr.add_log(msg);
                     }
@@ -963,9 +1077,9 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
                 } else if (keybinds::is_pressed(keybinds::Action::ToggleBeforeAfter)) {
                     before_after_toggle();
                     if (before_after_get_state().enabled) {
-                        block->view_interaction_flags |= VIEW_FLAG_BEFORE_AFTER;
+                        ipc_set_view_flag(&block->view_interaction_flags, VIEW_FLAG_BEFORE_AFTER);
                     } else {
-                        block->view_interaction_flags &= ~VIEW_FLAG_BEFORE_AFTER;
+                        ipc_clear_view_flag(&block->view_interaction_flags, VIEW_FLAG_BEFORE_AFTER);
                     }
                     block->before_after_angle = before_after_get_state().angle;
                     block->before_after_split = before_after_get_state().split_offset;
@@ -990,35 +1104,25 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
             }
         }
 
-        uint32_t preserved_flags = block->view_interaction_flags & (VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT | VIEW_FLAG_LOCK_PAN | VIEW_FLAG_DEPTH_PEEK | VIEW_FLAG_BEFORE_AFTER | VIEW_FLAG_BEFORE_AFTER_DRAG);
-        if (want_text) {
-            preserved_flags |= VIEW_FLAG_TEXT_INPUT;
-        } else {
-            preserved_flags &= ~VIEW_FLAG_TEXT_INPUT;
-        }
-        uint32_t inter_flags = preserved_flags;
-        if (ba_state.enabled) {
-            inter_flags |= VIEW_FLAG_BEFORE_AFTER;
-        } else {
-            inter_flags &= ~VIEW_FLAG_BEFORE_AFTER;
-        }
-        if (ba_state.is_dragging_pos) {
-            inter_flags |= VIEW_FLAG_BEFORE_AFTER_DRAG;
-        } else {
-            inter_flags &= ~VIEW_FLAG_BEFORE_AFTER_DRAG;
-        }
-        if (s_overlay_panning)    inter_flags |= VIEW_FLAG_PANNING;
-        if (s_overlay_rotating)   inter_flags |= VIEW_FLAG_ROTATING;
-        if (s_overlay_snapped)    inter_flags |= VIEW_FLAG_SNAPPED;
-        if (fine)                 inter_flags |= VIEW_FLAG_FINE;
-        if (s_pan_locked_attempt) inter_flags |= VIEW_FLAG_PAN_LOCKED_ATTEMPT;
-        if (inter_flags != block->view_interaction_flags) {
-            uint32_t old_flags = block->view_interaction_flags;
-            block->view_interaction_flags = inter_flags;
+        constexpr uint32_t kOverlayManagedMask = VIEW_FLAG_TEXT_INPUT | VIEW_FLAG_BEFORE_AFTER | VIEW_FLAG_BEFORE_AFTER_DRAG |
+                                                VIEW_FLAG_PANNING | VIEW_FLAG_ROTATING | VIEW_FLAG_SNAPPED | VIEW_FLAG_FINE | VIEW_FLAG_PAN_LOCKED_ATTEMPT;
+        uint32_t overlay_flags = 0;
+        if (want_text)                overlay_flags |= VIEW_FLAG_TEXT_INPUT;
+        if (ba_state.enabled)         overlay_flags |= VIEW_FLAG_BEFORE_AFTER;
+        if (ba_state.is_dragging_pos) overlay_flags |= VIEW_FLAG_BEFORE_AFTER_DRAG;
+        if (s_overlay_panning)        overlay_flags |= VIEW_FLAG_PANNING;
+        if (s_overlay_rotating)       overlay_flags |= VIEW_FLAG_ROTATING;
+        if (s_overlay_snapped)        overlay_flags |= VIEW_FLAG_SNAPPED;
+        if (fine)                     overlay_flags |= VIEW_FLAG_FINE;
+        if (s_pan_locked_attempt)     overlay_flags |= VIEW_FLAG_PAN_LOCKED_ATTEMPT;
+
+        uint32_t old_flags = block->view_interaction_flags;
+        if ((old_flags & kOverlayManagedMask) != overlay_flags) {
+            ipc_update_view_flags(&block->view_interaction_flags, kOverlayManagedMask, overlay_flags);
             constexpr uint32_t kTransformMask = VIEW_FLAG_ROTATING | VIEW_FLAG_PANNING |
                                                 VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT | VIEW_FLAG_LOCK_PAN |
                                                 VIEW_FLAG_SNAPPED | VIEW_FLAG_FINE | VIEW_FLAG_PAN_LOCKED_ATTEMPT;
-            if ((inter_flags & kTransformMask) != (old_flags & kTransformMask)) {
+            if ((overlay_flags & kTransformMask) != (old_flags & kTransformMask)) {
                 block->view_transform_version++;
             }
         }
@@ -1046,7 +1150,13 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
             s_last_depth_version = block->depth_version;
             s_prev_depth_valid = block->depth_valid;
             if (wcslen(block->preview_path) > 0) {
-                queue_mgr.add_log(L"Image loaded: " + std::wstring(block->preview_path));
+                std::wstring p(block->preview_path);
+                std::wstring p_lower = p;
+                for (auto &c : p_lower) c = towlower(c);
+                if (p_lower.find(L"erase_stages") == std::wstring::npos) {
+                    EraseTool::get().clear_erase_history();
+                }
+                queue_mgr.add_log(L"Image loaded: " + p);
                 if (block->depth_valid) {
                     wchar_t dbuf[128];
                     swprintf_s(dbuf, L"Depth buffer active (%ux%u, Far=%.0f)", block->depth_width, block->depth_height, block->depth_far_plane);
@@ -1072,6 +1182,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         }
     }
 
+    bool is_on_erase_tab = false;
     ImGui::BeginTabBar("ShaderLabTabs", ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_FittingPolicyScroll);
     if (ImGui::BeginTabItem("Main")) {
         // image drop zone
@@ -1295,9 +1406,8 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         ImGui::Separator();
         ImGui::Spacing();
 
-        // footer
         float win_w = ImGui::GetWindowWidth();
-        ImGui::TextDisabled("ShaderLab v1.2.1  -  by NotRaySt");
+        ImGui::TextDisabled("ShaderLab v1.2.2  -  by NotRaySt");
         if (win_w >= 540.0f) {
             ImGui::SameLine();
         } else {
@@ -1339,7 +1449,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
 
         static float s_ai_far_plane = 50.0f;
         static int s_ai_model_idx = 0;
-        static int s_ai_input_size = 1008;
+        static int s_ai_input_size = 2016;
         static uint32_t s_last_img_w = 0, s_last_img_h = 0;
         static bool s_res_user_set = false;
         static float s_ai_gamma = 2.0f;
@@ -1356,15 +1466,13 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         const char *encoders[] = { "vitl", "vitb", "vits" };
 
         int max_res = 2016;
-        int default_res = 1008;
+        int default_res = 2016;
         if (block && block->view_image_width > 0 && block->view_image_height > 0) {
             int img_max = (std::max)(block->view_image_width, block->view_image_height);
             max_res = (img_max / 14) * 14;
             if (max_res < 392) max_res = 392;
 
-            default_res = ((img_max / 2) / 14) * 14;
-            if (default_res < 392) default_res = 392;
-            if (default_res > max_res) default_res = max_res;
+            default_res = max_res;
 
             if (block->view_image_width != s_last_img_w || block->view_image_height != s_last_img_h) {
                 s_last_img_w = block->view_image_width;
@@ -1377,7 +1485,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         if (s_ai_input_size > max_res) s_ai_input_size = max_res;
         if (s_ai_input_size < 392) s_ai_input_size = 392;
 
-        bool ai_running = depth_mgr.is_ai_running();
+        bool ai_running = depth_mgr.is_processing();
         bool downloading = depth_mgr.is_downloading();
         bool model_present = depth_mgr.is_model_present(encoders[s_ai_model_idx]);
 
@@ -1392,7 +1500,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
             btn_label = status_txt.empty() ? "Downloading Model..." : ("Downloading: " + status_txt);
             is_busy = true;
         } else if (ai_running) {
-            float p = depth_mgr.get_ai_progress();
+            float p = depth_mgr.get_progress();
             btn_progress = (p >= 0.0f) ? p : -1.0f;
             btn_label = (avail_w < 260.0f) ? "Generating Depth..." : "Generating Depth (AI)...";
             is_busy = true;
@@ -1416,9 +1524,20 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         bool btn_disabled = active_path.empty() || is_busy;
         if (DrawProgressButton("##GenDepthBtn", btn_label.c_str(), btn_progress, is_busy, btn_disabled, ImVec2(-1, 38))) {
             if (!model_present) {
-                depth_mgr.trigger_model_download(encoders[s_ai_model_idx]);
+                depth_mgr.trigger_model_download_and_estimate(
+                    active_path,
+                    s_ai_far_plane,
+                    false,
+                    encoders[s_ai_model_idx],
+                    s_ai_input_size,
+                    s_ai_gamma,
+                    s_ai_near_threshold,
+                    s_ai_sky_threshold,
+                    s_ai_edge_refine,
+                    s_ai_invert
+                );
             } else {
-                depth_mgr.trigger_ai_depth(
+                depth_mgr.trigger_depth_estimate(
                     active_path,
                     s_ai_far_plane,
                     false,
@@ -1434,14 +1553,14 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         }
 
         if (ai_running) {
-            std::string status = depth_mgr.get_ai_status();
+            std::string status = depth_mgr.get_status();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.8f, 1.0f, 1.0f));
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextWrapped("Processing: %s", status.c_str());
             ImGui::PopTextWrapPos();
             ImGui::PopStyleColor();
         } else {
-            std::string err = depth_mgr.get_ai_last_error();
+            std::string err = depth_mgr.get_last_error();
             if (!err.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
                 ImGui::PushTextWrapPos(0.0f);
@@ -1484,8 +1603,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Inference resolution passed to Vision Transformer (snapped in steps of 14px).\n"
                                   "Min: 392px (Fast)\n"
-                                  "Default: %dpx (Half-resolution for fast inference)\n"
-                                  "Max: %dpx (Native image dimension cap)", default_res, max_res);
+                                  "Default / Max: %dpx (Native image dimension cap)", max_res);
             }
 
             ImGui::Spacing();
@@ -1611,6 +1729,12 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
             ImGui::PopTextWrapPos();
         }
 
+        ImGui::EndTabItem();
+    }
+
+    if (ImGui::BeginTabItem("Erase")) {
+        is_on_erase_tab = true;
+        EraseTool::get().render_ui(block, active_path);
         ImGui::EndTabItem();
     }
 
@@ -2059,7 +2183,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.35f, 0.70f, 1.00f, 1.00f), "ShaderLab");
         ImGui::SameLine();
-        ImGui::TextDisabled("v1.2.1");
+        ImGui::TextDisabled("v1.2.2");
 
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::PushTextWrapPos(0.0f);
@@ -2148,4 +2272,7 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
 
     ImGui::EndTabBar();
 
+    if (!is_on_erase_tab && EraseTool::get().is_active()) {
+        EraseTool::get().set_active(false);
+    }
 }

@@ -35,6 +35,7 @@ set(HOST_SOURCES
     src/cli/cli_dispatcher.cpp
     src/cli/cli_ctl.h
     src/cli/cli_ctl.cpp
+    src/cli/cli_reshade_utils.h
     ../common/project_file.h
     ../common/project_file.cpp
     ../common/depth_file.cpp

@@ -83,6 +83,8 @@ public:
     bool is_dragging_split_rot() const { return m_is_dragging_split_rot; }
     void set_before_after_enabled(bool enabled);
     void toggle_before_after() { set_before_after_enabled(!m_before_after_enabled); }
+    bool is_erase_active() const { return m_erase_active; }
+    void set_erase_active(bool e) { m_erase_active = e; }
 
 private:
     void update_snap();
@@ -90,6 +92,7 @@ private:
 
     ViewportTransform m_transform;
     bool m_is_locked = false;
+    bool m_erase_active = false;
     bool m_lock_zoom = false;
     bool m_lock_rotate = false;
     bool m_lock_pan = false;
@@ -110,6 +113,8 @@ private:
     bool  m_is_dragging_split_pos = false;
     bool  m_is_dragging_split_rot = false;
     bool  m_is_hovering_split = false;
+    bool  m_split_changed = false;
+    bool  m_angle_changed = false;
     float m_raw_split_angle = 0.0f;
     bool  m_saved_lock_zoom = false;
     bool  m_saved_lock_rotate = false;

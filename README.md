@@ -48,7 +48,7 @@ ShaderLab is a lightweight app with an addon that leverages ReShade's shader pip
 4. Drag and drop any image (`.png`, `.jpg`, `.jpeg`, `.bmp`) or `.shaderlab` project onto the window.
 5. Press `Home` to open the overlay:
    - **Home tab**: Enable and tweak your ReShade shaders.
-   - **ShaderLab Helper tab**: On first launch it'll be off to the far right of the tabs, just drag it out for ease of use. You can manage depth, settings, keybinds, and **Export** there.
+   - **ShaderLab Helper tab**: Contains controls to manage depth, settings, keybinds, and **Export**.
 
 ---
 

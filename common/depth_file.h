@@ -13,7 +13,7 @@ constexpr uint32_t kSidecarFlagFlat  = 1 << 1;
 struct SidecarDepthHeader {
     uint32_t magic;                // 'SLD1' = 0x534C4431
     uint16_t version;              // 1
-    uint16_t encoding;             // 0 = R32F Deflate compressed
+    uint16_t encoding;             // 0 = R32F, 1 = R16U, 2 = R8U, 3 = R4U (Deflate compressed)
     uint32_t width;                // width in pixels
     uint32_t height;               // height in pixels
     uint32_t flags;                // kSidecarFlagValid, etc.

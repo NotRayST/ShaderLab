@@ -1,2 +1,2 @@
 #pragma once
-// modal dialogs and redundant preferences retired, kept in trash for safekeeping
+// retired modal dialogs, kept for safekeeping

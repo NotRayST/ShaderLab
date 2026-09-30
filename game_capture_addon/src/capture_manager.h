@@ -21,6 +21,13 @@ public:
     void on_reshade_screenshot(reshade::api::effect_runtime* runtime, const char* path);
     void on_reshade_reloaded_effects(reshade::api::effect_runtime* runtime);
     void on_draw_overlay(reshade::api::effect_runtime* runtime);
+    void on_reshade_overlay_frame(reshade::api::effect_runtime* runtime);
+
+    void set_standalone_tab(reshade::api::effect_runtime* runtime, bool standalone);
+    bool is_standalone_tab() const;
+
+    void set_enabled(reshade::api::effect_runtime* runtime, bool enabled);
+    bool is_enabled() const { return m_enabled; }
 
     bool embed_depth_in_png(reshade::api::effect_runtime* runtime, const std::string& png_path);
     bool save_depth_sidecar(reshade::api::effect_runtime* runtime, const std::string& sidecar_path);
@@ -33,6 +40,7 @@ private:
 
     std::string get_log_file_path() const;
     void ensure_shader_file(reshade::api::effect_runtime* runtime);
+    void load_notice_state(reshade::api::effect_runtime* runtime);
 
     std::mutex m_log_mutex;
     std::ofstream m_log_file;
@@ -43,7 +51,8 @@ private:
     std::atomic<bool> m_technique_found{ false };
 
     // diagnostics & ui state
-    bool m_export_16bit{ true };
+    bool m_enabled{ true };
+    int  m_depth_bit_depth{ 1 }; // 0 = 32-bit float, 1 = 16-bit int, 2 = 8-bit int, 3 = 4-bit int
     std::atomic<bool> m_last_capture_success{ false };
     std::string m_last_capture_status{ "Ready - Press ReShade Screenshot key" };
     uint32_t m_last_capture_w{ 0 };
@@ -53,4 +62,14 @@ private:
     bool m_last_is_flat{ false };
     std::string m_last_saved_png_path;
     std::string m_last_saved_sidecar_path;
+
+    // first-run ShaderLab notice state
+    bool m_notice_checked{ false };
+    bool m_notice_dismissed{ false };  // persisted: notice was already shown once
+    bool m_notice_open{ false };       // notice window visible this session
+    bool m_overlay_opened_once{ false };
+
+    // post-capture prompt state
+    bool m_capture_notice_checked{ false };
+    bool m_capture_notice_dismissed{ false };
 };

@@ -27,6 +27,24 @@ static void on_overlay(reshade::api::effect_runtime* runtime) {
     CaptureManager::get().on_draw_overlay(runtime);
 }
 
+static void on_reshade_overlay_frame(reshade::api::effect_runtime* runtime) {
+    CaptureManager::get().on_reshade_overlay_frame(runtime);
+}
+
+static bool s_standalone_tab = true;
+
+void CaptureManager::set_standalone_tab(reshade::api::effect_runtime* runtime, bool standalone) {
+    if (s_standalone_tab == standalone) return;
+    reshade::unregister_overlay(s_standalone_tab ? "ShaderLab Capture" : nullptr, &on_overlay);
+    s_standalone_tab = standalone;
+    if (runtime) reshade::set_config_value(runtime, "ShaderLabCapture", "StandaloneTab", s_standalone_tab);
+    reshade::register_overlay(s_standalone_tab ? "ShaderLab Capture" : nullptr, &on_overlay);
+}
+
+bool CaptureManager::is_standalone_tab() const {
+    return s_standalone_tab;
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
@@ -37,10 +55,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         reshade::register_event<reshade::addon_event::reshade_finish_effects>(&on_finish_effects);
         reshade::register_event<reshade::addon_event::reshade_screenshot>(&on_screenshot);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(&on_reloaded_effects);
-        reshade::register_overlay(nullptr, &on_overlay);
+        reshade::register_event<reshade::addon_event::reshade_overlay>(&on_reshade_overlay_frame);
+        reshade::register_overlay(s_standalone_tab ? "ShaderLab Capture" : nullptr, &on_overlay);
         break;
     case DLL_PROCESS_DETACH:
-        reshade::unregister_overlay(nullptr, &on_overlay);
+        reshade::unregister_overlay(s_standalone_tab ? "ShaderLab Capture" : nullptr, &on_overlay);
+        reshade::unregister_event<reshade::addon_event::reshade_overlay>(&on_reshade_overlay_frame);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(&on_reloaded_effects);
         reshade::unregister_event<reshade::addon_event::reshade_screenshot>(&on_screenshot);
         reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(&on_finish_effects);
