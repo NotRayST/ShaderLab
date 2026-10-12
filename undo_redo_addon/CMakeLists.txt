@@ -69,25 +69,4 @@ set_target_properties(UndoRedo PROPERTIES
     SOVERSION "1.1.0"
 )
 
-add_executable(UndoRedoTests
-    tests/test_main.cpp
-)
-
-target_compile_definitions(UndoRedoTests PRIVATE
-    _CRT_SECURE_NO_WARNINGS
-    WIN32_LEAN_AND_MEAN
-    NOMINMAX
-    UNDOREDO_STATIC
-)
-
-target_include_directories(UndoRedoTests PRIVATE
-    ${RESHADE_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
-target_link_libraries(UndoRedoTests PRIVATE
-    user32
-    shell32
-)
 

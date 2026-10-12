@@ -65,10 +65,6 @@ set_target_properties(capture PROPERTIES
     PREFIX ""
 )
 
-add_custom_command(TARGET capture POST_BUILD
-    COMMAND powershell.exe -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/../Trash/scripts/reset_capture_notice.ps1"
-    COMMENT "Resetting ShaderLab first-time overlay settings for testing"
-)
 
 # if you pass -DRESHADE_DIR we also drop a fresh dxgi.dll next to the addon for quick testing
 if(RESHADE_DIR)

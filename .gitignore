@@ -1,6 +1,5 @@
-#trash/testing folders
+#trash folder
 /trash
-undo_redo_addon/tests
 # build output
 /build/
 /build_*/

@@ -45,8 +45,4 @@ set_target_properties(ShaderLabCapture PROPERTIES
     SOVERSION "1.2.2"
 )
 
-add_custom_command(TARGET ShaderLabCapture POST_BUILD
-    COMMAND powershell.exe -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/../Trash/scripts/reset_capture_notice.ps1"
-    COMMENT "Resetting ShaderLabCapture first-time notice settings for testing"
-)
 

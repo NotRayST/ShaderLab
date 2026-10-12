@@ -41,7 +41,13 @@ jobs:
             New-Item -ItemType Directory -Path "dist\tools\lama" -Force
             Copy-Item "tools\lama\run_lama.py" "dist\tools\lama\"
           }
-          Compress-Archive -Path "dist\*" -DestinationPath "ShaderLab-nightly.zip"
+          Compress-Archive -Path "dist\*" -DestinationPath "ShaderLab-nightly.zip" -Force
+
+      - name: Update Nightly Tag
+        shell: pwsh
+        run: |
+          git tag -f nightly
+          git push -f origin nightly
 
       - name: Publish Nightly Release
         uses: softprops/action-gh-release@v2
@@ -49,6 +55,7 @@ jobs:
           tag_name: nightly
           name: "ShaderLab Nightly Build"
           prerelease: true
+          make_latest: false
           files: |
             ShaderLab-nightly.zip
             build/game_capture_addon/Release/ShaderLabCapture.addon
