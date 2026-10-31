@@ -6,6 +6,8 @@
 #include "settle_detector.h"
 #include "hud_renderer.h"
 #include "viewport_controller.h"
+#include "custom_ui.h"
+#include "effect_pipeline.h"
 #include "../../common/ipc_protocol.h"
 #include "../../common/depth_chunk.h"
 #include "../../common/depth_file.h"
@@ -429,6 +431,8 @@ static int run_app(int argc, wchar_t **argv) {
     ZoomHud zoom_hud;
     ToastHud toast_hud;
     WelcomeHud welcome_hud;
+    CustomUI custom_ui;
+    EffectPipeline pipeline;
 
     HudFontManager::get().initialize();
 
@@ -436,6 +440,9 @@ static int run_app(int argc, wchar_t **argv) {
     zoom_hud.initialize(gfx.get_device());
     toast_hud.initialize(gfx.get_device());
     welcome_hud.initialize(gfx.get_device());
+    custom_ui.initialize(gfx.get_hwnd(), gfx.get_device(), gfx.get_context());
+    pipeline.initialize(gfx.get_device());
+    gfx.add_input_hook(CustomUI::input_hook, &custom_ui);
 
     // if reshade is missing, show a big "go install it" overlay instead of just... nothing
     bool has_reshade = fs::exists(L"dxgi.dll") || fs::exists(L"ReShade64.dll");
@@ -447,7 +454,7 @@ static int run_app(int argc, wchar_t **argv) {
     if (warning.initialize(gfx.get_device())) {
         // check both naming conventions, reshade setup can go either way
         if (!has_reshade) {
-            warning.set_active(true);
+            warning.set_active(false);
         }
     }
 
@@ -1601,40 +1608,87 @@ static int run_app(int argc, wchar_t **argv) {
             gfx.set_render_target();
             gfx.clear(idle_color);
 
+            float menu_h = custom_ui.get_menu_bar_height();
+            float left_w = custom_ui.get_left_panel_width(gfx.get_render_width());
+            float right_w = custom_ui.get_right_panel_width(gfx.get_render_width());
+            float viewable_x = left_w;
+            float viewable_y = menu_h;
+            float viewable_w = static_cast<float>(gfx.get_render_width()) - left_w - right_w;
+            float viewable_h = static_cast<float>(gfx.get_render_height()) - menu_h;
+            if (viewable_w < 64.0f) viewable_w = 64.0f;
+            if (viewable_h < 64.0f) viewable_h = 64.0f;
+
+            D3D11_VIEWPORT vp = {};
+            vp.TopLeftX = viewable_x;
+            vp.TopLeftY = viewable_y;
+            vp.Width = viewable_w;
+            vp.Height = viewable_h;
+            vp.MinDepth = 0.0f;
+            vp.MaxDepth = 1.0f;
+
             if (depth_peek && active_image.has_depth && active_image.depth_srv) {
+                gfx.get_context()->RSSetViewports(1, &vp);
                 blit.render_depth_preview(
                     gfx.get_context(),
                     active_image.depth_srv.Get(),
                     viewport.get_transform(),
-                    static_cast<float>(gfx.get_render_width()),
-                    static_cast<float>(gfx.get_render_height()),
+                    viewable_w,
+                    viewable_h,
                     static_cast<float>(active_image.width),
                     static_cast<float>(active_image.height),
                     active_image.far_plane
                 );
             } else if (active_image.srv) {
-                blit.render_transformed(
+                ID3D11ShaderResourceView *display_srv = pipeline.process(
                     gfx.get_context(),
                     active_image.srv.Get(),
+                    active_image.width,
+                    active_image.height,
+                    custom_ui.get_effects()
+                );
+
+                gfx.set_render_target();
+                gfx.get_context()->RSSetViewports(1, &vp);
+
+                blit.render_transformed(
+                    gfx.get_context(),
+                    display_srv,
                     viewport.get_transform(),
-                    static_cast<float>(gfx.get_render_width()),
-                    static_cast<float>(gfx.get_render_height()),
+                    viewable_w,
+                    viewable_h,
                     static_cast<float>(active_image.width),
                     static_cast<float>(active_image.height)
                 );
             }
 
-            // welcome hud when no image loaded
-            welcome_hud.update(dt, active_image.srv != nullptr);
-            if (welcome_hud.is_visible()) {
-                welcome_hud.render(gfx.get_context(), gfx.get_render_width(), gfx.get_render_height());
-                if (welcome_hud.get_srv()) {
-                    blit.render_blend(gfx.get_context(), welcome_hud.get_srv());
+            if (!active_image.srv) {
+                welcome_hud.update(dt, false);
+                if (welcome_hud.is_visible()) {
+                    welcome_hud.render(gfx.get_context(), static_cast<uint32_t>(viewable_w), static_cast<uint32_t>(viewable_h));
+                    if (welcome_hud.get_srv()) {
+                        gfx.get_context()->RSSetViewports(1, &vp);
+                        blit.render_blend(gfx.get_context(), welcome_hud.get_srv());
+                    }
                 }
             }
 
-            // hud layers
-            render_hud_layers();
+            gfx.reset_viewport();
+
+            if (has_reshade) {
+                render_hud_layers();
+            }
+
+            custom_ui.begin_frame();
+            custom_ui.render(
+                gfx.get_render_width(),
+                gfx.get_render_height(),
+                active_image.width,
+                active_image.height,
+                viewport.get_transform().zoom,
+                viewport.get_transform().pan_x,
+                viewport.get_transform().pan_y
+            );
+            custom_ui.end_frame();
 
             // sync interval: only allow unsynced present during active export,
             // keep vsync on in live preview so gpu doesnt melt at 1000+ fps
@@ -1648,6 +1702,8 @@ static int run_app(int argc, wchar_t **argv) {
         }
     }
 
+    pipeline.shutdown();
+    custom_ui.shutdown();
     std::wcout << L"[Host] Shutting down host application.\n";
     control_block->host_flags = 0;
     UnmapViewOfFile(control_block);

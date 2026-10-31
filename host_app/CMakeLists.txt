@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(host_app LANGUAGES CXX)
 
+set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/reshade-src/deps/imgui")
+
 set(HOST_SOURCES
     src/main.cpp
     src/gfx_device.h
@@ -19,6 +21,16 @@ set(HOST_SOURCES
     src/viewport_controller.cpp
     src/warning_overlay.h
     src/warning_overlay.cpp
+    src/custom_ui.h
+    src/custom_ui.cpp
+    src/effect_pipeline.h
+    src/effect_pipeline.cpp
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_dx11.cpp
     src/cli/cli_parser.h
     src/cli/cli_parser.cpp
     src/cli/cli_info.h
@@ -57,6 +69,8 @@ target_include_directories(host_app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../common
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/stb
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/miniz
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
 )
 
 target_link_libraries(host_app PRIVATE
