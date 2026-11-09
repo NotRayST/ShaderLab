@@ -85,14 +85,38 @@ public:
     void toggle_before_after() { set_before_after_enabled(!m_before_after_enabled); }
     bool is_erase_active() const { return m_erase_active; }
     void set_erase_active(bool e) { m_erase_active = e; }
+    bool is_hand_tool_active() const { return m_hand_tool_active; }
+    void set_hand_tool_active(bool h) { m_hand_tool_active = h; }
+    void simulate_mouse(float x, float y, int action);
+
+    void set_viewable_bounds(float x, float y, float w, float h) {
+        m_viewable_x = x;
+        m_viewable_y = y;
+        m_viewable_w = w;
+        m_viewable_h = h;
+    }
+    void set_static_zoom(bool s) { m_static_zoom = s; }
+    bool is_static_zoom() const { return m_static_zoom; }
+    void toggle_static_zoom() { m_static_zoom = !m_static_zoom; }
+
+    void zoom_fit(uint32_t img_w, uint32_t img_h);
+    void zoom_100(uint32_t img_w, uint32_t img_h);
+    void zoom_200(uint32_t img_w, uint32_t img_h);
+    void zoom_by(float factor);
 
 private:
     void update_snap();
     void clamp_pan(uint32_t render_w, uint32_t render_h, uint32_t img_w, uint32_t img_h);
 
     ViewportTransform m_transform;
+    float m_viewable_x = 0.0f;
+    float m_viewable_y = 0.0f;
+    float m_viewable_w = 0.0f;
+    float m_viewable_h = 0.0f;
+    bool m_static_zoom = false;
     bool m_is_locked = false;
     bool m_erase_active = false;
+    bool m_hand_tool_active = true;
     bool m_lock_zoom = false;
     bool m_lock_rotate = false;
     bool m_lock_pan = false;

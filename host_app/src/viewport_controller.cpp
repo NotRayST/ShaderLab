@@ -217,11 +217,53 @@ void ViewportController::update_snap() {
     }
 }
 
+void ViewportController::zoom_fit(uint32_t /*img_w*/, uint32_t /*img_h*/) {
+    m_transform.zoom = 1.0f;
+    m_transform.pan_x = 0.0f;
+    m_transform.pan_y = 0.0f;
+}
+
+void ViewportController::zoom_100(uint32_t img_w, uint32_t img_h) {
+    if (img_w == 0 || img_h == 0) return;
+    float rad = m_transform.angle * (kPi / 180.0f);
+    float cos_a = std::cos(rad);
+    float sin_a = std::sin(rad);
+    float rot_w = std::abs(cos_a * img_w) + std::abs(sin_a * img_h);
+    float rot_h = std::abs(sin_a * img_w) + std::abs(cos_a * img_h);
+    float canvas_w = (m_viewable_w > 0.0f) ? m_viewable_w : 1280.0f;
+    float canvas_h = (m_viewable_h > 0.0f) ? m_viewable_h : 720.0f;
+    float fit_scale = (rot_w > 0.0f && rot_h > 0.0f) ? (std::min)(canvas_w / rot_w, canvas_h / rot_h) : 1.0f;
+    if (fit_scale <= 0.0f) fit_scale = 1.0f;
+    m_transform.zoom = std::clamp(1.0f / fit_scale, 0.25f, 32.0f);
+    m_transform.pan_x = 0.0f;
+    m_transform.pan_y = 0.0f;
+}
+
+void ViewportController::zoom_200(uint32_t img_w, uint32_t img_h) {
+    if (img_w == 0 || img_h == 0) return;
+    float rad = m_transform.angle * (kPi / 180.0f);
+    float cos_a = std::cos(rad);
+    float sin_a = std::sin(rad);
+    float rot_w = std::abs(cos_a * img_w) + std::abs(sin_a * img_h);
+    float rot_h = std::abs(sin_a * img_w) + std::abs(cos_a * img_h);
+    float canvas_w = (m_viewable_w > 0.0f) ? m_viewable_w : 1280.0f;
+    float canvas_h = (m_viewable_h > 0.0f) ? m_viewable_h : 720.0f;
+    float fit_scale = (rot_w > 0.0f && rot_h > 0.0f) ? (std::min)(canvas_w / rot_w, canvas_h / rot_h) : 1.0f;
+    if (fit_scale <= 0.0f) fit_scale = 1.0f;
+    m_transform.zoom = std::clamp(2.0f / fit_scale, 0.25f, 32.0f);
+    m_transform.pan_x = 0.0f;
+    m_transform.pan_y = 0.0f;
+}
+
+void ViewportController::zoom_by(float factor) {
+    m_transform.zoom = std::clamp(m_transform.zoom * factor, 0.25f, 32.0f);
+}
+
 void ViewportController::clamp_pan(uint32_t /*render_w*/, uint32_t /*render_h*/, uint32_t img_w, uint32_t img_h) {
     if (img_w == 0 || img_h == 0) return;
 
-    float max_pan_x = static_cast<float>(img_w) * 2.0f;
-    float max_pan_y = static_cast<float>(img_h) * 2.0f;
+    float max_pan_x = static_cast<float>(img_w) * 3.0f;
+    float max_pan_y = static_cast<float>(img_h) * 3.0f;
     m_transform.pan_x = std::clamp(m_transform.pan_x, -max_pan_x, max_pan_x);
     m_transform.pan_y = std::clamp(m_transform.pan_y, -max_pan_y, max_pan_y);
 }
@@ -250,8 +292,8 @@ bool ViewportController::handle_input(
     float scale_x = static_cast<float>(render_w) / client_w;
     float scale_y = static_cast<float>(render_h) / client_h;
 
-    float center_x = static_cast<float>(render_w) * 0.5f;
-    float center_y = static_cast<float>(render_h) * 0.5f;
+    float center_x = (m_viewable_w > 0.0f) ? (m_viewable_x + m_viewable_w * 0.5f) : (static_cast<float>(render_w) * 0.5f);
+    float center_y = (m_viewable_h > 0.0f) ? (m_viewable_y + m_viewable_h * 0.5f) : (static_cast<float>(render_h) * 0.5f);
 
     bool shift_down = (GetAsyncKeyState(m_fine_vk) & 0x8000) != 0;
     bool alt_down = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
@@ -293,33 +335,67 @@ bool ViewportController::handle_input(
             float new_zoom = std::clamp(old_zoom * zoom_mult, 0.25f, 32.0f);
 
             if (std::abs(new_zoom - old_zoom) > 0.0001f) {
-                // zoom about the cursor position
-                float p_cur_x = cur_render_x - center_x;
-                float p_cur_y = cur_render_y - center_y;
-
                 float rad = m_transform.angle * (kPi / 180.0f);
                 float cos_a = std::cos(rad);
                 float sin_a = std::sin(rad);
 
-                float rot_x = p_cur_x * cos_a + p_cur_y * sin_a;
-                float rot_y = -p_cur_x * sin_a + p_cur_y * cos_a;
+                float rot_w = std::abs(cos_a * img_w) + std::abs(sin_a * img_h);
+                float rot_h = std::abs(sin_a * img_w) + std::abs(cos_a * img_h);
+                float canvas_w = (m_viewable_w > 0.0f) ? m_viewable_w : static_cast<float>(render_w);
+                float canvas_h = (m_viewable_h > 0.0f) ? m_viewable_h : static_cast<float>(render_h);
+                float fit_scale = (rot_w > 0.0f && rot_h > 0.0f) ? (std::min)(canvas_w / rot_w, canvas_h / rot_h) : 1.0f;
+                if (fit_scale <= 0.0f) fit_scale = 1.0f;
 
-                float factor = (1.0f / old_zoom) - (1.0f / new_zoom);
-                m_transform.pan_x += rot_x * factor;
-                m_transform.pan_y += rot_y * factor;
+                if (m_static_zoom) {
+                    m_transform.zoom = new_zoom;
+                } else {
+                    float p_cur_x = cur_render_x - center_x;
+                    float p_cur_y = cur_render_y - center_y;
 
-                m_transform.zoom = new_zoom;
-                clamp_pan(render_w, render_h, img_w, img_h);
+                    float rot_x = p_cur_x * cos_a + p_cur_y * sin_a;
+                    float rot_y = -p_cur_x * sin_a + p_cur_y * cos_a;
+
+                    float factor = ((1.0f / old_zoom) - (1.0f / new_zoom)) / fit_scale;
+                    m_transform.pan_x += rot_x * factor;
+                    m_transform.pan_y += rot_y * factor;
+
+                    m_transform.zoom = new_zoom;
+                    clamp_pan(render_w, render_h, img_w, img_h);
+                }
             }
         }
         return true;
     }
 
     case WM_LBUTTONDOWN: {
-        if (m_erase_active) return false;
         int client_x = GET_X_LPARAM(lParam);
         int client_y = GET_Y_LPARAM(lParam);
         m_last_mouse_client = { client_x, client_y };
+
+        bool in_canvas = true;
+        if (m_viewable_w > 0.0f && m_viewable_h > 0.0f) {
+            float rx = static_cast<float>(client_x) * scale_x;
+            float ry = static_cast<float>(client_y) * scale_y;
+            in_canvas = (rx >= m_viewable_x && rx <= m_viewable_x + m_viewable_w &&
+                         ry >= m_viewable_y && ry <= m_viewable_y + m_viewable_h);
+        }
+        if (!in_canvas) return false;
+
+        bool space_down = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+        if (space_down || m_hand_tool_active) {
+            if (m_lock_pan) {
+                m_is_pan_locked_attempt = true;
+                SetCapture(hwnd);
+                return true;
+            }
+            m_is_pan_locked_attempt = false;
+            m_is_panning = true;
+            m_is_rotating = false;
+            SetCapture(hwnd);
+            return true;
+        }
+
+        if (m_erase_active) return false;
 
         if (m_before_after_enabled) {
             float cur_render_x = static_cast<float>(client_x) * scale_x;
@@ -457,8 +533,16 @@ bool ViewportController::handle_input(
                 rot_dy *= 0.25f;
             }
 
-            m_transform.pan_x -= rot_dx / m_transform.zoom;
-            m_transform.pan_y -= rot_dy / m_transform.zoom;
+            float rot_w = std::abs(cos_a * img_w) + std::abs(sin_a * img_h);
+            float rot_h = std::abs(sin_a * img_w) + std::abs(cos_a * img_h);
+            float canvas_w = (m_viewable_w > 0.0f) ? m_viewable_w : static_cast<float>(render_w);
+            float canvas_h = (m_viewable_h > 0.0f) ? m_viewable_h : static_cast<float>(render_h);
+            float fit_scale = (rot_w > 0.0f && rot_h > 0.0f) ? (std::min)(canvas_w / rot_w, canvas_h / rot_h) : 1.0f;
+            if (fit_scale <= 0.0f) fit_scale = 1.0f;
+            float eff_zoom = m_transform.zoom * fit_scale;
+
+            m_transform.pan_x -= rot_dx / eff_zoom;
+            m_transform.pan_y -= rot_dy / eff_zoom;
 
             clamp_pan(render_w, render_h, img_w, img_h);
             SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
@@ -628,6 +712,15 @@ bool ViewportController::handle_input(
     }
 
     case WM_SETCURSOR: {
+        bool space_down = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+        if (space_down || m_hand_tool_active) {
+            SetCursor(LoadCursor(nullptr, m_is_panning ? IDC_SIZEALL : IDC_HAND));
+            return true;
+        }
+        if (m_is_panning) {
+            SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+            return true;
+        }
         if (m_before_after_enabled && LOWORD(lParam) == HTCLIENT) {
             if (m_is_dragging_split_pos || m_is_dragging_split_rot || m_is_hovering_split) {
                 SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
@@ -643,6 +736,29 @@ bool ViewportController::handle_input(
         bool ctrl_down  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
         bool shift_down_local = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         bool alt_down_local   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+        if (ctrl_down && !shift_down_local && !alt_down_local) {
+            if (wParam == '0') {
+                zoom_fit(img_w, img_h);
+                return true;
+            } else if (wParam == '1') {
+                zoom_100(img_w, img_h);
+                return true;
+            } else if (wParam == '2') {
+                zoom_200(img_w, img_h);
+                return true;
+            } else if (wParam == VK_OEM_PLUS || wParam == VK_ADD) {
+                zoom_by(1.25f);
+                return true;
+            } else if (wParam == VK_OEM_MINUS || wParam == VK_SUBTRACT) {
+                zoom_by(0.80f);
+                return true;
+            }
+        }
+        if (wParam == VK_HOME) {
+            reset();
+            return true;
+        }
 
         if (matches_keybind(IpcAction::ToggleBeforeAfter, wParam, ctrl_down, shift_down_local, alt_down_local)) {
             if (!was_down) {
@@ -663,8 +779,16 @@ bool ViewportController::handle_input(
             float sin_a = std::sin(rad);
             float rot_dx = (-screen_step) * cos_a;
             float rot_dy = -(-screen_step) * sin_a;
-            m_transform.pan_x -= rot_dx / m_transform.zoom;
-            m_transform.pan_y -= rot_dy / m_transform.zoom;
+            float rot_w = std::abs(cos_a * img_w) + std::abs(sin_a * img_h);
+            float rot_h = std::abs(sin_a * img_w) + std::abs(cos_a * img_h);
+            float canvas_w = (m_viewable_w > 0.0f) ? m_viewable_w : static_cast<float>(render_w);
+            float canvas_h = (m_viewable_h > 0.0f) ? m_viewable_h : static_cast<float>(render_h);
+            float fit_scale = (rot_w > 0.0f && rot_h > 0.0f) ? (std::min)(canvas_w / rot_w, canvas_h / rot_h) : 1.0f;
+            if (fit_scale <= 0.0f) fit_scale = 1.0f;
+            float eff_zoom = m_transform.zoom * fit_scale;
+
+            m_transform.pan_x -= rot_dx / eff_zoom;
+            m_transform.pan_y -= rot_dy / eff_zoom;
             clamp_pan(render_w, render_h, img_w, img_h);
             return true;
         } else if (matches_keybind(IpcAction::NudgeRight, wParam, ctrl_down, shift_down_local, alt_down_local)) {
@@ -675,8 +799,16 @@ bool ViewportController::handle_input(
             float sin_a = std::sin(rad);
             float rot_dx = screen_step * cos_a;
             float rot_dy = -screen_step * sin_a;
-            m_transform.pan_x -= rot_dx / m_transform.zoom;
-            m_transform.pan_y -= rot_dy / m_transform.zoom;
+            float rot_w = std::abs(cos_a * img_w) + std::abs(sin_a * img_h);
+            float rot_h = std::abs(sin_a * img_w) + std::abs(cos_a * img_h);
+            float canvas_w = (m_viewable_w > 0.0f) ? m_viewable_w : static_cast<float>(render_w);
+            float canvas_h = (m_viewable_h > 0.0f) ? m_viewable_h : static_cast<float>(render_h);
+            float fit_scale = (rot_w > 0.0f && rot_h > 0.0f) ? (std::min)(canvas_w / rot_w, canvas_h / rot_h) : 1.0f;
+            if (fit_scale <= 0.0f) fit_scale = 1.0f;
+            float eff_zoom = m_transform.zoom * fit_scale;
+
+            m_transform.pan_x -= rot_dx / eff_zoom;
+            m_transform.pan_y -= rot_dy / eff_zoom;
             clamp_pan(render_w, render_h, img_w, img_h);
             return true;
         }
@@ -802,3 +934,28 @@ void ViewportController::sync_from_block(const SharedControlBlock *block) {
     }
 }
 
+
+void ViewportController::simulate_mouse(float x, float y, int action) {
+    if (action == 2) {
+        m_last_mouse_client = { static_cast<int>(x), static_cast<int>(y) };
+        if (m_hand_tool_active) {
+            m_is_panning = true;
+        }
+    } else if (action == 0) {
+        if (m_is_panning) {
+            float dx = (x - static_cast<float>(m_last_mouse_client.x));
+            float dy = (y - static_cast<float>(m_last_mouse_client.y));
+            m_last_mouse_client = { static_cast<int>(x), static_cast<int>(y) };
+            float rad = m_transform.angle * (kPi / 180.0f);
+            float cos_a = std::cos(rad);
+            float sin_a = std::sin(rad);
+            float rot_dx = dx * cos_a + dy * sin_a;
+            float rot_dy = -dx * sin_a + dy * cos_a;
+            float eff_zoom = m_transform.zoom;
+            m_transform.pan_x -= rot_dx / (eff_zoom > 0.0f ? eff_zoom : 1.0f);
+            m_transform.pan_y -= rot_dy / (eff_zoom > 0.0f ? eff_zoom : 1.0f);
+        }
+    } else if (action == 3) {
+        m_is_panning = false;
+    }
+}

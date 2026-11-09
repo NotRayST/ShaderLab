@@ -125,6 +125,7 @@ bool ImageLoader::load_from_file(ID3D11Device *device, const wchar_t *path, Load
     float far_plane = 1000.0f;
     bool is_flat = false;
     bool depth_loaded = false;
+    DepthMapHeader chunk_hdr = {};
 
     if (fs::exists(sidecar_path)) {
         SidecarDepthHeader header = {};
@@ -149,7 +150,6 @@ bool ImageLoader::load_from_file(ID3D11Device *device, const wchar_t *path, Load
 
     // no sidecar, check for embedded slDp chunk
     if (!depth_loaded && buffer.size() > 8) {
-        DepthMapHeader chunk_hdr = {};
         std::string chunk_err;
         if (depth_chunk::extract_sldp(buffer.data(), buffer.size(), chunk_hdr, linear_floats, chunk_err)) {
             depth_w = chunk_hdr.width;
@@ -205,7 +205,11 @@ bool ImageLoader::load_from_file(ID3D11Device *device, const wchar_t *path, Load
 
             dhr = device->CreateShaderResourceView(out_image.depth_texture.Get(), &dsrv_desc, &out_image.depth_srv);
             if (SUCCEEDED(dhr)) {
-                out_image.has_depth = true;
+                bool valid = !is_flat;
+                if (chunk_hdr.magic == kDepthMagicSLD1 && (chunk_hdr.flags & kDepthFlagValid) == 0) {
+                    valid = false;
+                }
+                out_image.has_depth = valid;
                 out_image.far_plane = far_plane;
                 out_image.is_flat = is_flat;
                 out_image.min_depth = min_d;

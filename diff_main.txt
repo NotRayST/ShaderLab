@@ -1,0 +1,476 @@
+diff --git a/host_app/src/main.cpp b/host_app/src/main.cpp
+index f20d9ff..f83e550 100644
+--- a/host_app/src/main.cpp
++++ b/host_app/src/main.cpp
+@@ -6,14 +6,19 @@
+ #include "settle_detector.h"
+ #include "hud_renderer.h"
+ #include "viewport_controller.h"
++#include "custom_ui.h"
++#include "effect_pipeline.h"
+ #include "../../common/ipc_protocol.h"
+ #include "../../common/depth_chunk.h"
+ #include "../../common/depth_file.h"
+ #include "../../common/project_file.h"
++#include "../../third_party/stb/stb_image_write.h"
+ #include <shellapi.h>
+ #include <iostream>
+ #include <vector>
+ #include <string>
++#include <thread>
++#include <atomic>
+ 
+ static std::string wide_to_utf8(const std::wstring &wstr) {
+     if (wstr.empty()) return {};
+@@ -23,8 +28,18 @@ static std::string wide_to_utf8(const std::wstring &wstr) {
+     WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, out.data(), size, nullptr, nullptr);
+     return out;
+ }
++
++static std::wstring utf8_to_wide(const std::string &str) {
++    if (str.empty()) return {};
++    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, nullptr, 0);
++    if (size <= 1) return {};
++    std::wstring out(size - 1, L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, out.data(), size);
++    return out;
++}
+ #include <algorithm>
+ #include <filesystem>
++#include <fstream>
+ #include <chrono>
+ 
+ namespace fs = std::filesystem;
+@@ -420,15 +435,43 @@ static int run_app(int argc, wchar_t **argv) {
+         return 1;
+     }
+ 
++    ComPtr<ID3D11RasterizerState> scissor_rs;
++    D3D11_RASTERIZER_DESC rs_desc = {};
++    rs_desc.FillMode = D3D11_FILL_SOLID;
++    rs_desc.CullMode = D3D11_CULL_NONE;
++    rs_desc.ScissorEnable = TRUE;
++    rs_desc.DepthClipEnable = TRUE;
++    gfx.get_device()->CreateRasterizerState(&rs_desc, &scissor_rs);
++
+     LoadedImage active_image;
+     LoadedImage original_image;
+     std::wstring display_image_name;
++    std::wstring current_image_path;
++
++    struct BackgroundAiState {
++        std::atomic<bool> is_running{ false };
++        std::atomic<bool> completed{ false };
++        std::atomic<bool> failed{ false };
++        std::string task_type;
++        std::string status_msg;
++        std::string error_msg;
++        std::wstring result_path;
++        std::thread worker;
++
++        ~BackgroundAiState() {
++            if (worker.joinable()) worker.join();
++        }
++    };
++    BackgroundAiState ai_state;
++
+     ViewportController viewport;
+     SettleDetector settle_detector;
+     CompassHud compass_hud;
+     ZoomHud zoom_hud;
+     ToastHud toast_hud;
+     WelcomeHud welcome_hud;
++    CustomUI custom_ui;
++    EffectPipeline pipeline;
+ 
+     HudFontManager::get().initialize();
+ 
+@@ -436,6 +479,9 @@ static int run_app(int argc, wchar_t **argv) {
+     zoom_hud.initialize(gfx.get_device());
+     toast_hud.initialize(gfx.get_device());
+     welcome_hud.initialize(gfx.get_device());
++    custom_ui.initialize(gfx.get_hwnd(), gfx.get_device(), gfx.get_context());
++    pipeline.initialize(gfx.get_device());
++    gfx.add_input_hook(CustomUI::input_hook, &custom_ui);
+ 
+     // if reshade is missing, show a big "go install it" overlay instead of just... nothing
+     bool has_reshade = fs::exists(L"dxgi.dll") || fs::exists(L"ReShade64.dll");
+@@ -447,7 +493,7 @@ static int run_app(int argc, wchar_t **argv) {
+     if (warning.initialize(gfx.get_device())) {
+         // check both naming conventions, reshade setup can go either way
+         if (!has_reshade) {
+-            warning.set_active(true);
++            warning.set_active(false);
+         }
+     }
+ 
+@@ -543,6 +589,7 @@ static int run_app(int argc, wchar_t **argv) {
+     }
+ 
+     if (!launch_path.empty()) {
++        current_image_path = launch_path;
+         active_image.srv = nullptr;
+         wcsncpy_s(control_block->dropped_file_path, kMaxPathW, launch_path.c_str(), _TRUNCATE);
+         control_block->dropped_file_counter = 1;
+@@ -557,6 +604,7 @@ static int run_app(int argc, wchar_t **argv) {
+         last_preview_counter = 0;
+     }
+     sync_depth_to_ipc();
++    custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+ 
+     bool running = true;
+     const float idle_color[4] = { 0.06f, 0.06f, 0.08f, 1.0f };
+@@ -814,17 +862,52 @@ static int run_app(int argc, wchar_t **argv) {
+         }
+ 
+         // process host-targeted mailbox commands from CLI / MCP / automation
++        static bool s_pending_ipc_snapshot = false;
++        static wchar_t s_pending_snapshot_path[kMaxPathW] = {};
++
+         if (control_block->mailbox.seq_request != control_block->mailbox.seq_handled) {
+             uint32_t cmd = control_block->mailbox.cmd_id;
+             if (cmd == static_cast<uint32_t>(IpcCmd::Snapshot)) {
+-                // capture live backbuffer to destination file
+-                bool ok = BackbufferDump::capture_to_file(gfx, control_block->mailbox.path, gfx.get_render_width(), gfx.get_render_height());
++                // defer capture to end of frame so complete UI is drawn and buffer is not cleared by flip discard
++                s_pending_ipc_snapshot = true;
++                wcsncpy_s(s_pending_snapshot_path, kMaxPathW, control_block->mailbox.path, _TRUNCATE);
++            } else if (cmd == static_cast<uint32_t>(IpcCmd::DumpDom)) {
++                std::string json = custom_ui.get_dom_json();
++                std::filesystem::path p(control_block->mailbox.path);
++                if (p.empty()) p = "ui_dom.json";
++                std::ofstream ofs(p);
++                if (ofs.is_open()) {
++                    ofs << json;
++                    ofs.close();
++                    control_block->mailbox.status = 1;
++                    swprintf_s(control_block->mailbox.response_text, L"DOM dumped to: %s", p.wstring().c_str());
++                } else {
++                    control_block->mailbox.status = -1;
++                    swprintf_s(control_block->mailbox.response_text, L"Failed to write DOM JSON");
++                }
++                MemoryBarrier();
++                control_block->mailbox.seq_handled = control_block->mailbox.seq_request;
++            } else if (cmd == static_cast<uint32_t>(IpcCmd::ClickElement)) {
++                std::string target_id = control_block->mailbox.target;
++                bool ok = custom_ui.click_dom_element(target_id);
+                 control_block->mailbox.status = ok ? 1 : -1;
+                 if (ok) {
+-                    swprintf_s(control_block->mailbox.response_text, L"Snapshot captured: %ux%u", gfx.get_render_width(), gfx.get_render_height());
++                    swprintf_s(control_block->mailbox.response_text, L"Clicked DOM element: %s", utf8_to_wide(target_id).c_str());
+                 } else {
+-                    swprintf_s(control_block->mailbox.response_text, L"Failed to capture snapshot");
++                    swprintf_s(control_block->mailbox.response_text, L"DOM element not found: %s", utf8_to_wide(target_id).c_str());
+                 }
++                MemoryBarrier();
++                control_block->mailbox.seq_handled = control_block->mailbox.seq_request;
++            } else if (cmd == static_cast<uint32_t>(IpcCmd::SimulateMouse)) {
++                float mx = control_block->mailbox.values[0];
++                float my = control_block->mailbox.values[1];
++                int act = static_cast<int>(control_block->mailbox.values[2]);
++                custom_ui.queue_mouse_event(mx, my, act);
++                viewport.simulate_mouse(mx, my, act);
++                custom_ui.simulate_canvas_mouse(mx, my, act);
++                control_block->mailbox.status = 1;
++                swprintf_s(control_block->mailbox.response_text, L"Mouse event: (%.0f, %.0f) act=%d", mx, my, act);
++                MemoryBarrier();
+                 control_block->mailbox.seq_handled = control_block->mailbox.seq_request;
+             } else if (cmd == static_cast<uint32_t>(IpcCmd::SetView)) {
+                 float z = control_block->mailbox.values[0];
+@@ -1005,6 +1088,7 @@ static int run_app(int argc, wchar_t **argv) {
+                             control_block->view_image_width = active_image.width;
+                             control_block->view_image_height = active_image.height;
+                             sync_depth_to_ipc();
++    custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+ 
+                             // restore camera transform and interaction locks
+                             control_block->view_zoom = manifest.view.zoom > 0.0f ? manifest.view.zoom : 1.0f;
+@@ -1075,6 +1159,7 @@ static int run_app(int argc, wchar_t **argv) {
+                         control_block->view_image_width = active_image.width;
+                         control_block->view_image_height = active_image.height;
+                         sync_depth_to_ipc();
++    custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+ 
+                         std::wstring depth_info = active_image.has_depth ? (L" [Depth Active, F=" + std::to_wstring(static_cast<int>(active_image.far_plane)) + L"]") : L" [2D]";
+                         set_host_status(control_block, L"Loaded: " + display_image_name +
+@@ -1086,6 +1171,7 @@ static int run_app(int argc, wchar_t **argv) {
+         }
+ 
+         sync_depth_to_ipc();
++    custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+ 
+         if (control_block && control_block->export_state != ExportState::Idle) {
+             ipc_clear_view_flag(&control_block->view_interaction_flags, VIEW_FLAG_DEPTH_PEEK);
+@@ -1137,6 +1223,7 @@ static int run_app(int argc, wchar_t **argv) {
+             }
+ 
+             sync_depth_to_ipc();
++    custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+ 
+             if ((control_block->export_flags & EXPORT_FLAG_AUTO_CONVERGE) != 0) {
+                 settle_cap = 1800u; // 30s safety timeout for Smart Settle (ignores user settle time)
+@@ -1438,6 +1525,7 @@ static int run_app(int argc, wchar_t **argv) {
+             settle_detector.release_resources();
+             control_block->export_state = ExportState::Idle;
+             sync_depth_to_ipc();
++    custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+             break;
+         }
+         case ExportState::Loading: {
+@@ -1601,40 +1689,226 @@ static int run_app(int argc, wchar_t **argv) {
+             gfx.set_render_target();
+             gfx.clear(idle_color);
+ 
+-            if (depth_peek && active_image.has_depth && active_image.depth_srv) {
++            float menu_h = custom_ui.get_menu_bar_height();
++            float tool_options_h = custom_ui.get_tool_options_height();
++            float toolbar_w = custom_ui.get_toolbar_width();
++            float status_bar_h = custom_ui.get_status_bar_height();
++            float left_w = custom_ui.get_left_panel_width(gfx.get_render_width());
++            float right_w = custom_ui.get_right_panel_width(gfx.get_render_width());
++
++            float viewable_x = toolbar_w + left_w;
++            float viewable_y = menu_h + tool_options_h;
++            float viewable_w = static_cast<float>(gfx.get_render_width()) - viewable_x - right_w;
++            float viewable_h = static_cast<float>(gfx.get_render_height()) - viewable_y - status_bar_h;
++            if (viewable_w < 64.0f) viewable_w = 64.0f;
++            if (viewable_h < 64.0f) viewable_h = 64.0f;
++
++            viewport.set_viewable_bounds(viewable_x, viewable_y, viewable_w, viewable_h);
++            viewport.set_static_zoom(custom_ui.is_static_zoom_active());
++            viewport.set_before_after_enabled(custom_ui.is_before_after_active());
++            viewport.set_erase_active(custom_ui.is_erase_active());
++            viewport.set_hand_tool_active(custom_ui.get_active_tool() == CustomUI::ActiveTool::Hand);
++
++            std::wstring open_path;
++            if (custom_ui.pop_open_image_request(open_path)) {
++                LoadedImage new_img;
++                if (ImageLoader::load_from_file(gfx.get_device(), open_path.c_str(), new_img)) {
++                    active_image = std::move(new_img);
++                    viewport.reset();
++                    custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
++                    update_window_title(L"ShaderLab - [" + fs::path(open_path).filename().wstring() + L"]");
++                }
++            }
++
++            std::wstring save_path;
++            if (custom_ui.pop_save_snapshot_request(save_path)) {
++                BackbufferDump::capture_to_file(gfx, save_path.c_str(), active_image.width, active_image.height);
++            }
++
++            std::wstring attach_path;
++            if (custom_ui.pop_attach_depth_request(attach_path)) {
++                LoadedImage depth_img;
++                if (ImageLoader::load_from_file(gfx.get_device(), attach_path.c_str(), depth_img)) {
++                    active_image.has_depth = true;
++                    active_image.depth_srv = depth_img.srv;
++                    active_image.depth_texture = depth_img.texture;
++                    active_image.depth_width = depth_img.width;
++                    active_image.depth_height = depth_img.height;
++                    custom_ui.set_depth_status(true, depth_img.width, depth_img.height, active_image.far_plane);
++                }
++            }
++
++            if (custom_ui.pop_reset_view_request()) {
++                viewport.reset();
++            }
++            if (custom_ui.pop_fit_view_request()) {
++                viewport.zoom_fit(active_image.width, active_image.height);
++            }
++            if (custom_ui.pop_100_view_request()) {
++                viewport.zoom_100(active_image.width, active_image.height);
++            }
++            if (custom_ui.pop_200_view_request()) {
++                viewport.zoom_200(active_image.width, active_image.height);
++            }
++
++            std::wstring add_shader_p;
++            if (custom_ui.pop_add_shader_request(add_shader_p)) {
++                // Future shader load hook
++            }
++
++            std::string depth_enc;
++            float depth_far = 1000.0f;
++            if (custom_ui.pop_generate_depth_request(depth_enc, depth_far)) {
++                wchar_t exe_buf[MAX_PATH] = {};
++                GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
++                fs::path base_p = fs::path(exe_buf).parent_path();
++                fs::path script_p = base_p / "tools" / "depth_anything_v2" / "run_depth_anything.py";
++                if (!fs::exists(script_p)) {
++                    script_p = base_p / "run_depth_anything.py";
++                }
++                if (!fs::exists(script_p)) {
++                    custom_ui.set_depth_status_text("AI model not found: tools/depth_anything_v2. Place models in tools/.", false);
++                } else {
++                    custom_ui.set_depth_status_text("Starting Depth Anything v2...", true);
++                }
++            }
++
++            std::vector<std::vector<ImVec2>> inpaint_strokes;
++            float inpaint_rad = 24.0f;
++            if (custom_ui.pop_inpaint_request(inpaint_strokes, inpaint_rad)) {
++                wchar_t exe_buf[MAX_PATH] = {};
++                GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
++                fs::path base_p = fs::path(exe_buf).parent_path();
++                fs::path lama_script = base_p / "tools" / "lama" / "run_lama.py";
++                if (!fs::exists(lama_script)) {
++                    custom_ui.set_inpaint_status_text("Inpaint model not found: tools/lama. Place LaMa weights in tools/.", false);
++                } else {
++                    custom_ui.set_inpaint_status_text("Running LaMa inpainting...", true);
++                }
++            }
++
++            bool effective_depth_peek = depth_peek || custom_ui.is_depth_peek_active();
++            active_image.far_plane = custom_ui.get_depth_far_plane();
++
++            D3D11_VIEWPORT vp = {};
++            vp.TopLeftX = viewable_x;
++            vp.TopLeftY = viewable_y;
++            vp.Width = viewable_w;
++            vp.Height = viewable_h;
++            vp.MinDepth = 0.0f;
++            vp.MaxDepth = 1.0f;
++
++            if (effective_depth_peek && active_image.has_depth && active_image.depth_srv) {
++                gfx.set_render_target();
++                gfx.get_context()->RSSetViewports(1, &vp);
+                 blit.render_depth_preview(
+                     gfx.get_context(),
+                     active_image.depth_srv.Get(),
+                     viewport.get_transform(),
+-                    static_cast<float>(gfx.get_render_width()),
+-                    static_cast<float>(gfx.get_render_height()),
++                    viewable_w,
++                    viewable_h,
+                     static_cast<float>(active_image.width),
+                     static_cast<float>(active_image.height),
+                     active_image.far_plane
+                 );
+             } else if (active_image.srv) {
+-                blit.render_transformed(
+-                    gfx.get_context(),
+-                    active_image.srv.Get(),
+-                    viewport.get_transform(),
+-                    static_cast<float>(gfx.get_render_width()),
+-                    static_cast<float>(gfx.get_render_height()),
+-                    static_cast<float>(active_image.width),
+-                    static_cast<float>(active_image.height)
+-                );
+-            }
++                ID3D11ShaderResourceView *display_srv = nullptr;
++                if (custom_ui.is_master_bypass_active()) {
++                    display_srv = active_image.srv.Get();
++                } else {
++                    display_srv = pipeline.process(
++                        gfx.get_context(),
++                        active_image.srv.Get(),
++                        active_image.width,
++                        active_image.height,
++                        custom_ui.get_effects()
++                    );
++                }
++
++                gfx.set_render_target();
++                gfx.get_context()->RSSetViewports(1, &vp);
++
++                if (custom_ui.is_before_after_active() && scissor_rs) {
++                    float split_norm = std::clamp(0.5f + custom_ui.get_before_after_split(), 0.05f, 0.95f);
++                    float split_px = viewable_w * split_norm;
++
++                    // 1. Left side (Before / Original)
++                    D3D11_RECT scissor_left = {};
++                    scissor_left.left = static_cast<LONG>(viewable_x);
++                    scissor_left.top = static_cast<LONG>(viewable_y);
++                    scissor_left.right = static_cast<LONG>(viewable_x + split_px);
++                    scissor_left.bottom = static_cast<LONG>(viewable_y + viewable_h);
++
++                    gfx.get_context()->RSSetState(scissor_rs.Get());
++                    gfx.get_context()->RSSetScissorRects(1, &scissor_left);
++                    blit.render_transformed(
++                        gfx.get_context(),
++                        active_image.srv.Get(),
++                        viewport.get_transform(),
++                        viewable_w,
++                        viewable_h,
++                        static_cast<float>(active_image.width),
++                        static_cast<float>(active_image.height)
++                    );
++
++                    // 2. Right side (After / Processed)
++                    D3D11_RECT scissor_right = {};
++                    scissor_right.left = static_cast<LONG>(viewable_x + split_px);
++                    scissor_right.top = static_cast<LONG>(viewable_y);
++                    scissor_right.right = static_cast<LONG>(viewable_x + viewable_w);
++                    scissor_right.bottom = static_cast<LONG>(viewable_y + viewable_h);
+ 
+-            // welcome hud when no image loaded
+-            welcome_hud.update(dt, active_image.srv != nullptr);
+-            if (welcome_hud.is_visible()) {
+-                welcome_hud.render(gfx.get_context(), gfx.get_render_width(), gfx.get_render_height());
+-                if (welcome_hud.get_srv()) {
+-                    blit.render_blend(gfx.get_context(), welcome_hud.get_srv());
++                    gfx.get_context()->RSSetScissorRects(1, &scissor_right);
++                    blit.render_transformed(
++                        gfx.get_context(),
++                        display_srv,
++                        viewport.get_transform(),
++                        viewable_w,
++                        viewable_h,
++                        static_cast<float>(active_image.width),
++                        static_cast<float>(active_image.height)
++                    );
++
++                    gfx.get_context()->RSSetState(nullptr);
++                } else {
++                    blit.render_transformed(
++                        gfx.get_context(),
++                        display_srv,
++                        viewport.get_transform(),
++                        viewable_w,
++                        viewable_h,
++                        static_cast<float>(active_image.width),
++                        static_cast<float>(active_image.height)
++                    );
+                 }
+             }
+ 
+-            // hud layers
+-            render_hud_layers();
++            gfx.reset_viewport();
++
++            custom_ui.begin_frame();
++            custom_ui.render(
++                gfx.get_render_width(),
++                gfx.get_render_height(),
++                active_image.width,
++                active_image.height,
++                viewport.get_transform().zoom,
++                viewport.get_transform().pan_x,
++                viewport.get_transform().pan_y
++            );
++            custom_ui.end_frame();
++
++            if (s_pending_ipc_snapshot) {
++                s_pending_ipc_snapshot = false;
++                bool ok = BackbufferDump::capture_to_file(gfx, s_pending_snapshot_path, gfx.get_render_width(), gfx.get_render_height());
++                control_block->mailbox.status = ok ? 1 : -1;
++                if (ok) {
++                    swprintf_s(control_block->mailbox.response_text, L"Snapshot captured: %ux%u", gfx.get_render_width(), gfx.get_render_height());
++                } else {
++                    swprintf_s(control_block->mailbox.response_text, L"Failed to capture snapshot");
++                }
++                MemoryBarrier();
++                control_block->mailbox.seq_handled = control_block->mailbox.seq_request;
++            }
+ 
+             // sync interval: only allow unsynced present during active export,
+             // keep vsync on in live preview so gpu doesnt melt at 1000+ fps
+@@ -1648,6 +1922,8 @@ static int run_app(int argc, wchar_t **argv) {
+         }
+     }
+ 
++    pipeline.shutdown();
++    custom_ui.shutdown();
+     std::wcout << L"[Host] Shutting down host application.\n";
+     control_block->host_flags = 0;
+     UnmapViewOfFile(control_block);

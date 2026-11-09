@@ -55,7 +55,7 @@ float4 blit_ps(VSOutput input) : SV_Target {
     float2 uv = tex_pixel / img_dims;
 
     if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
-        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return float4(0.08f, 0.08f, 0.09f, 1.0f);
     }
 
     if (g_XformC.z > 0.5f) {

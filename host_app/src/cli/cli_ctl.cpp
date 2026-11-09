@@ -10,6 +10,7 @@
 #include <chrono>
 #include <thread>
 #include <filesystem>
+#include <fstream>
 #include <algorithm>
 
 #include "../../common/str_utils.h"
@@ -255,6 +256,74 @@ int CliCtl::execute(const CliOptions &opts) {
                       << " (Frame " << b->export_frame_index << "/" << b->export_settle_frames << ")\n";
         }
         return 0;
+    }
+
+    if (action == "dom") {
+        std::wstring out_p = L"ui_dom.json";
+        if (opts.extra_args.size() > 1) {
+            out_p = opts.extra_args[1];
+        }
+        std::filesystem::path abs_p = std::filesystem::absolute(out_p);
+        bool ok = dispatch_mailbox_command(b, IpcCmd::DumpDom, nullptr, nullptr, abs_p.wstring().c_str(), 3000);
+        if (ok && std::filesystem::exists(abs_p)) {
+            std::ifstream ifs(abs_p);
+            std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+            std::cout << content << "\n";
+        }
+        return ok ? 0 : 1;
+    }
+
+    if (action == "click-id" || action == "click_id") {
+        if (opts.extra_args.size() < 2) {
+            std::cerr << "Error: Usage: ShaderLab.exe ctl click-id <element_id_or_label>\n";
+            return 1;
+        }
+        std::string elem = wide_to_utf8(opts.extra_args[1].c_str());
+        bool ok = dispatch_mailbox_command(b, IpcCmd::ClickElement, elem.c_str(), nullptr, nullptr, 2000);
+        return ok ? 0 : 1;
+    }
+
+    if (action == "mouse") {
+        if (opts.extra_args.size() < 4) {
+            std::cerr << "Error: Usage: ShaderLab.exe ctl mouse <x> <y> <act>\n";
+            return 1;
+        }
+        float x = std::stof(wide_to_utf8(opts.extra_args[1].c_str()));
+        float y = std::stof(wide_to_utf8(opts.extra_args[2].c_str()));
+        float act = std::stof(wide_to_utf8(opts.extra_args[3].c_str()));
+        float vals[4] = { x, y, act, 0.0f };
+        bool ok = dispatch_mailbox_command(b, IpcCmd::SimulateMouse, nullptr, vals, nullptr, 2000);
+        return ok ? 0 : 1;
+    }
+
+    if (action == "click") {
+        if (opts.extra_args.size() < 3) {
+            std::cerr << "Error: Usage: ShaderLab.exe ctl click <x> <y>\n";
+            return 1;
+        }
+        float x = std::stof(wide_to_utf8(opts.extra_args[1].c_str()));
+        float y = std::stof(wide_to_utf8(opts.extra_args[2].c_str()));
+        float vals[4] = { x, y, 1.0f, 0.0f };
+        bool ok = dispatch_mailbox_command(b, IpcCmd::SimulateMouse, nullptr, vals, nullptr, 2000);
+        return ok ? 0 : 1;
+    }
+
+    if (action == "drag") {
+        if (opts.extra_args.size() < 5) {
+            std::cerr << "Error: Usage: ShaderLab.exe ctl drag <x1> <y1> <x2> <y2>\n";
+            return 1;
+        }
+        float x1 = std::stof(wide_to_utf8(opts.extra_args[1].c_str()));
+        float y1 = std::stof(wide_to_utf8(opts.extra_args[2].c_str()));
+        float x2 = std::stof(wide_to_utf8(opts.extra_args[3].c_str()));
+        float y2 = std::stof(wide_to_utf8(opts.extra_args[4].c_str()));
+        float vals_down[4] = { x1, y1, 2.0f, 0.0f };
+        dispatch_mailbox_command(b, IpcCmd::SimulateMouse, nullptr, vals_down, nullptr, 2000);
+        float vals_move[4] = { x2, y2, 0.0f, 0.0f };
+        dispatch_mailbox_command(b, IpcCmd::SimulateMouse, nullptr, vals_move, nullptr, 2000);
+        float vals_up[4] = { x2, y2, 3.0f, 0.0f };
+        bool ok = dispatch_mailbox_command(b, IpcCmd::SimulateMouse, nullptr, vals_up, nullptr, 2000);
+        return ok ? 0 : 1;
     }
 
     if (action == "snapshot") {

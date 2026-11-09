@@ -284,6 +284,7 @@ bool GfxDevice::create_device_and_swap_chain(uint32_t width, uint32_t height) {
     desc.BufferCount = 2;
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.Scaling    = DXGI_SCALING_STRETCH; // bb decoupled from window size, this is the whole trick.
+    desc.AlphaMode  = DXGI_ALPHA_MODE_IGNORE;
 
     hr = dxgi_factory->CreateSwapChainForHwnd(
         m_device.Get(),
@@ -432,7 +433,7 @@ bool GfxDevice::resize_buffers(uint32_t width, uint32_t height) {
     m_before_canvas_rtv.Reset();
     m_before_canvas_tex.Reset();
 
-    HRESULT hr = m_swap_chain->ResizeBuffers(2, target_w, target_h, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+    HRESULT hr = m_swap_chain->ResizeBuffers(0, target_w, target_h, DXGI_FORMAT_UNKNOWN, 0);
     if (FAILED(hr)) {
         std::wcerr << L"[GfxDevice] ResizeBuffers failed with hr=0x" << std::hex << hr << L"\n";
         return false;

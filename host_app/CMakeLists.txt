@@ -81,6 +81,7 @@ target_link_libraries(host_app PRIVATE
     shell32
     gdiplus
     winmm
+    comdlg32
 )
 
 set_target_properties(host_app PROPERTIES

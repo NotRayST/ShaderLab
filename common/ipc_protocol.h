@@ -43,6 +43,9 @@ enum class IpcCmd : uint32_t {
     ReshadeSetPreset     = 11,  // Addon: path=preset file path
     TriggerExport        = 12,  // Host: path=output path, values[0]=settle_frames, values[1]=flags
     LoadImage            = 13,  // Host: path=input image path
+    SimulateMouse        = 14,  // Host: values[0]=x, values[1]=y, values[2]=action (0=move, 1=click, 2=down, 3=up)
+    DumpDom              = 15,  // Host: path=output JSON path
+    ClickElement         = 16,  // Host: target=element id or label substring
 };
 
 struct IpcCommandMailbox {

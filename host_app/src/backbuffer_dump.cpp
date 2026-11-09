@@ -70,11 +70,18 @@ bool BackbufferDump::capture_to_file(GfxDevice &gfx, const wchar_t *output_path,
 
     int ok = 0;
     const uint8_t *src_bytes = static_cast<const uint8_t *>(mapped.pData);
-    if (ext == ".jpg" || ext == ".jpeg") {
-        std::vector<uint8_t> packed(width * height * 4);
-        for (uint32_t y = 0; y < height; ++y) {
-            memcpy(packed.data() + (y * width * 4), src_bytes + (y * mapped.RowPitch), width * 4);
+    std::vector<uint8_t> packed(width * height * 4);
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t *row_src = src_bytes + (y * mapped.RowPitch);
+        uint8_t *row_dst = packed.data() + (y * width * 4);
+        for (uint32_t x = 0; x < width; ++x) {
+            row_dst[x * 4 + 0] = row_src[x * 4 + 0];
+            row_dst[x * 4 + 1] = row_src[x * 4 + 1];
+            row_dst[x * 4 + 2] = row_src[x * 4 + 2];
+            row_dst[x * 4 + 3] = 255;
         }
+    }
+    if (ext == ".jpg" || ext == ".jpeg") {
         ok = stbi_write_jpg(out_utf8.c_str(), static_cast<int>(width), static_cast<int>(height), 4, packed.data(), 95);
     } else {
         stbi_write_force_png_filter = 0;
@@ -83,8 +90,8 @@ bool BackbufferDump::capture_to_file(GfxDevice &gfx, const wchar_t *output_path,
             static_cast<int>(width),
             static_cast<int>(height),
             4,
-            mapped.pData,
-            static_cast<int>(mapped.RowPitch)
+            packed.data(),
+            static_cast<int>(width * 4)
         );
     }
 
