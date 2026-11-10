@@ -1,5 +1,10 @@
 # ShaderLab
 
+[![GitHub Stars](https://img.shields.io/github/stars/NotRayST/ShaderLab?style=for-the-badge&logo=github&color=blue)](https://github.com/NotRayST/ShaderLab/stargazers)
+[![GitHub Downloads (all releases)](https://img.shields.io/github/downloads/NotRayST/ShaderLab/total?style=for-the-badge&logo=github&color=green)](https://github.com/NotRayST/ShaderLab/releases)
+[![GitHub Downloads (latest release)](https://img.shields.io/github/downloads/NotRayST/ShaderLab/latest/total?style=for-the-badge&color=orange)](https://github.com/NotRayST/ShaderLab/releases/latest)
+[![GitHub Release](https://img.shields.io/github/v/release/NotRayST/ShaderLab?style=for-the-badge&color=purple)](https://github.com/NotRayST/ShaderLab/releases/latest)
+
 An image editor using ReShade shaders.
 
 If you just want to use the tool, grab the pre-built zip from the [Releases](https://github.com/NotRayST/ShaderLab/releases) tab.
