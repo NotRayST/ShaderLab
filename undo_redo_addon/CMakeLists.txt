@@ -37,6 +37,8 @@ set(ADDON_SOURCES
     src/AuditionStateMachine.hpp
     src/TransactionCoalescer.hpp
     src/AddonRegistry.hpp
+    src/TabDockingTracker.hpp
+    src/WindowTransformTracker.hpp
     src/main.cpp
     resource.rc
 )
@@ -65,8 +67,8 @@ set_target_properties(UndoRedo PROPERTIES
     OUTPUT_NAME "UndoRedo"
     SUFFIX ".addon"
     PREFIX ""
-    VERSION "1.1.0"
-    SOVERSION "1.1.0"
+    VERSION "1.2.0"
+    SOVERSION "1.2.0"
 )
 
 

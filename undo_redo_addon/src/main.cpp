@@ -1,22 +1,64 @@
 #define ImTextureID ImU64
 #ifndef UNDOREDO_WINDOW_LAYOUT
-#define UNDOREDO_WINDOW_LAYOUT 0
+#define UNDOREDO_WINDOW_LAYOUT 1
 #endif
 #include <imgui.h>
 #define GImGui (ImGui::GetCurrentContext())
 #include <imgui_internal.h>
 #include <reshade.hpp>
 
+#include <cstdio>
+#include <cstring>
+#include <windows.h>
+
+namespace {
+inline bool probe_imgui_context(const ImGuiContext *ctx) {
+    __try {
+        if (!ctx->Initialized || ctx->Time < 0.0 || ctx->Windows.Size < 0 || ctx->Windows.Size > 4096) {
+            return false;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+}
+
 namespace ImGui {
 inline ImGuiContext* GetCurrentContext() {
     const auto *table = imgui_function_table_instance();
-    if (!table || !table->GetIO) return nullptr;
+    if (!table || !table->GetIO || !table->GetVersion) return nullptr;
+
+    const char *v = table->GetVersion();
+    static bool s_logged_version_mismatch = false;
+    if (!v || std::strcmp(v, IMGUI_VERSION) != 0) {
+        if (!s_logged_version_mismatch) {
+            s_logged_version_mismatch = true;
+            char msg[256];
+            std::snprintf(msg, sizeof(msg),
+                "[UndoRedo] ImGui version mismatch: ReShade provides %s, addon compiled with %s. Layout tracking disabled.",
+                v ? v : "unknown", IMGUI_VERSION);
+            reshade::log::message(reshade::log::level::warning, msg);
+        }
+        return nullptr;
+    }
+
     uintptr_t io_addr = reinterpret_cast<uintptr_t>(&table->GetIO());
     if (io_addr < 0x10000 || io_addr > 0x7FFFFFFFFFFF) return nullptr;
     uintptr_t ctx_addr = io_addr - offsetof(ImGuiContext, IO);
-    if (ctx_addr < 0x10000 || ctx_addr > 0x7FFFFFFFFFFF) return nullptr;
+    if ((ctx_addr & 7) != 0 || ctx_addr < 0x10000 || ctx_addr > 0x7FFFFFFFFFFF) return nullptr;
+
     ImGuiContext *ctx = reinterpret_cast<ImGuiContext *>(ctx_addr);
-    return ctx->Initialized ? ctx : nullptr;
+    static bool s_logged_layout_fail = false;
+    if (!probe_imgui_context(ctx)) {
+        if (!s_logged_layout_fail) {
+            s_logged_layout_fail = true;
+            reshade::log::message(reshade::log::level::warning,
+                "[UndoRedo] ImGui context layout validation failed. Layout tracking disabled.");
+        }
+        return nullptr;
+    }
+    return ctx;
 }
 }
 
@@ -42,6 +84,8 @@ inline ImGuiContext* GetCurrentContext() {
 #include "AuditionStateMachine.hpp"
 #include "TransactionCoalescer.hpp"
 #include "AddonRegistry.hpp"
+#include "TabDockingTracker.hpp"
+#include "WindowTransformTracker.hpp"
 
 extern "C" __declspec(dllexport) const char *NAME = "Undo/Redo by NotRayST";
 extern "C" __declspec(dllexport) const char *DESCRIPTION = "Undo and redo support for ReShade effects and presets";
@@ -52,11 +96,9 @@ namespace {
 
 std::string g_preset_path;
 bool g_allow_all_hidden = false;
-bool g_log_addon_uniforms = false;
 bool g_global_mode = true;
 bool g_standalone_tab = true;
 char g_filter[128] = "";
-int g_suppress_tracking_frames = 0;
 
 bool matches_filter(const std::string &text, const char *f) {
     if (!f || !f[0]) return true;
@@ -318,13 +360,6 @@ bool on_set_uniform_value(reshade::api::effect_runtime *rt,
     if (before == after) return false;
 
     bool mouse = is_user_interacting();
-    if (g_log_addon_uniforms) {
-        char msg[512] = {};
-        snprintf(msg, sizeof(msg),
-            "[UndoRedo] Intercepted: Effect='%s', Var='%s', Elements=%u, Bytes=%zu, Mouse=%d",
-            eff, vn, elem, new_value_size, mouse ? 1 : 0);
-        reshade::log::message(reshade::log::level::info, msg);
-    }
 
     if (mouse) {
         TransactionCoalescer::instance().stage_uniform(eff, vn, std::move(before), std::move(after));
@@ -356,134 +391,14 @@ void on_preset_changed(reshade::api::effect_runtime *, const char *path) {
     ContextManager::instance().clear_all();
 }
 
-void dbg(const char *fmt, ...) {
-    if (!g_log_addon_uniforms) return;
-    char buf[256];
-    va_list a; va_start(a, fmt); vsnprintf(buf, sizeof(buf), fmt, a); va_end(a);
-    reshade::log::message(reshade::log::level::info, buf);
-}
-
-void track_overlay_windows() {
-    ImGuiContext *ctx = ImGui::GetCurrentContext();
-    if (!ctx) return;
-
-    struct WinTrack {
-        ImVec2 cpos, csize; uint32_t cdock = 0;
-        ImVec2 dpos, dsize; uint32_t ddock = 0;
-        bool dragging = false, has_base = false;
-    };
-    static std::unordered_map<ImGuiID, WinTrack> s_tracked;
-
-    static int s_suppress_frames = 0;
-    if (g_suppress_tracking_frames > 0) {
-        s_suppress_frames = g_suppress_tracking_frames;
-        g_suppress_tracking_frames = 0;
-    }
-    bool suppressing = ContextManager::instance().is_suppressing() || WindowTransformCommand::s_defer_transforms;
-    if (s_suppress_frames > 0) {
-        --s_suppress_frames;
-        suppressing = true;
-    }
-
-    bool mouse_down = ctx->IO.MouseDown[0] || ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
-
-    static ImVec2 s_last_disp = {};
-    bool res_changed = s_last_disp.x > 0 && s_last_disp.y > 0 &&
-        (fabs(ctx->IO.DisplaySize.x - s_last_disp.x) >= 1.0f || fabs(ctx->IO.DisplaySize.y - s_last_disp.y) >= 1.0f);
-    s_last_disp = ctx->IO.DisplaySize;
-
-    ImGuiDockNode *reshade_node = nullptr;
-    for (ImGuiWindow *w : ctx->Windows)
-        if (w && w->DockNode && is_reshade_main_dock_node(w->DockNode)) { reshade_node = w->DockNode; break; }
-
-    struct Target {
-        const char *name;
-        ImGuiID id;
-        ImVec2 pos, size;
-        uint32_t dock;
-        bool track_ps;
-    };
-    std::vector<Target> targets;
-
-    if (reshade_node)
-        targets.push_back({"ReShade", reshade_node->ID, reshade_node->Pos, reshade_node->Size, reshade_node->ID, true});
-
-    for (ImGuiWindow *w : ctx->Windows) {
-        if (!w || !w->Name || !w->Name[0] || w->IsExplicitChild) continue;
-        if (w->Flags & (ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_Popup)) continue;
-        if (strncmp(w->Name, "##", 2) == 0 && !strstr(w->Name, "###")) continue;
-        if (strcmp(w->Name, "Viewport") == 0 || strcmp(w->Name, "##Viewport") == 0) continue;
-        if (!w->WasActive && !w->Active) continue;
-
-        bool is_child_docked = (w->DockNode != nullptr) &&
-                               !(w->DockNode->IsFloatingNode() && w->DockNode->Windows.Size <= 1);
-        uint32_t dock_id = is_child_docked ? w->DockNode->ID : 0;
-        targets.push_back({w->Name, w->ID, w->Pos, w->Size, dock_id, !is_child_docked});
-    }
-
-    auto ps_changed = [](const Target &t, const ImVec2 &pos, const ImVec2 &size, bool &pc, bool &sc) {
-        pc = t.track_ps && (fabs(t.pos.x - pos.x) >= 1.0f || fabs(t.pos.y - pos.y) >= 1.0f);
-        sc = t.track_ps && (fabs(t.size.x - size.x) >= 1.0f || fabs(t.size.y - size.y) >= 1.0f);
-        return pc || sc;
-    };
-
-    for (const auto &t : targets) {
-        auto &st = s_tracked[t.id];
-        bool pc = false, sc = false;
-        bool changed = st.has_base && ps_changed(t, st.cpos, st.csize, pc, sc);
-
-        if (!st.has_base || suppressing || res_changed) {
-            if (changed && mouse_down)
-                dbg("[UndoRedo] DROP '%s': suppress_ctx=%d defer=%d res=%d",
-                    t.name, ContextManager::instance().is_suppressing(),
-                    WindowTransformCommand::s_defer_transforms, res_changed);
-            st.cpos = t.pos; st.csize = t.size; st.cdock = t.dock;
-            st.dpos = t.pos; st.dsize = t.size; st.ddock = t.dock;
-            st.dragging = false; st.has_base = true;
-            continue;
-        }
-
-        if (mouse_down && changed && !st.dragging) {
-            dbg("[UndoRedo] START '%s'", t.name);
-            st.dragging = true;
-            st.dpos = st.cpos; st.dsize = st.csize; st.ddock = st.cdock;
-        }
-    }
-
-    if (!mouse_down) {
-        for (const auto &t : targets) {
-            auto &st = s_tracked[t.id];
-            bool pc = false, sc = false;
-
-            if (!st.dragging) {
-                if (ps_changed(t, st.cpos, st.csize, pc, sc)) {
-                    dbg("[UndoRedo] MISS '%s': changed with mouse up, never seen mid-drag", t.name);
-                    st.cpos = t.pos; st.csize = t.size; st.cdock = t.dock;
-                }
-                continue;
-            }
-
-            st.dragging = false;
-            if (ps_changed(t, st.dpos, st.dsize, pc, sc)) {
-                dbg("[UndoRedo] COMMIT '%s'", t.name);
-                float bp[2] = {st.dpos.x, st.dpos.y}, bs[2] = {st.dsize.x, st.dsize.y};
-                float ap[2] = {t.pos.x, t.pos.y}, as[2] = {t.size.x, t.size.y};
-                ContextManager::instance().push_command(std::make_unique<WindowTransformCommand>(
-                    t.name, bp, bs, ap, as, -1, -1, st.ddock, t.dock));
-            }
-            st.cpos = t.pos; st.csize = t.size; st.cdock = t.dock;
-        }
-    }
-}
 
 void on_overlay_frame(reshade::api::effect_runtime *rt) {
-    if (!ImGui::GetCurrentContext()) return;
+    ImGuiContext *ctx = ImGui::GetCurrentContext();
 #if UNDOREDO_WINDOW_LAYOUT
-    if (WindowTransformCommand::s_defer_transforms && !ImGui::IsAnyItemActive()) {
-        WindowTransformCommand::set_defer_transforms(false);
-        g_suppress_tracking_frames = 2;
+    if (ctx) {
+        TabDockingTracker::update(ctx);
+        WindowTransformTracker::update(ctx);
     }
-    track_overlay_windows();
 #endif
     TransactionCoalescer::instance().update_frame();
     AuditionStateMachine::instance().update_frame();
@@ -502,9 +417,14 @@ void on_runtime_init(reshade::api::effect_runtime *rt) {
     g_runtime = rt;
     init_keybinds(rt);
     reshade::get_config_value(rt, "UndoRedo", "CaptureAllHiddenUniforms", g_allow_all_hidden);
-    reshade::get_config_value(rt, "UndoRedo", "LogAddonUniforms", g_log_addon_uniforms);
     reshade::get_config_value(rt, "UndoRedo", "GlobalUndoMode", g_global_mode);
     reshade::get_config_value(rt, "UndoRedo", "StandaloneTab", g_standalone_tab);
+#if UNDOREDO_WINDOW_LAYOUT
+    reshade::get_config_value(rt, "UndoRedo", "CaptureWindowDocking", g_capture_window_docking);
+    reshade::get_config_value(rt, "UndoRedo", "CaptureTabDocking", g_capture_tab_docking);
+    reshade::get_config_value(rt, "UndoRedo", "CaptureWindowResize", g_capture_window_resize);
+    reshade::get_config_value(rt, "UndoRedo", "CaptureWindowPosition", g_capture_window_position);
+#endif
     reshade::set_config_value(rt, "INPUT", "InputProcessing", 1);
 
     char pp[MAX_PATH] = {}; size_t ps = sizeof(pp);
@@ -750,8 +670,11 @@ void on_draw_overlay(reshade::api::effect_runtime *rt) {
             bool scrub_deactivated = ImGui::IsItemDeactivated();
 
             if (scrub_active) {
-                WindowTransformCommand::set_defer_transforms(true);
-                g_suppress_tracking_frames = 2;
+#if UNDOREDO_WINDOW_LAYOUT
+                WindowTransformTracker::set_defer(true);
+                TabDockingTracker::set_defer(true);
+#endif
+                g_suppress_tracking_frames = 4;
             }
 
             if (scrub_changed) {
@@ -760,9 +683,17 @@ void on_draw_overlay(reshade::api::effect_runtime *rt) {
                 g_global_mode ? cm.jump_global(tp, rt) : cm.jump_domain(cm.active_domain(), tp, rt);
             }
 
-            if (scrub_deactivated || (!scrub_active && WindowTransformCommand::has_deferred_transforms())) {
-                WindowTransformCommand::set_defer_transforms(false);
-                g_suppress_tracking_frames = 2;
+            if (scrub_deactivated || (!scrub_active && (
+#if UNDOREDO_WINDOW_LAYOUT
+                WindowTransformTracker::has_deferred() ||
+                TabDockingTracker::has_deferred() ||
+#endif
+                false))) {
+#if UNDOREDO_WINDOW_LAYOUT
+                WindowTransformTracker::set_defer(false);
+                TabDockingTracker::set_defer(false);
+#endif
+                g_suppress_tracking_frames = 6;
             }
             ImGui::Spacing();
         }
@@ -812,19 +743,33 @@ void on_draw_overlay(reshade::api::effect_runtime *rt) {
                 if (rt) reshade::set_config_value(rt, "UndoRedo", "CaptureAllHiddenUniforms", g_allow_all_hidden);
             tip("By default, hidden and nosave uniforms are excluded.\nEnabling this captures hidden uniform changes across all shaders.");
 
-            if (ImGui::Checkbox("Log captured uniforms to ReShade.log", &g_log_addon_uniforms))
-                if (rt) reshade::set_config_value(rt, "UndoRedo", "LogAddonUniforms", g_log_addon_uniforms);
-            tip("Logs every uniform change captured by Undo/Redo into ReShade.log for diagnostic analysis.");
-
             if (ImGui::Checkbox("Hotkeys use combined history", &g_global_mode))
                 if (rt) reshade::set_config_value(rt, "UndoRedo", "GlobalUndoMode", g_global_mode);
             tip("When enabled, pressing Undo/Redo acts on the latest global action across all tabs.\nWhen disabled, acts only on the currently active tab.");
+
+#if UNDOREDO_WINDOW_LAYOUT
+            if (ImGui::Checkbox("Capture window docking (Experimental)", &g_capture_window_docking))
+                if (rt) reshade::set_config_value(rt, "UndoRedo", "CaptureWindowDocking", g_capture_window_docking);
+            tip("Track and record window docking, undocking, and split rearrangements.\n(Experimental: disabled by default to maintain layout stability).");
+
+            if (ImGui::Checkbox("Capture tab docking", &g_capture_tab_docking))
+                if (rt) reshade::set_config_value(rt, "UndoRedo", "CaptureTabDocking", g_capture_tab_docking);
+            tip("Track and record tab docking into and out of overlay tab bars.");
+
+            if (ImGui::Checkbox("Capture window resizing", &g_capture_window_resize))
+                if (rt) reshade::set_config_value(rt, "UndoRedo", "CaptureWindowResize", g_capture_window_resize);
+            tip("Track and record window resizing and dock splitter adjustments.");
+
+            if (ImGui::Checkbox("Capture window position", &g_capture_window_position))
+                if (rt) reshade::set_config_value(rt, "UndoRedo", "CaptureWindowPosition", g_capture_window_position);
+            tip("Track and record moving and repositioning floating windows.");
+#endif
         }
 
         if (ImGui::CollapsingHeader("Keybindings")) draw_keybindings();
 
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
-        ImGui::TextDisabled("Undo / Redo v1.1.0 by NotRayST");
+        ImGui::TextDisabled("Undo / Redo v1.2.0 by NotRayST");
 
         if (ImGui::Button("GitHub"))
             ShellExecuteW(nullptr, L"open", L"https://github.com/NotRayST/ShaderLab", nullptr, nullptr, SW_SHOW);
@@ -874,7 +819,8 @@ __declspec(dllexport) bool ReShadeUndoRedo_PushWindowTransform(
 #else
     if (!name || !bp || !bs || !ap || !as) return false;
     return ContextManager::instance().push_command(
-        std::make_unique<WindowTransformCommand>(name, bp, bs, ap, as));
+        std::make_unique<WindowPosSizeCommand>(name, ImVec2(bp[0], bp[1]), ImVec2(bs[0], bs[1]),
+                                               ImVec2(ap[0], ap[1]), ImVec2(as[0], as[1])));
 #endif
 }
 
