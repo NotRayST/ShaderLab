@@ -5,9 +5,11 @@
 #include <vector>
 #include <string>
 #include <memory>
-#include "custom_ui.h"
+#include "GUI/types.h"
 
 using Microsoft::WRL::ComPtr;
+using gui::ShaderLabEffect;
+using gui::ShaderLabUniform;
 
 class EffectPipeline {
 public:

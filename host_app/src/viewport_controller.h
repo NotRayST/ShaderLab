@@ -31,6 +31,9 @@ public:
     bool handle_input(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, uint32_t render_w, uint32_t render_h, uint32_t img_w, uint32_t img_h);
 
     const ViewportTransform &get_transform() const { return m_transform; }
+    void set_transform(const ViewportTransform &t) { m_transform = t; }
+    void set_zoom(float z) { m_transform.zoom = z; }
+    void set_pan(float px, float py) { m_transform.pan_x = px; m_transform.pan_y = py; }
     float get_snapped_angle() const;
     float get_raw_angle() const { return m_raw_angle; }
     bool is_snapped() const { return m_is_snapped; }

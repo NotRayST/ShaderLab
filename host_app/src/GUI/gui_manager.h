@@ -1,159 +1,17 @@
 #pragma once
-#include <windows.h>
-#include <d3d11.h>
-#include <imgui.h>
-#include <string>
+#include "types.h"
 #include <vector>
-#include <memory>
-#include <cstdint>
+#include <string>
 
-struct ShaderLabUniform {
-    enum class Type { Float, Int, Bool, Color3, Color4, Enum };
-    std::string name;
-    std::string label;
-    std::string tooltip;
-    std::string category;
-    Type type = Type::Float;
-    float min_val = 0.0f;
-    float max_val = 1.0f;
-    float step = 0.01f;
-    float float_val = 0.5f;
-    float default_float = 0.5f;
-    int int_val = 0;
-    int default_int = 0;
-    bool bool_val = false;
-    bool default_bool = false;
-    float color_val[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    float default_color[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    std::vector<std::string> enum_items;
-    int enum_selected = 0;
-    int default_enum = 0;
+namespace gui {
 
-    void reset_to_default() {
-        float_val = default_float;
-        int_val = default_int;
-        bool_val = default_bool;
-        for (int i = 0; i < 4; ++i) color_val[i] = default_color[i];
-        enum_selected = default_enum;
-    }
-};
-
-struct ShaderLabEffect {
-    std::string name;
-    std::string file_path;
-    std::string engine_type;
-    bool enabled = true;
-    std::vector<ShaderLabUniform> uniforms;
-
-    void reset_uniforms() {
-        for (auto &u : uniforms) {
-            u.reset_to_default();
-        }
-    }
-};
-
-struct UiDomNode {
-    std::string id;
-    std::string label;
-    std::string type;
-    float x = 0;
-    float y = 0;
-    float w = 0;
-    float h = 0;
-    bool active = false;
-    bool enabled = false;
-};
-
-class UiDomRegistry {
+class GuiManager {
 public:
-    void clear() { m_nodes.clear(); }
-    void register_item(const std::string &id, const std::string &label, const std::string &type,
-                       const ImVec2 &p_min, const ImVec2 &p_max, bool active = false, bool enabled = true) {
-        UiDomNode node;
-        node.id = id;
-        node.label = label;
-        node.type = type;
-        node.x = p_min.x;
-        node.y = p_min.y;
-        node.w = p_max.x - p_min.x;
-        node.h = p_max.y - p_min.y;
-        node.active = active;
-        node.enabled = enabled;
-        m_nodes.push_back(node);
-    }
+    using ActiveTool = gui::ActiveTool;
+    using DocumentTab = gui::DocumentTab;
 
-    const std::vector<UiDomNode> &get_nodes() const { return m_nodes; }
-
-    const UiDomNode *find(const std::string &query) const {
-        for (const auto &n : m_nodes) {
-            if (n.id == query) return &n;
-        }
-        for (const auto &n : m_nodes) {
-            if (_stricmp(n.id.c_str(), query.c_str()) == 0) return &n;
-        }
-        // Aliases for tools and tabs
-        if (query == "tool_hand" || query == "tool_h") return find("tool_H");
-        if (query == "tool_erase" || query == "tool_e") return find("tool_E");
-        if (query == "tool_depth" || query == "tool_d") return find("tool_D");
-        if (query == "tool_split" || query == "tool_b") return find("tool_B");
-        if (query == "tool_bypass" || query == "tool_\\") return find("tool_\\");
-        if (query == "accordion_depth") {
-            const UiDomNode *n = find("tab_depth");
-            if (n) return n;
-        }
-        if (query == "accordion_erase") {
-            const UiDomNode *n = find("tab_erase");
-            if (n) return n;
-        }
-        if (query == "opt_fit") { const UiDomNode *n = find("status_btn_fit"); if (n) return n; }
-        if (query == "opt_100") { const UiDomNode *n = find("status_btn_100"); if (n) return n; }
-        if (query == "opt_200") { const UiDomNode *n = find("status_btn_200"); if (n) return n; }
-        for (const auto &n : m_nodes) {
-            if (_stricmp(n.label.c_str(), query.c_str()) == 0) return &n;
-        }
-        for (const auto &n : m_nodes) {
-            if (n.label.find(query) != std::string::npos) return &n;
-        }
-        return nullptr;
-    }
-
-    std::string to_json() const {
-        std::string out = "{\n  \"elements\": [\n";
-        for (size_t i = 0; i < m_nodes.size(); ++i) {
-            const auto &n = m_nodes[i];
-            out += "    {\"id\": \"" + json_escape(n.id) + "\", ";
-            out += "\"label\": \"" + json_escape(n.label) + "\", ";
-            out += "\"type\": \"" + json_escape(n.type) + "\", ";
-            out += "\"rect\": [" + std::to_string((int)n.x) + ", " + std::to_string((int)n.y) + ", " +
-                   std::to_string((int)n.w) + ", " + std::to_string((int)n.h) + "], ";
-            out += "\"active\": " + std::string(n.active ? "true" : "false") + ", ";
-            out += "\"enabled\": " + std::string(n.enabled ? "true" : "false") + "}";
-            if (i + 1 < m_nodes.size()) out += ",";
-            out += "\n";
-        }
-        out += "  ]\n}\n";
-        return out;
-    }
-
-private:
-    static std::string json_escape(const std::string &s) {
-        std::string r;
-        for (char c : s) {
-            if (c == '"') r += "\"";
-            else if (c == '\\') r += "\\\\";
-            else if (c == '\n') r += "\\n";
-            else r += c;
-        }
-        return r;
-    }
-
-    std::vector<UiDomNode> m_nodes;
-};
-
-class CustomUI {
-public:
-    CustomUI();
-    ~CustomUI();
+    GuiManager();
+    ~GuiManager();
 
     bool initialize(HWND hwnd, ID3D11Device *device, ID3D11DeviceContext *context);
     void shutdown();
@@ -174,7 +32,8 @@ public:
     float get_right_panel_width(uint32_t screen_w) const;
     float get_menu_bar_height() const;
     float get_toolbar_width() const { return 36.0f; }
-    float get_tool_options_height() const { return 30.0f; }
+    float get_tab_bar_height() const { return 30.0f; }
+    float get_tool_options_height() const { return get_tab_bar_height(); }
     float get_status_bar_height() const { return 24.0f; }
 
     bool is_depth_peek_active() const { return m_active_tool == ActiveTool::Depth && m_depth_peek; }
@@ -208,12 +67,6 @@ public:
     bool is_master_bypass_active() const { return m_master_bypass; }
     void set_master_bypass(bool b) { m_master_bypass = b; }
 
-    enum class ActiveTool {
-        Hand,
-        Erase,
-        Depth,
-        Split
-    };
     ActiveTool get_active_tool() const { return m_active_tool; }
     void set_active_tool(ActiveTool tool) {
         m_active_tool = tool;
@@ -222,18 +75,15 @@ public:
         m_depth_peek   = (tool == ActiveTool::Depth);
         if (tool == ActiveTool::Erase) {
             m_right_panel_tab = 2;
-            m_sync_tab_req = 2;
         } else if (tool == ActiveTool::Depth) {
             m_right_panel_tab = 1;
-            m_sync_tab_req = 1;
         } else if (tool == ActiveTool::Hand) {
             m_right_panel_tab = 0;
-            m_sync_tab_req = 0;
         }
     }
+
     void select_right_panel_tab(int tab_idx) {
         m_right_panel_tab = tab_idx;
-        m_sync_tab_req = tab_idx;
         if (tab_idx == 0) {
             if (m_active_tool == ActiveTool::Erase || m_active_tool == ActiveTool::Depth) {
                 set_active_tool(ActiveTool::Hand);
@@ -345,37 +195,88 @@ public:
     const UiDomRegistry &get_dom() const { return m_dom; }
     std::string get_dom_json() const { return m_dom.to_json(); }
 
-    bool click_dom_element(const std::string &id_or_label) {
-        if (id_or_label == "tab_shaders") { select_right_panel_tab(0); return true; }
-        if (id_or_label == "tab_depth" || id_or_label == "accordion_depth") { select_right_panel_tab(1); return true; }
-        if (id_or_label == "tab_erase" || id_or_label == "accordion_erase") { select_right_panel_tab(2); return true; }
-        if (id_or_label == "tool_hand" || id_or_label == "tool_H" || id_or_label == "tool_h") { set_active_tool(ActiveTool::Hand); return true; }
-        if (id_or_label == "tool_erase" || id_or_label == "tool_E" || id_or_label == "tool_e") { set_active_tool(ActiveTool::Erase); return true; }
-        if (id_or_label == "tool_depth" || id_or_label == "tool_D" || id_or_label == "tool_d") { set_active_tool(ActiveTool::Depth); return true; }
-        if (id_or_label == "tool_split" || id_or_label == "tool_B" || id_or_label == "tool_b") { set_active_tool(ActiveTool::Split); return true; }
-        if (id_or_label == "tool_bypass" || id_or_label == "tool_\\") { m_master_bypass = !m_master_bypass; return true; }
-        if (id_or_label == "opt_fit" || id_or_label == "status_btn_fit") { m_req_fit_view = true; return true; }
-        if (id_or_label == "opt_100" || id_or_label == "status_btn_100") { m_req_100_view = true; return true; }
-        if (id_or_label == "opt_200" || id_or_label == "status_btn_200") { m_req_200_view = true; return true; }
-        if (id_or_label == "opt_static_zoom" || id_or_label == "menu_opt_static_zoom") { m_static_zoom = !m_static_zoom; return true; }
-        if (id_or_label == "opt_undo" || id_or_label == "erase_btn_undo") { undo_erase_stroke(); return true; }
-        if (id_or_label == "opt_redo") { redo_erase_stroke(); return true; }
-        if (id_or_label == "opt_clear" || id_or_label == "erase_btn_clear") { clear_erase_strokes(); m_req_clear_mask = true; return true; }
-        if (id_or_label == "erase_checkbox_subtract" || id_or_label == "opt_subtract") { m_erase_subtract = !m_erase_subtract; return true; }
+    bool click_dom_element(const std::string &id_or_label);
 
-        const UiDomNode *n = m_dom.find(id_or_label);
-        if (!n) return false;
-        if (n->id == "tab_shaders") { select_right_panel_tab(0); return true; }
-        if (n->id == "tab_depth" || n->id == "accordion_depth") { select_right_panel_tab(1); return true; }
-        if (n->id == "tab_erase" || n->id == "accordion_erase") { select_right_panel_tab(2); return true; }
+    void set_tabs(const std::vector<DocumentTab> &tabs, int active_index) {
+        m_tabs = tabs;
+        m_active_tab = active_index;
+    }
 
-        float cx = n->x + n->w * 0.5f;
-        float cy = n->y + n->h * 0.5f;
-        queue_mouse_event(cx, cy, 1);
+    void select_tab(int index) {
+        m_programmatic_select_tab = index;
+        m_active_tab = index;
+    }
+
+    int get_active_tab() const { return m_active_tab; }
+    const std::vector<DocumentTab> &get_tabs() const { return m_tabs; }
+
+    void request_close_active_tab() {
+        if (m_active_tab >= 0 && m_active_tab < static_cast<int>(m_tabs.size())) {
+            m_req_close_tab = m_active_tab;
+        }
+    }
+
+    void request_cycle_tab(int dir) {
+        if (m_tabs.empty()) return;
+        int count = static_cast<int>(m_tabs.size());
+        int next = (m_active_tab + dir) % count;
+        if (next < 0) next += count;
+        m_req_switch_tab = next;
+    }
+
+    bool pop_switch_tab_request(int &out_tab_idx) {
+        if (m_req_switch_tab < 0) return false;
+        out_tab_idx = m_req_switch_tab;
+        m_req_switch_tab = -1;
+        return true;
+    }
+
+    bool pop_close_tab_request(int &out_tab_idx) {
+        if (m_req_close_tab < 0) return false;
+        out_tab_idx = m_req_close_tab;
+        m_req_close_tab = -1;
+        return true;
+    }
+
+    bool pop_close_all_tabs_request() {
+        if (!m_req_close_all_tabs) return false;
+        m_req_close_all_tabs = false;
+        return true;
+    }
+
+    bool pop_close_other_tabs_request(int &out_keep_idx) {
+        if (m_req_close_other_tabs < 0) return false;
+        out_keep_idx = m_req_close_other_tabs;
+        m_req_close_other_tabs = -1;
+        return true;
+    }
+
+    bool pop_duplicate_tab_request(int &out_tab_idx) {
+        if (m_req_duplicate_tab < 0) return false;
+        out_tab_idx = m_req_duplicate_tab;
+        m_req_duplicate_tab = -1;
+        return true;
+    }
+
+    bool pop_new_tab_request() {
+        if (!m_req_new_tab) return false;
+        m_req_new_tab = false;
         return true;
     }
 
     const std::vector<std::vector<ImVec2>> &get_erase_strokes() const { return m_erase_strokes; }
+    const std::vector<std::vector<std::vector<ImVec2>>> &get_erase_undo_stack() const { return m_erase_undo_stack; }
+    const std::vector<std::vector<std::vector<ImVec2>>> &get_erase_redo_stack() const { return m_erase_redo_stack; }
+    void set_erase_strokes(const std::vector<std::vector<ImVec2>> &strokes,
+                           const std::vector<std::vector<std::vector<ImVec2>>> &undo_stack,
+                           const std::vector<std::vector<std::vector<ImVec2>>> &redo_stack) {
+        m_erase_strokes = strokes;
+        m_erase_undo_stack = undo_stack;
+        m_erase_redo_stack = redo_stack;
+        m_current_stroke.clear();
+        m_is_painting_mask = false;
+    }
+
     void clear_erase_strokes();
     bool undo_erase_stroke();
     bool redo_erase_stroke();
@@ -384,6 +285,9 @@ public:
 
     std::vector<ShaderLabEffect> &get_effects() { return m_effects; }
     const std::vector<ShaderLabEffect> &get_effects() const { return m_effects; }
+    void set_effects(const std::vector<ShaderLabEffect> &effects) {
+        m_effects = effects;
+    }
 
     bool pop_add_shader_request(std::wstring &out_path) {
         if (!m_req_add_shader) return false;
@@ -393,21 +297,22 @@ public:
     }
     void simulate_canvas_mouse(float x, float y, int act);
 
-private:
-    void apply_photoshop_gray_theme();
-    void render_menu_bar();
-    void render_tool_strip(float top_offset, float height);
-    void render_tool_options_bar(float top_offset, float width);
-    void render_left_panel(float left_offset, float top_offset, float panel_width, float panel_height);
-    void render_center_canvas(float left_offset, float top_offset, float canvas_width, float canvas_height,
-                              uint32_t img_w, uint32_t img_h,
-                              float zoom_level, float pan_x, float pan_y);
-    void render_right_panel(float right_offset, float top_offset, float panel_width, float panel_height);
-    void render_bottom_status_bar(float top_offset, float width, float height,
-                                  uint32_t img_w, uint32_t img_h,
-                                  float zoom_level, float pan_x, float pan_y);
-    void add_sample_effects();
+    // Public state accessors for component renderers
+    HWND get_hwnd() const { return m_hwnd; }
+    UiDomRegistry &get_dom_mut() { return m_dom; }
 
+    // Friend component renderers
+    friend void render_menu_bar(GuiManager &gui);
+    friend void render_tool_strip(GuiManager &gui, float top_offset, float height);
+    friend void render_tab_bar(GuiManager &gui, float x_offset, float top_offset, float width);
+    friend void render_left_panel(GuiManager &gui, float left_offset, float top_offset, float panel_width, float panel_height);
+    friend void render_right_panel(GuiManager &gui, float right_offset, float top_offset, float panel_width, float panel_height);
+    friend void render_center_canvas(GuiManager &gui, float left_offset, float top_offset, float canvas_width, float canvas_height,
+                                     uint32_t img_w, uint32_t img_h, float zoom_level, float pan_x, float pan_y);
+    friend void render_bottom_status_bar(GuiManager &gui, float top_offset, float width, float height,
+                                         uint32_t img_w, uint32_t img_h, float zoom_level, float pan_x, float pan_y);
+
+private:
     HWND m_hwnd = nullptr;
     ID3D11Device *m_device = nullptr;
     ID3D11DeviceContext *m_context = nullptr;
@@ -456,7 +361,17 @@ private:
     bool m_req_clear_mask = false;
     bool m_req_add_shader = false;
     std::wstring m_add_shader_path;
-    int m_open_accordion = 0; // 0=none, 1=depth, 2=erase
+
+    std::vector<DocumentTab> m_tabs;
+    int m_active_tab = -1;
+    int m_req_switch_tab = -1;
+    int m_req_close_tab = -1;
+    bool m_req_close_all_tabs = false;
+    int m_req_close_other_tabs = -1;
+    int m_req_duplicate_tab = -1;
+    bool m_req_new_tab = false;
+    int m_programmatic_select_tab = -1;
+
     float m_canvas_view_x = 0.0f;
     float m_canvas_view_y = 0.0f;
     float m_canvas_view_w = 0.0f;
@@ -476,12 +391,14 @@ private:
     std::string m_inpaint_status_text;
     bool m_inpaint_is_busy = false;
     std::vector<SimMouseEvent> m_sim_mouse_queue;
+    bool m_sim_mouse_down_prev = false;
     UiDomRegistry m_dom;
 
     int m_right_panel_tab = 0;
-    int m_sync_tab_req = -1;
     std::vector<ShaderLabEffect> m_effects;
     int m_selected_effect_idx = 0;
     char m_search_buffer[128] = {};
     bool m_show_about_dialog = false;
 };
+
+} // namespace gui

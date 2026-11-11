@@ -21,8 +21,27 @@ set(HOST_SOURCES
     src/viewport_controller.cpp
     src/warning_overlay.h
     src/warning_overlay.cpp
-    src/custom_ui.h
-    src/custom_ui.cpp
+    src/GUI/types.h
+    src/GUI/tool_requirements.h
+    src/GUI/tool_requirements.cpp
+    src/GUI/theme.h
+    src/GUI/theme.cpp
+    src/GUI/menu_bar.h
+    src/GUI/menu_bar.cpp
+    src/GUI/tool_strip.h
+    src/GUI/tool_strip.cpp
+    src/GUI/tab_bar.h
+    src/GUI/tab_bar.cpp
+    src/GUI/left_panel.h
+    src/GUI/left_panel.cpp
+    src/GUI/right_panel.h
+    src/GUI/right_panel.cpp
+    src/GUI/canvas.h
+    src/GUI/canvas.cpp
+    src/GUI/status_bar.h
+    src/GUI/status_bar.cpp
+    src/GUI/gui_manager.h
+    src/GUI/gui_manager.cpp
     src/effect_pipeline.h
     src/effect_pipeline.cpp
     ${IMGUI_DIR}/imgui.cpp
@@ -82,6 +101,8 @@ target_link_libraries(host_app PRIVATE
     gdiplus
     winmm
     comdlg32
+    urlmon
+    wininet
 )
 
 set_target_properties(host_app PROPERTIES
