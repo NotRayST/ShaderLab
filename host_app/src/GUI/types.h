@@ -9,24 +9,66 @@
 #include <memory>
 #include <cstdint>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 
 namespace gui {
 
 enum class ActiveTool {
-    Hand,
-    Erase,
-    Depth,
-    Split
+    Move,           // V - Intra-frame layer translation (Feature 8)
+    Hand,           // H - Viewport camera pan/zoom
+    Rotate,         // R - Rotate + Camera Raw Horizon Alignment line (Feature 6)
+    Crop,           // C - Crop marquee with aspect ratio presets (Feature 13)
+    RasterErase,    // E - Alpha Eraser with Size, Hardness, Opacity (Feature 12)
+    AiInpaint,      // J - LaMa Big HD Object Erase (renamed from Erase, Feature 7 & 12)
+    Erase = AiInpaint, // temporary alias so existing code builds before @canvas-tools updates refs
+    Text,           // T - System Font Text Layer Tool (Feature 15)
+    Upscale,        // U - AI Super-Resolution Upscaler (Feature 14)
+    Depth,          // D - 3D Depth Calibration
+    Split           // B - Before/After Split Comparison
 };
 
 enum class ToolIconType {
+    Move,
     Hand,
-    Erase,
+    Rotate,
+    Crop,
+    RasterErase,
+    AiInpaint,
+    Erase = AiInpaint, // temporary alias for phase 0 compilation
+    Text,
+    Upscale,
     Depth,
     Split,
     Bypass
+};
+
+enum class BlendMode : int {
+    Normal = 0,
+    Dissolve = 1,
+    Darken = 2,
+    Multiply = 3,
+    ColorBurn = 4,
+    LinearBurn = 5,
+    DarkerColor = 6,
+    Lighten = 7,
+    Screen = 8,
+    ColorDodge = 9,
+    LinearDodge = 10,
+    LighterColor = 11,
+    Overlay = 12,
+    SoftLight = 13,
+    HardLight = 14,
+    VividLight = 15,
+    LinearLight = 16,
+    PinLight = 17,
+    HardMix = 18,
+    Difference = 19,
+    Exclusion = 20,
+    Subtract = 21,
+    Divide = 22,
+    Count = 23
 };
 
 struct ShaderLabUniform {
@@ -116,30 +158,76 @@ public:
 
     const std::vector<UiDomNode> &get_nodes() const { return m_nodes; }
 
-    const UiDomNode *find(const std::string &query) const {
+    const UiDomNode *find_direct(const std::string &query) const {
         for (const auto &n : m_nodes) {
             if (n.id == query) return &n;
         }
         for (const auto &n : m_nodes) {
             if (_stricmp(n.id.c_str(), query.c_str()) == 0) return &n;
         }
-        // Aliases for tools and tabs
-        if (query == "tool_hand" || query == "tool_h") return find("tool_H");
-        if (query == "tool_erase" || query == "tool_e") return find("tool_E");
-        if (query == "tool_depth" || query == "tool_d") return find("tool_D");
-        if (query == "tool_split" || query == "tool_b") return find("tool_B");
-        if (query == "tool_bypass" || query == "tool_\\") return find("tool_\\");
-        if (query == "accordion_depth") {
-            const UiDomNode *n = find("tab_depth");
-            if (n) return n;
+        return nullptr;
+    }
+
+    const UiDomNode *find(const std::string &query) const {
+        if (const UiDomNode *direct = find_direct(query)) return direct;
+
+        std::string q_low = query;
+        std::transform(q_low.begin(), q_low.end(), q_low.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+
+        struct AliasEntry {
+            const char *alias;
+            const char *target;
+        };
+        static constexpr AliasEntry kAliases[] = {
+            { "tool_move",       "tool_V" },
+            { "tool_v",          "tool_move" },
+            { "tool_hand",       "tool_H" },
+            { "tool_h",          "tool_hand" },
+            { "tool_rotate",     "tool_R" },
+            { "tool_r",          "tool_rotate" },
+            { "tool_crop",       "tool_C" },
+            { "tool_c",          "tool_crop" },
+            { "tool_eraser",     "tool_E" },
+            { "tool_eraser",     "tool_erase" },
+            { "tool_erase",      "tool_E" },
+            { "tool_erase",      "tool_eraser" },
+            { "tool_e",          "tool_eraser" },
+            { "tool_e",          "tool_erase" },
+            { "tool_ai_inpaint", "tool_J" },
+            { "tool_j",          "tool_ai_inpaint" },
+            { "tool_text",       "tool_T" },
+            { "tool_t",          "tool_text" },
+            { "tool_upscale",    "tool_U" },
+            { "tool_u",          "tool_upscale" },
+            { "tool_depth",      "tool_D" },
+            { "tool_d",          "tool_depth" },
+            { "tool_split",      "tool_B" },
+            { "tool_b",          "tool_split" },
+            { "tool_bypass",     "tool_\\" },
+            { "tool_\\",         "tool_bypass" },
+            { "accordion_depth", "tab_depth" },
+            { "tab_depth",       "accordion_depth" },
+            { "accordion_erase", "tab_ai_inpaint" },
+            { "accordion_erase", "tab_erase" },
+            { "tab_erase",       "tab_ai_inpaint" },
+            { "tab_erase",       "accordion_erase" },
+            { "tab_ai_inpaint",  "tab_erase" },
+            { "tab_ai_inpaint",  "accordion_erase" },
+            { "tab_prefs",       "tab_preferences" },
+            { "tab_preferences", "tab_prefs" },
+            { "tab_upscale",     "accordion_upscale" },
+            { "tab_text",        "accordion_text" },
+            { "opt_fit",         "status_btn_fit" },
+            { "opt_100",         "status_btn_100" },
+            { "opt_200",         "status_btn_200" },
+        };
+        for (const auto &entry : kAliases) {
+            if (q_low == entry.alias) {
+                if (const UiDomNode *n = find_direct(entry.target)) return n;
+            }
         }
-        if (query == "accordion_erase") {
-            const UiDomNode *n = find("tab_erase");
-            if (n) return n;
-        }
-        if (query == "opt_fit") { const UiDomNode *n = find("status_btn_fit"); if (n) return n; }
-        if (query == "opt_100") { const UiDomNode *n = find("status_btn_100"); if (n) return n; }
-        if (query == "opt_200") { const UiDomNode *n = find("status_btn_200"); if (n) return n; }
         for (const auto &n : m_nodes) {
             if (_stricmp(n.label.c_str(), query.c_str()) == 0) return &n;
         }
