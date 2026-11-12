@@ -9,25 +9,65 @@ namespace gui {
 void render_menu_bar(GuiManager &gui) {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Open Image...", "Ctrl+O")) {
+            if (ImGui::MenuItem("Open Image or Project...", "Ctrl+O")) {
                 std::wstring path;
-                if (open_file_dialog(gui.m_hwnd, L"Image Files (*.png;*.jpg;*.jpeg;*.bmp;*.tga)\0*.png;*.jpg;*.jpeg;*.bmp;*.tga\0All Files (*.*)\0*.*\0", path)) {
+                if (open_file_dialog(
+                        gui.m_hwnd,
+                        L"Images & Projects (*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.shaderlab;*.slab)\0*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.shaderlab;*.slab\0"
+                        L"ShaderLab Projects (*.shaderlab;*.slab)\0*.shaderlab;*.slab\0"
+                        L"Image Files (*.png;*.jpg;*.jpeg;*.bmp;*.tga)\0*.png;*.jpg;*.jpeg;*.bmp;*.tga\0"
+                        L"All Files (*.*)\0*.*\0",
+                        path)) {
                     gui.m_req_open_image = true;
                     gui.m_open_image_path = path;
                 }
             }
-            if (ImGui::MenuItem("Save Snapshot...", "Ctrl+S")) {
+            gui.register_dom_last_item("menu_file_open", "Open Image or Project...", "menu_item");
+
+            const bool has_doc = !gui.m_tabs.empty();
+            if (ImGui::MenuItem("Save", "Ctrl+S", false, has_doc)) {
+                gui.m_req_save_project = true;
+            }
+            gui.register_dom_last_item("menu_file_save", "Save", "menu_item", false, has_doc);
+
+            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, has_doc)) {
                 std::wstring path;
-                if (save_file_dialog(gui.m_hwnd, L"PNG Image (*.png)\0*.png\0JPEG Image (*.jpg)\0*.jpg\0All Files (*.*)\0*.*\0", L"png", path)) {
-                    gui.m_req_save_snapshot = true;
-                    gui.m_save_snapshot_path = path;
+                if (save_file_dialog(
+                        gui.m_hwnd,
+                        L"ShaderLab Project (*.shaderlab;*.slab)\0*.shaderlab;*.slab\0All Files (*.*)\0*.*\0",
+                        L"shaderlab",
+                        path)) {
+                    gui.m_save_project_path = path;
+                    gui.m_req_save_project_as = true;
                 }
             }
+            gui.register_dom_last_item("menu_file_save_as", "Save As...", "menu_item", false, has_doc);
+
             ImGui::Separator();
-            if (ImGui::MenuItem("Close Tab", "Ctrl+W", false, !gui.m_tabs.empty())) {
+
+            if (ImGui::MenuItem("Export", "Ctrl+E", false, has_doc)) {
+                gui.m_req_export_image = true;
+            }
+            gui.register_dom_last_item("menu_file_export", "Export", "menu_item", false, has_doc);
+
+            if (ImGui::MenuItem("Export As...", "Ctrl+Shift+E", false, has_doc)) {
+                std::wstring path;
+                if (save_file_dialog(
+                        gui.m_hwnd,
+                        L"PNG Image (*.png)\0*.png\0JPEG Image (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0TGA Image (*.tga)\0*.tga\0All Files (*.*)\0*.*\0",
+                        L"png",
+                        path)) {
+                    gui.m_export_image_path = path;
+                    gui.m_req_export_image_as = true;
+                }
+            }
+            gui.register_dom_last_item("menu_file_export_as", "Export As...", "menu_item", false, has_doc);
+
+            ImGui::Separator();
+            if (ImGui::MenuItem("Close Tab", "Ctrl+W", false, has_doc)) {
                 gui.m_req_close_tab = gui.m_active_tab;
             }
-            if (ImGui::MenuItem("Close All Tabs", nullptr, false, !gui.m_tabs.empty())) {
+            if (ImGui::MenuItem("Close All Tabs", nullptr, false, has_doc)) {
                 gui.m_req_close_all_tabs = true;
             }
             ImGui::Separator();
@@ -42,15 +82,24 @@ void render_menu_bar(GuiManager &gui) {
             if (ImGui::MenuItem("Exit", "Alt+F4")) {
                 PostMessageW(gui.m_hwnd, WM_CLOSE, 0, 0);
             }
+            gui.register_dom_last_item("menu_file_exit", "Exit", "menu_item");
             ImGui::EndMenu();
+        } else {
+            const bool has_doc = !gui.m_tabs.empty();
+            gui.m_dom.register_item("menu_file_open", "Open Image or Project...", "menu_item", ImVec2(0.0f, 0.0f), ImVec2(0.0f, 0.0f), false, true);
+            gui.m_dom.register_item("menu_file_save", "Save", "menu_item", ImVec2(0.0f, 0.0f), ImVec2(0.0f, 0.0f), false, has_doc);
+            gui.m_dom.register_item("menu_file_save_as", "Save As...", "menu_item", ImVec2(0.0f, 0.0f), ImVec2(0.0f, 0.0f), false, has_doc);
+            gui.m_dom.register_item("menu_file_export", "Export", "menu_item", ImVec2(0.0f, 0.0f), ImVec2(0.0f, 0.0f), false, has_doc);
+            gui.m_dom.register_item("menu_file_export_as", "Export As...", "menu_item", ImVec2(0.0f, 0.0f), ImVec2(0.0f, 0.0f), false, has_doc);
+            gui.m_dom.register_item("menu_file_exit", "Exit", "menu_item", ImVec2(0.0f, 0.0f), ImVec2(0.0f, 0.0f), false, true);
         }
 
         if (ImGui::BeginMenu("Edit")) {
-            bool can_undo_erase = (gui.m_active_tool == ActiveTool::Erase && !gui.m_erase_undo_stack.empty());
+            bool can_undo_erase = (gui.m_active_tool == ActiveTool::AiInpaint && !gui.m_erase_undo_stack.empty());
             if (ImGui::MenuItem("Undo Mask Stroke", "Ctrl+Z", false, can_undo_erase)) {
                 gui.undo_erase_stroke();
             }
-            bool can_redo_erase = (gui.m_active_tool == ActiveTool::Erase && !gui.m_erase_redo_stack.empty());
+            bool can_redo_erase = (gui.m_active_tool == ActiveTool::AiInpaint && !gui.m_erase_redo_stack.empty());
             if (ImGui::MenuItem("Redo Mask Stroke", "Ctrl+Y", false, can_redo_erase)) {
                 gui.redo_erase_stroke();
             }
@@ -76,9 +125,15 @@ void render_menu_bar(GuiManager &gui) {
             if (ImGui::MenuItem("Invert Depth Buffer", nullptr, &gui.m_depth_invert)) {}
             ImGui::Separator();
             if (ImGui::MenuItem("Hide Side Panels", "Tab", &gui.m_hide_panels)) {}
+            ImGui::Separator();
+            if (ImGui::MenuItem("Preferences...", "Ctrl+,")) {
+                gui.m_req_open_prefs = true;
+            }
+            gui.register_dom_last_item("menu_settings_prefs", "Preferences...", "menu_item");
             ImGui::EndMenu();
         } else {
             gui.m_dom.register_item("opt_static_zoom", "Static Zoom", "setting", ImVec2(0.0f, 0.0f), ImVec2(0.0f, 0.0f), gui.m_static_zoom, true);
+            gui.m_dom.register_item("menu_settings_prefs", "Preferences...", "menu_item", ImVec2(0.0f, 0.0f), ImVec2(0.0f, 0.0f), false, true);
         }
 
         if (ImGui::BeginMenu("Shaders")) {

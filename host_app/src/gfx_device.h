@@ -47,6 +47,10 @@ public:
 
     bool dispatch_input_hook(UINT msg, WPARAM wParam, LPARAM lParam);
 
+    using CloseRequestHook = bool(*)(void *user_data);
+    void set_close_request_hook(CloseRequestHook hook, void *user_data);
+    bool dispatch_close_request();
+
     bool is_fullscreen() const { return m_is_fullscreen; }
     void toggle_fullscreen();
     void set_fullscreen(bool fullscreen);
@@ -96,6 +100,9 @@ private:
         void *user_data;
     };
     std::vector<HookEntry> m_input_hooks;
+
+    CloseRequestHook m_close_hook = nullptr;
+    void *m_close_hook_data = nullptr;
 
     ComPtr<ID3D11Device> m_device;
     ComPtr<ID3D11DeviceContext> m_context;
