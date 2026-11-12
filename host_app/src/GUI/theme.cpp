@@ -66,7 +66,7 @@ void add_sample_effects(std::vector<ShaderLabEffect> &effects) {
     fx1.name = "Adaptive Sharpen";
     fx1.file_path = "shaders/AdaptiveSharpen.fx";
     fx1.engine_type = "ReShade FX";
-    fx1.enabled = true;
+    fx1.enabled = false;
     {
         ShaderLabUniform u;
         u.name = "curve_height";

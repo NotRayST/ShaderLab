@@ -33,7 +33,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         break;
     case WM_CLOSE:
-        if (self) self->save_window_placement();
+        if (self) {
+            if (self->dispatch_close_request()) {
+                return 0;
+            }
+            self->save_window_placement();
+        }
         break;
     case WM_DESTROY:
         if (self) self->save_window_placement();
@@ -667,6 +672,18 @@ bool GfxDevice::dispatch_input_hook(UINT msg, WPARAM wParam, LPARAM lParam) {
         if (entry.hook && entry.hook(entry.user_data, msg, wParam, lParam)) {
             return true;
         }
+    }
+    return false;
+}
+
+void GfxDevice::set_close_request_hook(CloseRequestHook hook, void *user_data) {
+    m_close_hook = hook;
+    m_close_hook_data = user_data;
+}
+
+bool GfxDevice::dispatch_close_request() {
+    if (m_close_hook) {
+        return m_close_hook(m_close_hook_data);
     }
     return false;
 }
