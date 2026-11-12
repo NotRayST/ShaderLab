@@ -9,10 +9,14 @@ SamplerState g_PointSampler : register(s0);
 SamplerState g_LinearSampler : register(s1);
 
 cbuffer XformBuffer : register(b0) {
-    float4 g_XformA; // cos_angle, sin_angle, zoom, is_transformed
-    float4 g_XformB; // pan_x, pan_y, canvas_w, canvas_h
-    float4 g_XformC; // img_w, img_h, use_linear, far_plane
-    float4 g_XformD; // is_preview, unused, unused, unused
+    float4 g_XformA;     // cos_angle, sin_angle, zoom, is_transformed
+    float4 g_XformB;     // pan_x, pan_y, canvas_w, canvas_h
+    float4 g_XformC;     // img_w, img_h, use_linear, far_plane
+    float4 g_XformD;     // is_preview, show_checkerboard, checker_cell_size, unused
+    float4 g_CheckerA;   // light/alt checker rgb
+    float4 g_CheckerB;   // dark/base checker rgb
+    float4 g_ApronCol;   // dark workspace apron rgba
+    float4 g_LayerXform; // offset_x, offset_y, layer_w, layer_h
 };
 
 struct VSOutput {
@@ -51,18 +55,38 @@ float4 blit_ps(VSOutput input) : SV_Target {
     float2 q = float2(p.x * cos_a + p.y * sin_a, -p.x * sin_a + p.y * cos_a);
 
     float2 img_center = img_dims * 0.5f;
-    float2 tex_pixel = q + img_center + pan;
-    float2 uv = tex_pixel / img_dims;
+    float2 doc_pixel = q + img_center + pan;
+    float2 doc_uv = doc_pixel / img_dims;
 
-    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
-        return float4(0.08f, 0.08f, 0.09f, 1.0f);
+    if (doc_uv.x < 0.0f || doc_uv.x > 1.0f || doc_uv.y < 0.0f || doc_uv.y > 1.0f) {
+        if (g_XformD.y > 0.5f) {
+            return float4(g_ApronCol.rgb, 1.0f);
+        }
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
 
-    if (g_XformC.z > 0.5f) {
-        return g_Texture.Sample(g_LinearSampler, uv);
-    } else {
-        return g_Texture.Sample(g_PointSampler, uv);
+    // Optional intra-frame layer offset inside the document frame
+    float2 layer_dims = (g_LayerXform.z > 0.0f && g_LayerXform.w > 0.0f) ? g_LayerXform.zw : img_dims;
+    float2 layer_pixel = doc_pixel - g_LayerXform.xy;
+    float2 layer_uv = layer_pixel / layer_dims;
+
+    float4 tex_col = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (layer_uv.x >= 0.0f && layer_uv.x <= 1.0f && layer_uv.y >= 0.0f && layer_uv.y <= 1.0f) {
+        tex_col = (g_XformC.z > 0.5f)
+            ? g_Texture.Sample(g_LinearSampler, layer_uv)
+            : g_Texture.Sample(g_PointSampler, layer_uv);
     }
+
+    if (g_XformD.y > 0.5f) {
+        float cell_sz = max(2.0f, g_XformD.z);
+        uint2 checker_ij = uint2(floor(input.Pos.xy / cell_sz));
+        bool is_alt = ((checker_ij.x + checker_ij.y) & 1u) != 0u;
+        float3 checker_rgb = is_alt ? g_CheckerA.rgb : g_CheckerB.rgb;
+        float3 final_rgb = lerp(checker_rgb, tex_col.rgb, tex_col.a);
+        return float4(final_rgb, 1.0f);
+    }
+
+    return tex_col;
 }
 
 float4 blit_depth_ps(VSOutput input) : SV_TARGET {
@@ -247,6 +271,24 @@ void BlitRenderer::shutdown() {
     m_vs.Reset();
 }
 
+void BlitRenderer::set_display_settings(
+    float checker_cell_size_px,
+    const float checker_col_a[4],
+    const float checker_col_b[4],
+    const float apron_col[4]
+) {
+    m_checker_cell_size = (checker_cell_size_px >= 2.0f) ? checker_cell_size_px : 8.0f;
+    if (checker_col_a) {
+        for (int i = 0; i < 4; ++i) m_checker_col_a[i] = checker_col_a[i];
+    }
+    if (checker_col_b) {
+        for (int i = 0; i < 4; ++i) m_checker_col_b[i] = checker_col_b[i];
+    }
+    if (apron_col) {
+        for (int i = 0; i < 4; ++i) m_apron_col[i] = apron_col[i];
+    }
+}
+
 void BlitRenderer::render(ID3D11DeviceContext *context, ID3D11ShaderResourceView *srv) {
     if (!context || !m_vs || !m_ps || !srv) return;
 
@@ -254,10 +296,9 @@ void BlitRenderer::render(ID3D11DeviceContext *context, ID3D11ShaderResourceView
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         if (SUCCEEDED(context->Map(m_cbuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
             auto *cb = static_cast<ConstantBufferData *>(mapped.pData);
+            *cb = {};
             cb->xform_a[0] = 1.0f;
-            cb->xform_a[1] = 0.0f;
             cb->xform_a[2] = 1.0f;
-            cb->xform_a[3] = 0.0f; // is_transformed = false
             cb->xform_c[3] = 1000.0f;
             context->Unmap(m_cbuffer.Get(), 0);
         }
@@ -289,17 +330,9 @@ void BlitRenderer::render_depth(ID3D11DeviceContext *context, ID3D11ShaderResour
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         if (SUCCEEDED(context->Map(m_cbuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
             auto *cb = static_cast<ConstantBufferData *>(mapped.pData);
+            *cb = {};
             cb->xform_a[0] = 1.0f;
-            cb->xform_a[1] = 0.0f;
             cb->xform_a[2] = 1.0f;
-            cb->xform_a[3] = 0.0f; // is_transformed = false
-            cb->xform_b[0] = 0.0f;
-            cb->xform_b[1] = 0.0f;
-            cb->xform_b[2] = 0.0f;
-            cb->xform_b[3] = 0.0f;
-            cb->xform_c[0] = 0.0f;
-            cb->xform_c[1] = 0.0f;
-            cb->xform_c[2] = 0.0f;
             cb->xform_c[3] = (far_plane > 1.0f) ? far_plane : 1000.0f;
             context->Unmap(m_cbuffer.Get(), 0);
         }
@@ -342,7 +375,12 @@ void BlitRenderer::render_transformed(
     float canvas_w,
     float canvas_h,
     float img_w,
-    float img_h
+    float img_h,
+    bool show_checkerboard,
+    float layer_offset_x,
+    float layer_offset_y,
+    float layer_w,
+    float layer_h
 ) {
     if (!context || !m_vs || !m_ps || !srv || !m_cbuffer) return;
 
@@ -368,6 +406,7 @@ void BlitRenderer::render_transformed(
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (SUCCEEDED(context->Map(m_cbuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         auto *cb = static_cast<ConstantBufferData *>(mapped.pData);
+        *cb = {};
         cb->xform_a[0] = cos_a;
         cb->xform_a[1] = sin_a;
         cb->xform_a[2] = eff_zoom;
@@ -384,9 +423,20 @@ void BlitRenderer::render_transformed(
         cb->xform_c[3] = 1000.0f;
 
         cb->xform_d[0] = 0.0f;
-        cb->xform_d[1] = 0.0f;
-        cb->xform_d[2] = 0.0f;
+        cb->xform_d[1] = show_checkerboard ? 1.0f : 0.0f;
+        cb->xform_d[2] = m_checker_cell_size;
         cb->xform_d[3] = 0.0f;
+
+        for (int i = 0; i < 4; ++i) {
+            cb->checker_a[i] = m_checker_col_a[i];
+            cb->checker_b[i] = m_checker_col_b[i];
+            cb->apron_col[i] = m_apron_col[i];
+        }
+
+        cb->layer_xform[0] = layer_offset_x;
+        cb->layer_xform[1] = layer_offset_y;
+        cb->layer_xform[2] = (layer_w > 0.0f) ? layer_w : img_w;
+        cb->layer_xform[3] = (layer_h > 0.0f) ? layer_h : img_h;
 
         context->Unmap(m_cbuffer.Get(), 0);
     }
@@ -446,6 +496,7 @@ void BlitRenderer::render_depth_transformed(
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (SUCCEEDED(context->Map(m_cbuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         auto *cb = static_cast<ConstantBufferData *>(mapped.pData);
+        *cb = {};
         cb->xform_a[0] = cos_a;
         cb->xform_a[1] = sin_a;
         cb->xform_a[2] = eff_zoom;
@@ -462,9 +513,6 @@ void BlitRenderer::render_depth_transformed(
         cb->xform_c[3] = (far_plane > 0.0f) ? far_plane : 1000.0f;
 
         cb->xform_d[0] = is_preview ? 1.0f : 0.0f;
-        cb->xform_d[1] = 0.0f;
-        cb->xform_d[2] = 0.0f;
-        cb->xform_d[3] = 0.0f;
 
         context->Unmap(m_cbuffer.Get(), 0);
     }
