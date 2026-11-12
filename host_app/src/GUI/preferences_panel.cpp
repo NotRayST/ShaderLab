@@ -260,20 +260,23 @@ bool render_texture_slot_controls(
     }
 
     const char *modes[] = { "Tile", "Stretch", "Center" };
+    ImGui::TextUnformatted("Mode");
     ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::Combo("Mode", &tex_mode, modes, IM_ARRAYSIZE(modes))) {
+    if (ImGui::Combo("##tex_mode", &tex_mode, modes, IM_ARRAYSIZE(modes))) {
         modified = true;
     }
     register_dom(dom, dom_mode_id, "Texture Mode", "combo");
 
+    ImGui::TextUnformatted("Opacity");
     ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::SliderFloat("Opacity", &tex_opacity, 0.0f, 1.0f, "%.2f")) {
+    if (ImGui::SliderFloat("##tex_opacity", &tex_opacity, 0.0f, 1.0f, "%.2f")) {
         modified = true;
     }
     register_dom(dom, dom_opacity_id, "Texture Opacity", "slider");
 
+    ImGui::TextUnformatted("Scale");
     ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::SliderFloat("Scale", &tex_scale, 0.25f, 4.0f, "%.2fx")) {
+    if (ImGui::SliderFloat("##tex_scale", &tex_scale, 0.25f, 4.0f, "%.2fx")) {
         modified = true;
     }
     register_dom(dom, dom_scale_id, "Texture Scale", "slider");
@@ -743,15 +746,17 @@ bool render_preferences_tab(
                 register_dom(dom, row.dom_id, row.label, "color_picker");
             }
 
+            ImGui::TextUnformatted("Corner Rounding");
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::SliderFloat("Corner Rounding", &prefs.ui_rounding, 0.0f, 10.0f, "%.1f px")) {
+            if (ImGui::SliderFloat("##prefs_rounding", &prefs.ui_rounding, 0.0f, 10.0f, "%.1f px")) {
                 theme_modified = true;
                 modified = true;
             }
             register_dom(dom, "prefs_slider_rounding", "Corner Rounding", "slider");
 
+            ImGui::TextUnformatted("Border Size");
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::SliderFloat("Border Size", &prefs.ui_border_size, 0.0f, 3.0f, "%.1f px")) {
+            if (ImGui::SliderFloat("##prefs_border", &prefs.ui_border_size, 0.0f, 3.0f, "%.1f px")) {
                 theme_modified = true;
                 modified = true;
             }
@@ -788,8 +793,9 @@ bool render_preferences_tab(
 
         // Section 3: Transparency Checkerboard
         if (ImGui::CollapsingHeader("Transparency Checkerboard", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextUnformatted("Square Size");
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::SliderFloat("Square Size", &prefs.checker_size, 4.0f, 64.0f, "%.0f px")) {
+            if (ImGui::SliderFloat("##prefs_checker_size", &prefs.checker_size, 4.0f, 64.0f, "%.0f px")) {
                 modified = true;
             }
             register_dom(dom, "prefs_slider_checker_size", "Checkerboard Size", "slider");
@@ -820,8 +826,9 @@ bool render_preferences_tab(
             register_dom(dom, "prefs_combo_export_fmt", "Default Export Format", "combo");
 
             if (prefs.default_export_format == 1) {
+                ImGui::TextUnformatted("JPEG Quality");
                 ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::SliderInt("JPEG Quality", &prefs.export_jpeg_quality, 10, 100, "%d%%")) {
+                if (ImGui::SliderInt("##prefs_jpg_quality", &prefs.export_jpeg_quality, 10, 100, "%d%%")) {
                     modified = true;
                 }
                 register_dom(dom, "prefs_slider_jpg_quality", "JPEG Quality", "slider");
