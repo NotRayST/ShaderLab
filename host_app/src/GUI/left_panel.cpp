@@ -72,7 +72,9 @@ void render_left_panel(GuiManager &gui, float left_offset, float top_offset, flo
 
         // dedicated checkbox area
         ImGui::SetCursorScreenPos(ImVec2(row_x + 6.0f, check_y));
-        ImGui::Checkbox("##enabled", &fx.enabled);
+        if (ImGui::Checkbox("##enabled", &fx.enabled)) {
+            gui.mark_active_document_dirty();
+        }
         gui.register_dom_last_item("shader_checkbox_" + std::to_string(i), fx.name + " Checkbox", "checkbox", fx.enabled);
 
         // clickable label region for selecting this effect
@@ -84,6 +86,7 @@ void render_left_panel(GuiManager &gui, float left_offset, float top_offset, flo
         gui.register_dom_last_item("shader_select_" + std::to_string(i), fx.name, "list_item", is_selected);
         if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
             fx.enabled = !fx.enabled;
+            gui.mark_active_document_dirty();
         }
 
         // engine badge calculation
@@ -152,6 +155,7 @@ void render_left_panel(GuiManager &gui, float left_offset, float top_offset, flo
         if (can_move_up) {
             std::swap(gui.m_effects[gui.m_selected_effect_idx], gui.m_effects[gui.m_selected_effect_idx - 1]);
             gui.m_selected_effect_idx--;
+            gui.mark_active_document_dirty();
         }
     }
     gui.register_dom_last_item("btn_move_up", "Move Up", "button", false, can_move_up);
@@ -166,6 +170,7 @@ void render_left_panel(GuiManager &gui, float left_offset, float top_offset, flo
         if (can_move_down) {
             std::swap(gui.m_effects[gui.m_selected_effect_idx], gui.m_effects[gui.m_selected_effect_idx + 1]);
             gui.m_selected_effect_idx++;
+            gui.mark_active_document_dirty();
         }
     }
     gui.register_dom_last_item("btn_move_down", "Move Down", "button", false, can_move_down);
