@@ -2256,45 +2256,132 @@ SamplerState sampler_CameraDepthTexture;
 float4 tex2D(sampler2D_dummy) { return 0; }
 #define UNITY_DECLARE_TEX2D(tex) Texture2D tex; SamplerState sampler##tex
 #define UNITY_SAMPLE_TEX2D(tex, coord) tex.Sample(sampler##tex, coord)
+#define TEXTURE2D(tex) Texture2D tex
+#define SAMPLER(smp) SamplerState smp
+#define SAMPLE_TEXTURE2D(tex, smp, coord) ((tex).Sample((smp), (coord)))
+#define real float
+#define real2 float2
+#define real3 float3
+#define real4 float4
 
 float Luminance(float3 rgb) { return dot(rgb, float3(0.2126, 0.7152, 0.0722)); }
-
-struct appdata {
-    float4 vertex : POSITION;
-    float2 uv : TEXCOORD0;
-};
-struct appdata_img {
-    float4 vertex : POSITION;
-    float2 texcoord : TEXCOORD0;
-};
-struct v2f {
-    float4 pos : SV_Position;
-    float2 uv : TEXCOORD0;
-};
 )HLSL";
 
-    // Handle `sampler2D _MainTex;` declarations cleanly
+    // Handle `sampler2D` and duplicate built-in Texture2D/SamplerState declarations cleanly
     std::string cg_body = filtered_cg.str();
     std::string rewritten_cg;
     {
+        auto is_builtin_tex_or_smp = [](const std::string &sym) -> bool {
+            return sym == "_MainTex" || sym == "_CameraDepthTexture" ||
+                   sym == "sampler_MainTex" || sym == "sampler_CameraDepthTexture";
+        };
+        auto extract_macro_arg = [](const std::string &stmt, const char *macro_name) -> std::string {
+            std::string trimmed = trim_copy(stmt);
+            size_t mlen = std::strlen(macro_name);
+            if (trimmed.rfind(macro_name, 0) != 0) return {};
+            size_t p = mlen;
+            while (p < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[p]))) ++p;
+            if (p >= trimmed.size() || trimmed[p] != '(') return {};
+            size_t rp = trimmed.find(')', p + 1);
+            if (rp == std::string::npos) return {};
+            return trim_copy(trimmed.substr(p + 1, rp - p - 1));
+        };
+
         std::stringstream bss(cg_body);
         std::string ln;
         while (std::getline(bss, ln)) {
             std::string tr = trim_copy(ln);
-            if (tr.rfind("sampler2D ", 0) == 0 && tr.find('(') == std::string::npos) {
-                std::string sym = trim_copy(tr.substr(10));
-                if (!sym.empty() && sym.back() == ';') sym.pop_back();
-                sym = trim_copy(sym);
-                if (sym != "_MainTex" && sym != "_CameraDepthTexture") {
-                    rewritten_cg += "Texture2D " + sym + "; SamplerState sampler" + sym + ";\n";
+            // Split semicolon-separated top-level declarations on the same line if no `{`/`(`
+            if (tr.find('{') == std::string::npos && tr.find(';') != std::string::npos) {
+                std::string rebuilt_ln;
+                size_t pos = 0;
+                bool handled_any = false;
+                while (pos < tr.size()) {
+                    size_t semi = tr.find(';', pos);
+                    if (semi == std::string::npos) {
+                        rebuilt_ln += tr.substr(pos);
+                        break;
+                    }
+                    std::string stmt = trim_copy(tr.substr(pos, semi - pos));
+                    pos = semi + 1;
+                    if (stmt.empty()) continue;
+
+                    std::string macro_arg = extract_macro_arg(stmt, "TEXTURE2D");
+                    if (macro_arg.empty()) macro_arg = extract_macro_arg(stmt, "SAMPLER");
+                    if (macro_arg.empty()) macro_arg = extract_macro_arg(stmt, "UNITY_DECLARE_TEX2D");
+                    if (!macro_arg.empty()) {
+                        if (is_builtin_tex_or_smp(macro_arg)) {
+                            handled_any = true;
+                            continue;
+                        }
+                    }
+
+                    // Parse `<type> <ident>` (supports sampler2D, sampler2D_float, Texture2D, Texture2D<float4>, SamplerState)
+                    size_t sp = 0;
+                    while (sp < stmt.size() && is_ident_char(stmt[sp])) ++sp;
+                    std::string kw = stmt.substr(0, sp);
+                    size_t after_kw = sp;
+                    while (after_kw < stmt.size() && std::isspace(static_cast<unsigned char>(stmt[after_kw]))) ++after_kw;
+                    if (kw == "Texture2D" && after_kw < stmt.size() && stmt[after_kw] == '<') {
+                        size_t ca = stmt.find('>', after_kw);
+                        if (ca != std::string::npos) {
+                            after_kw = ca + 1;
+                            while (after_kw < stmt.size() && std::isspace(static_cast<unsigned char>(stmt[after_kw]))) ++after_kw;
+                        }
+                    }
+                    std::string rest_sym = (after_kw < stmt.size()) ? trim_copy(stmt.substr(after_kw)) : std::string();
+                    if ((kw == "sampler2D" || kw == "sampler2D_float") && stmt.find('(') == std::string::npos && !rest_sym.empty()) {
+                        handled_any = true;
+                        if (!is_builtin_tex_or_smp(rest_sym)) {
+                            rebuilt_ln += "Texture2D " + rest_sym + "; SamplerState sampler" + rest_sym + "; ";
+                        }
+                        continue;
+                    }
+                    if ((kw == "Texture2D" || kw == "SamplerState") && stmt.find('(') == std::string::npos &&
+                        is_builtin_tex_or_smp(rest_sym)) {
+                        handled_any = true;
+                        continue;
+                    }
+                    rebuilt_ln += stmt + "; ";
                 }
-                continue;
-            }
-            if (tr.rfind("sampler2D_float ", 0) == 0) {
-                continue;
+                if (handled_any) {
+                    if (!rebuilt_ln.empty()) rewritten_cg += rebuilt_ln + "\n";
+                    continue;
+                }
             }
             rewritten_cg += ln + "\n";
         }
+    }
+
+    // Conditionally emit fallback Unity structs only when not declared in shader source
+    auto has_struct_def = [](const std::string &code, const std::string &sname) -> bool {
+        size_t pos = 0;
+        while ((pos = code.find("struct", pos)) != std::string::npos) {
+            bool left_ok = (pos == 0 || !is_ident_char(code[pos - 1]));
+            size_t after = pos + 6;
+            if (left_ok && after < code.size() && std::isspace(static_cast<unsigned char>(code[after]))) {
+                size_t ns = skip_ws_and_comments(code, after);
+                size_t ne = ns;
+                while (ne < code.size() && is_ident_char(code[ne])) ++ne;
+                if (code.substr(ns, ne - ns) == sname) {
+                    size_t brace = skip_ws_and_comments(code, ne);
+                    if (brace < code.size() && code[brace] == '{') {
+                        return true;
+                    }
+                }
+            }
+            pos = after;
+        }
+        return false;
+    };
+    if (!has_struct_def(rewritten_cg, "appdata")) {
+        final_hlsl << "struct appdata {\n    float4 vertex : POSITION;\n    float2 uv : TEXCOORD0;\n};\n";
+    }
+    if (!has_struct_def(rewritten_cg, "appdata_img")) {
+        final_hlsl << "struct appdata_img {\n    float4 vertex : POSITION;\n    float2 texcoord : TEXCOORD0;\n};\n";
+    }
+    if (!has_struct_def(rewritten_cg, "v2f")) {
+        final_hlsl << "struct v2f {\n    float4 pos : SV_Position;\n    float2 uv : TEXCOORD0;\n};\n";
     }
 
     // Rewrite tex2D(_MainTex, uv) -> _MainTex.Sample(sampler_MainTex, uv)

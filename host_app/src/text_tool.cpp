@@ -826,21 +826,18 @@ void TextToolEngine::render_text_tab(
 
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextColored(ImVec4(0.75f, 0.85f, 1.0f, 1.0f), "System Font Typography");
-    ImGui::TextDisabled("Click the canvas with Text Tool (T) to place a text layer, or edit active layer text below.");
+    ImGui::TextDisabled("Click canvas (T) to place, or edit active layer.");
     ImGui::PopTextWrapPos();
-    ImGui::Spacing();
 
     bool changed = false;
 
-    // Text Content input
+    // Text Content input (compact height so Font, Size, Style & Align fit comfortably at 1440x900)
     ImGui::TextUnformatted("Content");
-    if (ImGui::InputTextMultiline("##text_content", m_text_edit_buf, sizeof(m_text_edit_buf), ImVec2(-1.0f, 76.0f))) {
+    if (ImGui::InputTextMultiline("##text_content", m_text_edit_buf, sizeof(m_text_edit_buf), ImVec2(-1.0f, 40.0f))) {
         m_settings.text_utf8 = m_text_edit_buf;
         changed = true;
     }
     gui.register_dom_last_item("text_input_content", "Text Content", "input", false, true);
-
-    ImGui::Spacing();
 
     // Searchable System Font Picker
     std::string cur_font = wide_to_utf8(m_settings.font_family);
@@ -875,9 +872,7 @@ void TextToolEngine::render_text_tab(
     }
     gui.register_dom_last_item("text_combo_font", cur_font, "combo", false, true);
 
-    ImGui::Spacing();
-
-    // Font Size + Presets
+    // Font Size + single compact preset row
     ImGui::TextUnformatted("Size (pt)");
     ImGui::SetNextItemWidth(-1.0f);
     if (ImGui::SliderFloat("##text_size_slider", &m_settings.font_size, 6.0f, 500.0f, "%.0f pt")) {
@@ -885,9 +880,9 @@ void TextToolEngine::render_text_tab(
     }
     gui.register_dom_last_item("text_slider_size", "Font Size", "slider", false, true);
 
-    static constexpr float kSizePresets[] = { 12.f, 18.f, 24.f, 36.f, 48.f, 72.f, 96.f, 144.f };
-    for (int i = 0; i < 8; ++i) {
-        if (i > 0 && i != 4) ImGui::SameLine();
+    static constexpr float kSizePresets[] = { 12.f, 24.f, 36.f, 48.f, 72.f, 96.f };
+    for (int i = 0; i < 6; ++i) {
+        if (i > 0) ImGui::SameLine();
         char pbuf[16] = {};
         snprintf(pbuf, sizeof(pbuf), "%.0f", kSizePresets[i]);
         if (ImGui::SmallButton(pbuf)) {
@@ -895,8 +890,6 @@ void TextToolEngine::render_text_tab(
             changed = true;
         }
     }
-
-    ImGui::Spacing();
 
     // Style toggles: Bold / Italic / Underline / Strikethrough
     auto toggle_btn = [&](const char *label, const char *dom_id, bool &flag) {
