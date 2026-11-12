@@ -1,5 +1,7 @@
 #include "backbuffer_dump.h"
 #include "image_loader.h"
+#include <algorithm>
+#include <cctype>
 #include <iostream>
 #include <vector>
 #include <filesystem>
@@ -18,7 +20,12 @@ static std::string wide_to_utf8(const std::wstring &wstr) {
     return out;
 }
 
-static bool write_mapped_rgba_to_file(const uint8_t *src_bytes, UINT row_pitch, uint32_t width, uint32_t height, bool is_bgra, const wchar_t *output_path) {
+static bool write_mapped_rgba_to_file(const uint8_t *src_bytes, UINT row_pitch, uint32_t width, uint32_t height,
+                                      bool is_bgra, bool preserve_alpha, const wchar_t *output_path) {
+    if (!src_bytes || width == 0 || height == 0 || !output_path) {
+        return false;
+    }
+
     std::filesystem::path p(output_path);
     if (p.has_parent_path()) {
         std::error_code ec;
@@ -37,16 +44,21 @@ static bool write_mapped_rgba_to_file(const uint8_t *src_bytes, UINT row_pitch, 
             uint8_t c0 = row_src[x * 4 + 0];
             uint8_t c1 = row_src[x * 4 + 1];
             uint8_t c2 = row_src[x * 4 + 2];
+            uint8_t c3 = row_src[x * 4 + 3];
             row_dst[x * 4 + 0] = is_bgra ? c2 : c0;
             row_dst[x * 4 + 1] = c1;
             row_dst[x * 4 + 2] = is_bgra ? c0 : c2;
-            row_dst[x * 4 + 3] = 255;
+            row_dst[x * 4 + 3] = preserve_alpha ? c3 : 255;
         }
     }
 
     int ok = 0;
     if (ext == ".jpg" || ext == ".jpeg") {
         ok = stbi_write_jpg(out_utf8.c_str(), static_cast<int>(width), static_cast<int>(height), 4, packed.data(), 95);
+    } else if (ext == ".tga") {
+        ok = stbi_write_tga(out_utf8.c_str(), static_cast<int>(width), static_cast<int>(height), 4, packed.data());
+    } else if (ext == ".bmp") {
+        ok = stbi_write_bmp(out_utf8.c_str(), static_cast<int>(width), static_cast<int>(height), 4, packed.data());
     } else {
         stbi_write_force_png_filter = 0;
         ok = stbi_write_png(
@@ -61,7 +73,30 @@ static bool write_mapped_rgba_to_file(const uint8_t *src_bytes, UINT row_pitch, 
     return (ok != 0);
 }
 
-bool BackbufferDump::save_texture_to_file(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Texture2D *src_tex, const wchar_t *output_path) {
+bool BackbufferDump::save_rgba_to_file(uint32_t width, uint32_t height, const uint8_t *rgba_bytes, const wchar_t *output_path, bool preserve_alpha) {
+    if (!rgba_bytes || width == 0 || height == 0 || !output_path) {
+        return false;
+    }
+    return write_mapped_rgba_to_file(rgba_bytes, static_cast<UINT>(width * 4), width, height, false, preserve_alpha, output_path);
+}
+
+bool BackbufferDump::save_srv_to_file(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11ShaderResourceView *src_srv, const wchar_t *output_path, bool preserve_alpha) {
+    if (!device || !context || !src_srv || !output_path) {
+        return false;
+    }
+    ComPtr<ID3D11Resource> res;
+    src_srv->GetResource(&res);
+    if (!res) {
+        return false;
+    }
+    ComPtr<ID3D11Texture2D> tex;
+    if (FAILED(res.As(&tex)) || !tex) {
+        return false;
+    }
+    return save_texture_to_file(device, context, tex.Get(), output_path, preserve_alpha);
+}
+
+bool BackbufferDump::save_texture_to_file(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Texture2D *src_tex, const wchar_t *output_path, bool preserve_alpha) {
     if (!device || !context || !src_tex || !output_path) {
         return false;
     }
@@ -101,12 +136,12 @@ bool BackbufferDump::save_texture_to_file(ID3D11Device *device, ID3D11DeviceCont
     }
 
     bool is_bgra = (src_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || src_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
-    bool ok = write_mapped_rgba_to_file(static_cast<const uint8_t *>(mapped.pData), mapped.RowPitch, src_desc.Width, src_desc.Height, is_bgra, output_path);
+    bool ok = write_mapped_rgba_to_file(static_cast<const uint8_t *>(mapped.pData), mapped.RowPitch, src_desc.Width, src_desc.Height, is_bgra, preserve_alpha, output_path);
     context->Unmap(staging.Get(), 0);
     return ok;
 }
 
-bool BackbufferDump::capture_to_file(GfxDevice &gfx, const wchar_t *output_path, uint32_t width, uint32_t height) {
+bool BackbufferDump::capture_to_file(GfxDevice &gfx, const wchar_t *output_path, uint32_t width, uint32_t height, bool preserve_alpha) {
     if (!gfx.get_device() || !gfx.get_context() || !gfx.get_swap_chain() || !output_path) {
         return false;
     }
@@ -156,7 +191,7 @@ bool BackbufferDump::capture_to_file(GfxDevice &gfx, const wchar_t *output_path,
     }
 
     bool is_bgra = (bb_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || bb_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
-    bool ok = write_mapped_rgba_to_file(static_cast<const uint8_t *>(mapped.pData), mapped.RowPitch, copy_w, copy_h, is_bgra, output_path);
+    bool ok = write_mapped_rgba_to_file(static_cast<const uint8_t *>(mapped.pData), mapped.RowPitch, copy_w, copy_h, is_bgra, preserve_alpha, output_path);
     gfx.get_context()->Unmap(staging.Get(), 0);
 
     return ok;
