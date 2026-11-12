@@ -1935,6 +1935,11 @@ void GuiManager::simulate_canvas_mouse(float x, float y, int act) {
     if (m_last_img_w == 0 || m_last_img_h == 0) {
         return;
     }
+    const bool in_canvas = (x >= m_canvas_view_x && x < (m_canvas_view_x + m_canvas_view_w) &&
+                            y >= m_canvas_view_y && y < (m_canvas_view_y + m_canvas_view_h));
+    if (!in_canvas && (act == 1 || act == 2 || act == 4 || !has_active_drag())) {
+        return;
+    }
 
     if (m_active_tool == ActiveTool::AiInpaint && m_erase_active) {
         float img_px_x = 0.0f, img_px_y = 0.0f;

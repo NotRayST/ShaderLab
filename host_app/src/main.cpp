@@ -1393,11 +1393,20 @@ static int run_app(int argc, wchar_t **argv) {
 
     custom_ui.render_text_tab_fn = [&]() {
         bool active_is_text = false;
+        gui::TextCaretPreview tpreview;
         if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
             if (const auto *al = app_documents[active_doc_idx].layer_stack.active_layer()) {
                 active_is_text = al->is_text_layer;
+                tpreview.active = al->is_text_layer;
+                tpreview.doc_x = al->offset_x;
+                tpreview.doc_y = al->offset_y;
+                tpreview.doc_w = static_cast<float>(al->width);
+                tpreview.doc_h = static_cast<float>(al->height);
+                tpreview.editing = (custom_ui.get_right_panel_tab() == 4 ||
+                                    custom_ui.get_active_tool() == CustomUI::ActiveTool::Text);
             }
         }
+        custom_ui.set_text_caret_preview(tpreview);
         shaderlab::TextToolEngine::get().render_text_tab(
             custom_ui,
             active_image.width > 0 && active_image.height > 0,
@@ -3398,6 +3407,44 @@ static int run_app(int argc, wchar_t **argv) {
                     app_documents[active_doc_idx].is_dirty = true;
                     sync_tabs_to_ui();
                 }
+            }
+
+            {
+                gui::LayerStatusView lview;
+                gui::TextCaretPreview tpreview;
+                if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    const auto &stack = app_documents[active_doc_idx].layer_stack;
+                    if (const auto *al = stack.active_layer()) {
+                        lview.valid = true;
+                        lview.active_index = stack.active_index;
+                        lview.count = static_cast<int>(stack.layers.size());
+                        lview.layer_name = al->name;
+                        lview.blend_mode_name = blend_mode_name(al->blend_mode);
+                        lview.opacity_pct = static_cast<int>(std::lround(al->opacity * 100.0f));
+                        lview.fill_pct = static_cast<int>(std::lround(al->fill_opacity * 100.0f));
+                        lview.offset_x = al->offset_x;
+                        lview.offset_y = al->offset_y;
+                        lview.rotation_deg = al->rotation_deg;
+                        lview.scale_x = al->scale_x;
+                        lview.scale_y = al->scale_y;
+                        lview.width = al->width;
+                        lview.height = al->height;
+                        lview.visible = al->visible;
+                        lview.lock_alpha = al->lock_alpha;
+                        lview.lock_pixels = al->lock_pixels;
+                        lview.lock_position = al->lock_position;
+
+                        tpreview.active = al->is_text_layer;
+                        tpreview.doc_x = al->offset_x;
+                        tpreview.doc_y = al->offset_y;
+                        tpreview.doc_w = static_cast<float>(al->width);
+                        tpreview.doc_h = static_cast<float>(al->height);
+                        tpreview.editing = (custom_ui.get_right_panel_tab() == 4 ||
+                                            custom_ui.get_active_tool() == CustomUI::ActiveTool::Text);
+                    }
+                }
+                custom_ui.set_active_layer_view(lview);
+                custom_ui.set_text_caret_preview(tpreview);
             }
 
             custom_ui.begin_frame();

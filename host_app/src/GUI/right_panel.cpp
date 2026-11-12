@@ -121,15 +121,19 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
 
                 ImGui::PushID(static_cast<int>(u_idx));
 
+                bool uniform_changed = false;
                 switch (u.type) {
                 case ShaderLabUniform::Type::Float: {
                     ImGui::PushTextWrapPos(0.0f);
                     ImGui::TextUnformatted(u.label.c_str());
                     ImGui::PopTextWrapPos();
                     ImGui::SetNextItemWidth(-1.0f);
-                    ImGui::SliderFloat("##val", &u.float_val, u.min_val, u.max_val, "%.3f");
+                    if (ImGui::SliderFloat("##val", &u.float_val, u.min_val, u.max_val, "%.3f")) {
+                        uniform_changed = true;
+                    }
                     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
                         u.float_val = u.default_float;
+                        uniform_changed = true;
                     }
                     break;
                 }
@@ -138,16 +142,22 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
                     ImGui::TextUnformatted(u.label.c_str());
                     ImGui::PopTextWrapPos();
                     ImGui::SetNextItemWidth(-1.0f);
-                    ImGui::SliderInt("##val", &u.int_val, static_cast<int>(u.min_val), static_cast<int>(u.max_val));
+                    if (ImGui::SliderInt("##val", &u.int_val, static_cast<int>(u.min_val), static_cast<int>(u.max_val))) {
+                        uniform_changed = true;
+                    }
                     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
                         u.int_val = u.default_int;
+                        uniform_changed = true;
                     }
                     break;
                 }
                 case ShaderLabUniform::Type::Bool: {
-                    ImGui::Checkbox(u.label.c_str(), &u.bool_val);
+                    if (ImGui::Checkbox(u.label.c_str(), &u.bool_val)) {
+                        uniform_changed = true;
+                    }
                     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
                         u.bool_val = u.default_bool;
+                        uniform_changed = true;
                     }
                     break;
                 }
@@ -156,9 +166,12 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
                     ImGui::TextUnformatted(u.label.c_str());
                     ImGui::PopTextWrapPos();
                     ImGui::SetNextItemWidth(-1.0f);
-                    ImGui::ColorEdit3("##val", u.color_val);
+                    if (ImGui::ColorEdit3("##val", u.color_val)) {
+                        uniform_changed = true;
+                    }
                     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
                         for (int c = 0; c < 3; ++c) u.color_val[c] = u.default_color[c];
+                        uniform_changed = true;
                     }
                     break;
                 }
@@ -167,9 +180,12 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
                     ImGui::TextUnformatted(u.label.c_str());
                     ImGui::PopTextWrapPos();
                     ImGui::SetNextItemWidth(-1.0f);
-                    ImGui::ColorEdit4("##val", u.color_val);
+                    if (ImGui::ColorEdit4("##val", u.color_val)) {
+                        uniform_changed = true;
+                    }
                     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
                         for (int c = 0; c < 4; ++c) u.color_val[c] = u.default_color[c];
+                        uniform_changed = true;
                     }
                     break;
                 }
@@ -181,10 +197,15 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
                     if (!u.enum_items.empty()) {
                         std::vector<const char *> items;
                         for (const auto &item : u.enum_items) items.push_back(item.c_str());
-                        ImGui::Combo("##val", &u.enum_selected, items.data(), static_cast<int>(items.size()));
+                        if (ImGui::Combo("##val", &u.enum_selected, items.data(), static_cast<int>(items.size()))) {
+                            uniform_changed = true;
+                        }
                     }
                     break;
                 }
+                }
+                if (uniform_changed) {
+                    gui.mark_active_document_dirty();
                 }
 
                 if (!u.tooltip.empty() && ImGui::IsItemHovered()) {
@@ -419,7 +440,10 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
             bool has_effect = (gui.m_selected_effect_idx >= 0 && gui.m_selected_effect_idx < static_cast<int>(gui.m_effects.size()));
             if (!has_effect) ImGui::BeginDisabled();
             if (ImGui::Button("Reset Parameters to Default", ImVec2(-1.0f, bottom_btn_h))) {
-                if (has_effect) gui.m_effects[gui.m_selected_effect_idx].reset_uniforms();
+                if (has_effect) {
+                    gui.m_effects[gui.m_selected_effect_idx].reset_uniforms();
+                    gui.mark_active_document_dirty();
+                }
             }
             gui.register_dom_last_item("btn_reset_defaults", "Reset Parameters to Default", "button", false, has_effect);
             if (!has_effect) ImGui::EndDisabled();
