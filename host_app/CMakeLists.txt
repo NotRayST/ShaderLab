@@ -21,6 +21,20 @@ set(HOST_SOURCES
     src/erase_tool.cpp
     src/depth_manager.h
     src/depth_manager.cpp
+    src/layer_system.h
+    src/layer_system.cpp
+    src/crop_rotate_tool.h
+    src/crop_rotate_tool.cpp
+    src/raster_eraser.h
+    src/raster_eraser.cpp
+    src/project_lifecycle_ops.h
+    src/project_lifecycle_ops.cpp
+    src/upscale_manager.h
+    src/upscale_manager.cpp
+    src/text_tool.h
+    src/text_tool.cpp
+    src/hlsl_parser.h
+    src/hlsl_parser.cpp
     src/GUI/types.h
     src/GUI/tool_requirements.h
     src/GUI/tool_requirements.cpp
@@ -36,6 +50,12 @@ set(HOST_SOURCES
     src/GUI/left_panel.cpp
     src/GUI/right_panel.h
     src/GUI/right_panel.cpp
+    src/GUI/layers_panel.h
+    src/GUI/layers_panel.cpp
+    src/GUI/preferences_panel.h
+    src/GUI/preferences_panel.cpp
+    src/GUI/exit_modal.h
+    src/GUI/exit_modal.cpp
     src/GUI/canvas.h
     src/GUI/canvas.cpp
     src/GUI/status_bar.h
@@ -98,6 +118,10 @@ target_link_libraries(host_app PRIVATE
     d3d11
     dxgi
     d3dcompiler
+    dwrite
+    d2d1
+    windowscodecs
+    ole32
     user32
     shell32
     winmm

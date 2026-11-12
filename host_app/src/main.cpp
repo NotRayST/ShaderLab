@@ -6,7 +6,17 @@
 #include "viewport_controller.h"
 #include "erase_tool.h"
 #include "depth_manager.h"
+#include "layer_system.h"
+#include "crop_rotate_tool.h"
+#include "raster_eraser.h"
+#include "project_lifecycle_ops.h"
+#include "upscale_manager.h"
+#include "text_tool.h"
+#include "hlsl_parser.h"
 #include "GUI/gui_manager.h"
+#include "GUI/layers_panel.h"
+#include "GUI/preferences_panel.h"
+#include "GUI/exit_modal.h"
 #include "GUI/tool_requirements.h"
 
 using CustomUI = gui::GuiManager;
@@ -170,6 +180,8 @@ struct ViewportHookContext {
     SharedControlBlock *block = nullptr;
     CustomUI *custom_ui = nullptr;
     uint32_t *last_synced_xform_ver = nullptr;
+    bool *req_layer_undo = nullptr;
+    bool *req_layer_redo = nullptr;
 };
 
 static uint64_t g_last_fullscreen_toggle_ms = 0;
@@ -250,6 +262,28 @@ static bool on_viewport_input_hook(void *user_data, UINT msg, WPARAM wParam, LPA
         if (ctrl_down && !alt_down && wParam == VK_TAB) {
             if (!was_down && ctx->custom_ui) {
                 ctx->custom_ui->request_cycle_tab(shift_down ? -1 : 1);
+            }
+            return true;
+        }
+
+        // open preferences (ctrl+,)
+        if (ctrl_down && !shift_down && !alt_down && wParam == VK_OEM_COMMA) {
+            if (!was_down && ctx->custom_ui) {
+                ctx->custom_ui->select_right_panel_tab(5);
+            }
+            return true;
+        }
+
+        // undo / redo raster eraser strokes (ctrl+z / ctrl+y / ctrl+shift+z)
+        if (ctrl_down && !alt_down && wParam == 'Z' && !shift_down) {
+            if (!was_down && ctx->req_layer_undo) {
+                *ctx->req_layer_undo = true;
+            }
+            return true;
+        }
+        if (ctrl_down && !alt_down && ((wParam == 'Y' && !shift_down) || (wParam == 'Z' && shift_down))) {
+            if (!was_down && ctx->req_layer_redo) {
+                *ctx->req_layer_redo = true;
             }
             return true;
         }
@@ -477,13 +511,25 @@ static int run_app(int argc, wchar_t **argv) {
     std::wstring display_image_name;
     std::wstring current_image_path;
 
+    struct LayerPixelSnapshot {
+        uint32_t layer_id = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        std::vector<uint8_t> rgba;
+    };
+
     struct AppDocument {
         uint32_t id = 0;
         std::wstring file_path;
         std::wstring source_path;
+        std::wstring project_path;
+        std::wstring last_export_path;
         std::wstring display_name;
         LoadedImage image;
         LoadedImage original_image;
+        LayerStack layer_stack;
+        std::vector<LayerPixelSnapshot> layer_undo_stack;
+        std::vector<LayerPixelSnapshot> layer_redo_stack;
         float zoom = 1.0f;
         float pan_x = 0.0f;
         float pan_y = 0.0f;
@@ -514,6 +560,11 @@ static int run_app(int argc, wchar_t **argv) {
     SettleDetector settle_detector;
     CustomUI custom_ui;
     EffectPipeline pipeline;
+    LayerCompositor layer_compositor;
+    gui::AppPreferences prefs;
+    bool confirmed_exit = false;
+    bool req_layer_undo = false;
+    bool req_layer_redo = false;
 
     uint32_t last_synced_xform_ver = 0;
 
@@ -524,9 +575,46 @@ static int run_app(int argc, wchar_t **argv) {
     vp_ctx.block = control_block;
     vp_ctx.custom_ui = &custom_ui;
     vp_ctx.last_synced_xform_ver = &last_synced_xform_ver;
+    vp_ctx.req_layer_undo = &req_layer_undo;
+    vp_ctx.req_layer_redo = &req_layer_redo;
 
     custom_ui.initialize(gfx.get_hwnd(), gfx.get_device(), gfx.get_context());
-    const std::vector<ShaderLabEffect> default_effects = custom_ui.get_effects();
+    std::vector<ShaderLabEffect> default_effects = custom_ui.get_effects();
+    for (auto &fx : default_effects) {
+        fx.enabled = false;
+    }
+    custom_ui.set_effects(default_effects);
+
+    fs::path repo_root = fs::current_path();
+    if (exe_file_path[0] != L'\0') {
+        fs::path probe = fs::path(exe_file_path).parent_path();
+        for (int depth = 0; depth < 6 && !probe.empty(); ++depth) {
+            std::error_code ec;
+            if (fs::exists(probe / "tools" / "upscale" / "run_upscale.py", ec)) {
+                repo_root = probe;
+                break;
+            }
+            probe = probe.parent_path();
+        }
+    }
+    UpscaleManager::get().initialize(repo_root);
+    shaderlab::TextToolEngine::get().initialize();
+    layer_compositor.initialize(gfx.get_device());
+
+    gui::load_preferences_json(gfx.get_device(), prefs);
+    gui::apply_preferences_theme(prefs);
+    auto sync_prefs_to_renderers = [&]() {
+        blit.set_display_settings(prefs.checker_size, prefs.checker_col_a, prefs.checker_col_b, prefs.col_apron_bg);
+        gui::CheckerboardConfig cb_cfg;
+        cb_cfg.checker_size = prefs.checker_size;
+        for (int c = 0; c < 4; ++c) {
+            cb_cfg.checker_color_a[c] = prefs.checker_col_a[c];
+            cb_cfg.checker_color_b[c] = prefs.checker_col_b[c];
+        }
+        custom_ui.set_checkerboard_config(cb_cfg);
+    };
+    sync_prefs_to_renderers();
+
     clean_stale_workspace_on_startup();
     CustomUI::ViewportCallbacks ui_vp_cb;
     ui_vp_cb.is_panning = [](void *p) { return static_cast<ViewportHookContext *>(p)->controller->is_panning(); };
@@ -751,9 +839,23 @@ static int run_app(int argc, wchar_t **argv) {
             doc.zoom = viewport.get_transform().zoom;
             doc.pan_x = viewport.get_transform().pan_x;
             doc.pan_y = viewport.get_transform().pan_y;
+            doc.angle = viewport.get_transform().angle;
         } else {
-            viewport.set_pan(doc.pan_x, doc.pan_y);
-            viewport.set_zoom(doc.zoom);
+            ViewportTransform xf = viewport.get_transform();
+            xf.zoom = doc.zoom;
+            xf.pan_x = doc.pan_x;
+            xf.pan_y = doc.pan_y;
+            xf.angle = doc.angle;
+            viewport.set_transform(xf);
+        }
+        custom_ui.sync_viewport_angle(viewport.get_transform().angle);
+        custom_ui.get_crop_state().reset(active_image.width, active_image.height);
+        if (const auto *al = doc.layer_stack.active_layer(); al && al->is_text_layer) {
+            shaderlab::TextToolEngine::get().sync_settings_from_layer(*al);
+        }
+        if (control_block) {
+            wcsncpy_s(control_block->active_project_path, kMaxPathW, doc.project_path.c_str(), _TRUNCATE);
+            control_block->project_dirty = doc.is_dirty ? 1u : 0u;
         }
 
         control_block->view_image_width = active_image.width;
@@ -795,6 +897,14 @@ static int run_app(int argc, wchar_t **argv) {
         }
         doc.image = std::move(loaded);
         doc.original_image = doc.image;
+        if (doc.image.texture && doc.layer_stack.layers.empty()) {
+            std::vector<uint8_t> bg_rgba;
+            uint32_t bg_w = 0, bg_h = 0;
+            if (lifecycle_ops::readback_texture_rgba(gfx.get_device(), gfx.get_context(), doc.image.texture.Get(), bg_rgba, bg_w, bg_h, false)) {
+                doc.layer_stack.clear();
+                doc.layer_stack.add_layer_from_rgba("Background", bg_w, bg_h, bg_rgba.data(), bg_rgba.size(), gfx.get_device(), true);
+            }
+        }
         doc.effects = default_effects;
         doc.selected_effect_idx = 0;
         doc.effects_initialized = true;
@@ -936,6 +1046,11 @@ static int run_app(int argc, wchar_t **argv) {
         copy.id = next_doc_id++;
         copy.display_name = copy.display_name + L" (Copy)";
         copy.source_path.clear();
+        copy.project_path.clear();
+        for (auto &layer : copy.layer_stack.layers) {
+            layer.reset_gpu();
+            layer.sync_to_gpu(gfx.get_device(), gfx.get_context());
+        }
         std::wstring old_key = app_documents[idx].erase_state.stage_dir_key.empty()
             ? doc_stage_dir_key(app_documents[idx].id)
             : app_documents[idx].erase_state.stage_dir_key;
@@ -952,6 +1067,389 @@ static int run_app(int argc, wchar_t **argv) {
         restore_active_doc_state(active_doc_idx, false);
         custom_ui.select_tab(active_doc_idx);
         sync_tabs_to_ui();
+    };
+
+    auto update_doc_layer0_from_image = [&](AppDocument &tdoc, const LoadedImage &img) {
+        if (!img.texture) return;
+        std::vector<uint8_t> rgba;
+        uint32_t w = 0, h = 0;
+        if (!lifecycle_ops::readback_texture_rgba(gfx.get_device(), gfx.get_context(), img.texture.Get(), rgba, w, h, false)) {
+            return;
+        }
+        if (tdoc.layer_stack.layers.empty()) {
+            tdoc.layer_stack.add_layer_from_rgba("Background", w, h, rgba.data(), rgba.size(), gfx.get_device(), true);
+        } else {
+            auto &base = tdoc.layer_stack.layers.front();
+            base.width = w;
+            base.height = h;
+            base.rgba_pixels = std::move(rgba);
+            base.mark_dirty();
+            base.sync_to_gpu(gfx.get_device(), gfx.get_context());
+            tdoc.layer_stack.doc_width = w;
+            tdoc.layer_stack.doc_height = h;
+        }
+    };
+
+    auto sync_active_text_layer_settings = [&]() {
+        if (active_doc_idx < 0 || active_doc_idx >= static_cast<int>(app_documents.size())) return;
+        if (const auto *al = app_documents[active_doc_idx].layer_stack.active_layer(); al && al->is_text_layer) {
+            shaderlab::TextToolEngine::get().sync_settings_from_layer(*al);
+        }
+    };
+
+    auto render_doc_composite_srv = [&](AppDocument &tdoc, float frame_dt) -> ID3D11ShaderResourceView * {
+        ID3D11ShaderResourceView *base_srv = tdoc.image.srv.Get();
+        if (!tdoc.layer_stack.layers.empty() && tdoc.layer_stack.doc_width > 0 && tdoc.layer_stack.doc_height > 0) {
+            if (auto *comp = layer_compositor.composite_stack(
+                    gfx.get_context(),
+                    tdoc.layer_stack.doc_width,
+                    tdoc.layer_stack.doc_height,
+                    tdoc.layer_stack.layers)) {
+                base_srv = comp;
+            }
+        }
+        if (!base_srv || custom_ui.is_master_bypass_active()) {
+            return base_srv;
+        }
+        const uint32_t w = tdoc.layer_stack.doc_width > 0 ? tdoc.layer_stack.doc_width : tdoc.image.width;
+        const uint32_t h = tdoc.layer_stack.doc_height > 0 ? tdoc.layer_stack.doc_height : tdoc.image.height;
+        const auto &fx_list = (&tdoc == (active_doc_idx >= 0 ? &app_documents[active_doc_idx] : nullptr))
+            ? custom_ui.get_effects()
+            : tdoc.effects;
+        return pipeline.process(
+            gfx.get_context(),
+            base_srv,
+            w,
+            h,
+            fx_list,
+            tdoc.image.has_depth ? tdoc.image.depth_srv.Get() : nullptr,
+            frame_dt
+        );
+    };
+
+    auto do_save_project = [&](int doc_idx, bool force_save_as, const std::wstring &explicit_path = L"") -> bool {
+        if (doc_idx < 0 || doc_idx >= static_cast<int>(app_documents.size())) return false;
+        save_active_doc_state(active_doc_idx);
+        auto &doc = app_documents[doc_idx];
+
+        project_file::ViewportState vs;
+        vs.zoom = doc.zoom;
+        vs.angle = doc.angle;
+        vs.pan[0] = doc.pan_x;
+        vs.pan[1] = doc.pan_y;
+        vs.is_fullscreen = gfx.is_fullscreen();
+        vs.lock_pan = viewport.is_lock_pan();
+        vs.lock_zoom = viewport.is_lock_zoom();
+        vs.lock_rot = viewport.is_lock_rotate();
+
+        project_file::DepthState ds;
+        ds.has_depth = doc.image.has_depth;
+        ds.far_plane = doc.image.far_plane;
+
+        std::vector<project_file::SerializedLayerEntry> serialized_layers;
+        serialized_layers.reserve(doc.layer_stack.layers.size());
+        for (const auto &layer : doc.layer_stack.layers) {
+            project_file::SerializedLayerEntry entry;
+            entry.id = layer.id;
+            entry.name = layer.name;
+            entry.type = layer.is_text_layer ? 1 : 0;
+            entry.visible = layer.visible;
+            entry.blend_mode = static_cast<int>(layer.blend_mode);
+            entry.opacity = layer.opacity;
+            entry.fill_opacity = layer.fill_opacity;
+            entry.offset_x = layer.offset_x;
+            entry.offset_y = layer.offset_y;
+            entry.rotation_deg = layer.rotation_deg;
+            entry.scale_x = layer.scale_x;
+            entry.scale_y = layer.scale_y;
+            entry.lock_alpha = layer.lock_alpha;
+            entry.lock_pixels = layer.lock_pixels;
+            entry.lock_position = layer.lock_position;
+            entry.width = layer.width;
+            entry.height = layer.height;
+            if (!layer.rgba_pixels.empty() && layer.width > 0 && layer.height > 0) {
+                lifecycle_ops::encode_rgba_to_png_bytes(layer.rgba_pixels.data(), layer.width, layer.height, entry.png_bytes);
+            }
+            if (layer.is_text_layer) {
+                entry.text_utf8 = wide_to_utf8(layer.text_content);
+                entry.font_family = wide_to_utf8(layer.font_family);
+                entry.font_size = layer.font_size;
+                for (int c = 0; c < 4; ++c) {
+                    entry.text_color[c] = layer.text_color[c];
+                    entry.stroke_color[c] = layer.stroke_color[c];
+                    entry.shadow_color[c] = layer.shadow_color[c];
+                }
+                entry.text_align = layer.text_align;
+                entry.font_bold = layer.font_bold;
+                entry.font_italic = layer.font_italic;
+                entry.font_underline = layer.font_underline;
+                entry.font_strikethrough = layer.font_strikethrough;
+                entry.line_spacing = layer.line_spacing;
+                entry.tracking = layer.tracking;
+                entry.stroke_width = layer.stroke_width;
+                entry.shadow_enabled = layer.shadow_enabled;
+                entry.shadow_offset_x = layer.shadow_offset_x;
+                entry.shadow_offset_y = layer.shadow_offset_y;
+                entry.shadow_blur = layer.shadow_blur;
+            }
+            serialized_layers.push_back(std::move(entry));
+        }
+
+        std::wstring proj_path = !explicit_path.empty() ? explicit_path : doc.project_path;
+        bool use_force_as = explicit_path.empty() && (force_save_as || proj_path.empty());
+        std::wstring src_img = (!doc.file_path.empty() && fs::exists(doc.file_path)) ? doc.file_path : doc.source_path;
+        std::wstring stem = fs::path(doc.display_name.empty() ? L"ShaderLab_Project" : doc.display_name).stem().wstring();
+        const uint32_t canvas_w = doc.layer_stack.doc_width > 0 ? doc.layer_stack.doc_width : doc.image.width;
+        const uint32_t canvas_h = doc.layer_stack.doc_height > 0 ? doc.layer_stack.doc_height : doc.image.height;
+
+        std::wstring err;
+        if (!lifecycle_ops::execute_save_project_archive(
+                gfx.get_hwnd(),
+                proj_path,
+                use_force_as,
+                src_img,
+                doc.effects,
+                vs,
+                ds,
+                serialized_layers,
+                canvas_w,
+                canvas_h,
+                doc.layer_stack.active_index,
+                stem,
+                err)) {
+            if (!err.empty()) {
+                set_host_status(control_block, L"Save failed: " + err);
+            }
+            return false;
+        }
+
+        doc.project_path = proj_path;
+        doc.is_dirty = false;
+        if (control_block && doc_idx == active_doc_idx) {
+            wcsncpy_s(control_block->active_project_path, kMaxPathW, proj_path.c_str(), _TRUNCATE);
+            control_block->project_dirty = 0;
+            control_block->active_project_version++;
+        }
+        sync_tabs_to_ui();
+        set_host_status(control_block, L"Saved project: " + fs::path(proj_path).filename().wstring());
+        return true;
+    };
+
+    auto do_export_image = [&](int doc_idx, bool force_export_as, const std::wstring &explicit_path = L"") -> bool {
+        if (doc_idx < 0 || doc_idx >= static_cast<int>(app_documents.size())) return false;
+        auto &doc = app_documents[doc_idx];
+        ID3D11ShaderResourceView *final_srv = render_doc_composite_srv(doc, 1.0f / 60.0f);
+        if (!final_srv) return false;
+        ComPtr<ID3D11Resource> res;
+        final_srv->GetResource(&res);
+        ComPtr<ID3D11Texture2D> tex;
+        if (FAILED(res.As(&tex)) || !tex) return false;
+
+        std::wstring out_path = !explicit_path.empty() ? explicit_path : doc.last_export_path;
+        bool use_force_as = explicit_path.empty() && (force_export_as || out_path.empty());
+        std::wstring stem = fs::path(doc.display_name.empty() ? L"ShaderLab_Export" : doc.display_name).stem().wstring();
+        std::wstring err;
+        if (!lifecycle_ops::execute_export_texture(
+                gfx.get_hwnd(),
+                gfx.get_device(),
+                gfx.get_context(),
+                tex.Get(),
+                out_path,
+                use_force_as,
+                prefs.default_export_format,
+                prefs.export_jpeg_quality,
+                stem,
+                err)) {
+            if (!err.empty()) {
+                set_host_status(control_block, L"Export failed: " + err);
+            }
+            return false;
+        }
+
+        doc.last_export_path = out_path;
+        set_host_status(control_block, L"Exported: " + fs::path(out_path).filename().wstring());
+        return true;
+    };
+
+    struct CloseHookCtx {
+        bool *confirmed_exit = nullptr;
+        std::vector<AppDocument> *docs = nullptr;
+        int *active_idx = nullptr;
+        CustomUI *ui = nullptr;
+        std::function<void(int)> save_active_fn;
+    } close_hook_ctx{ &confirmed_exit, &app_documents, &active_doc_idx, &custom_ui, save_active_doc_state };
+
+    gfx.set_close_request_hook([](void *user) -> bool {
+        auto *ctx = static_cast<CloseHookCtx *>(user);
+        if (!ctx || (ctx->confirmed_exit && *ctx->confirmed_exit)) {
+            return false;
+        }
+        if (ctx->save_active_fn && ctx->active_idx) {
+            ctx->save_active_fn(*ctx->active_idx);
+        }
+        bool any_dirty = false;
+        if (ctx->docs) {
+            for (const auto &d : *ctx->docs) {
+                if (d.is_dirty) {
+                    any_dirty = true;
+                    break;
+                }
+            }
+        }
+        if (any_dirty && ctx->ui) {
+            ctx->ui->open_unsaved_exit_modal();
+            return true;
+        }
+        return false;
+    }, &close_hook_ctx);
+
+    custom_ui.on_document_dirty = [&]() {
+        if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+            if (!app_documents[active_doc_idx].is_dirty) {
+                app_documents[active_doc_idx].is_dirty = true;
+                if (control_block) control_block->project_dirty = 1;
+                sync_tabs_to_ui();
+            }
+        }
+    };
+
+    custom_ui.render_exit_modal_fn = [&]() {
+        if (!custom_ui.is_unsaved_exit_modal_open()) return;
+        gui::ExitModalDecision dec = gui::render_unsaved_exit_modal(
+            custom_ui.m_show_unsaved_exit_modal,
+            custom_ui.m_unsaved_exit_modal_open,
+            custom_ui.get_tabs(),
+            &custom_ui.get_dom_mut()
+        );
+        if (dec == gui::ExitModalDecision::SaveAndExit) {
+            custom_ui.m_req_save_and_exit = true;
+        } else if (dec == gui::ExitModalDecision::DontSaveAndExit) {
+            custom_ui.m_req_force_exit_without_saving = true;
+        }
+    };
+
+    custom_ui.render_prefs_tab_fn = [&]() {
+        gui::render_preferences_tab(gfx.get_hwnd(), gfx.get_device(), prefs, &custom_ui.get_dom_mut(), [&]() {
+            gui::apply_preferences_theme(prefs);
+            sync_prefs_to_renderers();
+            gui::save_preferences_json(prefs);
+        });
+    };
+
+    gui::LayerPanelCallbacks layer_panel_cb;
+    layer_panel_cb.owner_hwnd = gfx.get_hwnd();
+    layer_panel_cb.on_layers_changed = [&]() {
+        if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+            app_documents[active_doc_idx].is_dirty = true;
+            sync_active_text_layer_settings();
+            sync_tabs_to_ui();
+        }
+    };
+    layer_panel_cb.on_select_text_layer = [&](int /*layer_idx*/) {
+        sync_active_text_layer_settings();
+    };
+    layer_panel_cb.on_import_clicked = [&]() {
+        if (active_doc_idx < 0 || active_doc_idx >= static_cast<int>(app_documents.size())) return;
+        std::wstring img_p;
+        if (gui::open_file_dialog(
+                gfx.get_hwnd(),
+                L"Image Files (*.png;*.jpg;*.jpeg;*.bmp;*.tga)\0*.png;*.jpg;*.jpeg;*.bmp;*.tga\0All Files (*.*)\0*.*\0",
+                img_p)) {
+            std::wstring err;
+            if (app_documents[active_doc_idx].layer_stack.import_image_layer(img_p, gfx.get_device(), &err) >= 0) {
+                app_documents[active_doc_idx].is_dirty = true;
+                sync_tabs_to_ui();
+            } else if (!err.empty()) {
+                set_host_status(control_block, L"Import layer failed: " + err);
+            }
+        }
+    };
+
+    custom_ui.render_layers_panel_fn = [&]() {
+        if (active_doc_idx < 0 || active_doc_idx >= static_cast<int>(app_documents.size())) {
+            ImGui::TextDisabled("Open an image to view and edit layers.");
+            return;
+        }
+        gui::render_layers_panel(
+            custom_ui,
+            app_documents[active_doc_idx].layer_stack,
+            layer_compositor,
+            gfx.get_device(),
+            gfx.get_context(),
+            &layer_panel_cb
+        );
+    };
+
+    custom_ui.render_upscale_tab_fn = [&]() {
+        UpscaleManager::get().render_upscale_tab(
+            custom_ui,
+            active_image.width > 0 && active_image.height > 0,
+            active_image.width,
+            active_image.height,
+            active_image.has_depth,
+            false
+        );
+    };
+
+    custom_ui.render_text_tab_fn = [&]() {
+        bool active_is_text = false;
+        if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+            if (const auto *al = app_documents[active_doc_idx].layer_stack.active_layer()) {
+                active_is_text = al->is_text_layer;
+            }
+        }
+        shaderlab::TextToolEngine::get().render_text_tab(
+            custom_ui,
+            active_image.width > 0 && active_image.height > 0,
+            active_is_text,
+            false
+        );
+    };
+
+    custom_ui.on_get_active_layer_pixels = [&]() -> gui::LayerPixelView {
+        gui::LayerPixelView v;
+        if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+            if (auto *al = app_documents[active_doc_idx].layer_stack.active_layer()) {
+                v.rgba_pixels = &al->rgba_pixels;
+                v.width = al->width;
+                v.height = al->height;
+                v.offset_x = al->offset_x;
+                v.offset_y = al->offset_y;
+                v.lock_alpha = al->lock_alpha;
+                v.lock_pixels = al->lock_pixels;
+                v.is_text_layer = al->is_text_layer;
+            }
+        }
+        return v;
+    };
+
+    custom_ui.on_commit_layer_pixels = [&](int /*dx*/, int /*dy*/, int /*dw*/, int /*dh*/) {
+        if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+            auto &doc = app_documents[active_doc_idx];
+            if (auto *al = doc.layer_stack.active_layer()) {
+                al->mark_dirty();
+                al->sync_to_gpu(gfx.get_device(), gfx.get_context());
+                doc.is_dirty = true;
+                sync_tabs_to_ui();
+            }
+        }
+    };
+
+    custom_ui.on_push_layer_pixel_undo = [&](const std::vector<uint8_t> &before_rgba) {
+        if (active_doc_idx < 0 || active_doc_idx >= static_cast<int>(app_documents.size())) return;
+        auto &doc = app_documents[active_doc_idx];
+        auto *al = doc.layer_stack.active_layer();
+        if (!al || before_rgba.empty()) return;
+        if (doc.layer_undo_stack.size() >= 25) {
+            doc.layer_undo_stack.erase(doc.layer_undo_stack.begin());
+        }
+        doc.layer_undo_stack.push_back({ al->id, al->width, al->height, before_rgba });
+        doc.layer_redo_stack.clear();
+    };
+
+    custom_ui.on_text_canvas_click = [&](float doc_x, float doc_y) {
+        shaderlab::TextToolEngine::get().on_canvas_click(doc_x, doc_y);
+        custom_ui.select_right_panel_tab(4);
     };
 
     // check if launched with image or project file arguments
@@ -1018,19 +1516,6 @@ static int run_app(int argc, wchar_t **argv) {
             if (msg.message == WM_QUIT) {
                 running = false;
                 break;
-            }
-            if (msg.message == WM_CLOSE && msg.hwnd == gfx.get_hwnd()) {
-                save_active_doc_state(active_doc_idx);
-                bool any_dirty = false;
-                for (const auto &d : app_documents) {
-                    if (d.is_dirty) { any_dirty = true; break; }
-                }
-                if (any_dirty) {
-                    int res = MessageBoxW(gfx.get_hwnd(), L"You have documents with unsaved changes.\n\nDo you want to discard changes and exit?", L"ShaderLab - Exit Confirmation", MB_YESNO | MB_ICONWARNING);
-                    if (res != IDYES) {
-                        continue; // ignore close
-                    }
-                }
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -1316,10 +1801,80 @@ static int run_app(int argc, wchar_t **argv) {
 
                         std::wstring out_img_path, out_preset_path, load_err;
                         project_file::ProjectManifest manifest;
-                        if (project_file::load_project(proj_src_path, proj_ws.wstring(), out_img_path, out_preset_path, manifest, load_err)) {
+                        std::vector<project_file::SerializedLayerEntry> out_layers;
+                        if (project_file::load_project_v2(proj_src_path, proj_ws.wstring(), out_img_path, out_preset_path, manifest, out_layers, load_err)) {
                             LoadedImage new_preview;
                             if (ImageLoader::load_from_file(gfx.get_device(), out_img_path.c_str(), new_preview)) {
                                 add_or_open_document(out_img_path, std::move(new_preview), true, alloc_id, proj_src_path);
+                                if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                                    auto &doc = app_documents[active_doc_idx];
+                                    doc.project_path = fs::absolute(proj_src_path).wstring();
+                                    if (!out_layers.empty()) {
+                                        doc.layer_stack.clear();
+                                        doc.layer_stack.doc_width = manifest.image_width > 0 ? manifest.image_width : doc.image.width;
+                                        doc.layer_stack.doc_height = manifest.image_height > 0 ? manifest.image_height : doc.image.height;
+                                        for (const auto &se : out_layers) {
+                                            DocumentLayer dl;
+                                            dl.id = se.id > 0 ? se.id : doc.layer_stack.next_layer_id++;
+                                            if (se.id >= doc.layer_stack.next_layer_id) doc.layer_stack.next_layer_id = se.id + 1;
+                                            dl.name = se.name;
+                                            dl.visible = se.visible;
+                                            dl.blend_mode = static_cast<gui::BlendMode>(std::clamp(se.blend_mode, 0, static_cast<int>(gui::BlendMode::Count) - 1));
+                                            dl.opacity = se.opacity;
+                                            dl.fill_opacity = se.fill_opacity;
+                                            dl.offset_x = se.offset_x;
+                                            dl.offset_y = se.offset_y;
+                                            dl.rotation_deg = se.rotation_deg;
+                                            dl.scale_x = se.scale_x;
+                                            dl.scale_y = se.scale_y;
+                                            dl.lock_alpha = se.lock_alpha;
+                                            dl.lock_pixels = se.lock_pixels;
+                                            dl.lock_position = se.lock_position;
+                                            dl.is_text_layer = (se.type == 1);
+                                            if (!se.png_bytes.empty()) {
+                                                lifecycle_ops::decode_png_bytes_to_rgba(se.png_bytes, dl.rgba_pixels, dl.width, dl.height);
+                                            }
+                                            if (dl.width == 0 || dl.height == 0) {
+                                                dl.width = se.width > 0 ? se.width : doc.layer_stack.doc_width;
+                                                dl.height = se.height > 0 ? se.height : doc.layer_stack.doc_height;
+                                                dl.rgba_pixels.assign(static_cast<size_t>(dl.width) * dl.height * 4, 0);
+                                            }
+                                            if (dl.is_text_layer) {
+                                                dl.text_content = utf8_to_wide(se.text_utf8);
+                                                dl.font_family = utf8_to_wide(se.font_family);
+                                                dl.font_size = se.font_size;
+                                                for (int c = 0; c < 4; ++c) {
+                                                    dl.text_color[c] = se.text_color[c];
+                                                    dl.stroke_color[c] = se.stroke_color[c];
+                                                    dl.shadow_color[c] = se.shadow_color[c];
+                                                }
+                                                dl.text_align = se.text_align;
+                                                dl.font_bold = se.font_bold;
+                                                dl.font_italic = se.font_italic;
+                                                dl.font_underline = se.font_underline;
+                                                dl.font_strikethrough = se.font_strikethrough;
+                                                dl.line_spacing = se.line_spacing;
+                                                dl.tracking = se.tracking;
+                                                dl.stroke_width = se.stroke_width;
+                                                dl.shadow_enabled = se.shadow_enabled;
+                                                dl.shadow_offset_x = se.shadow_offset_x;
+                                                dl.shadow_offset_y = se.shadow_offset_y;
+                                                dl.shadow_blur = se.shadow_blur;
+                                            }
+                                            dl.mark_dirty();
+                                            dl.sync_to_gpu(gfx.get_device(), gfx.get_context());
+                                            doc.layer_stack.layers.push_back(std::move(dl));
+                                        }
+                                        if (!doc.layer_stack.layers.empty()) {
+                                            doc.layer_stack.active_index = std::clamp(manifest.active_layer_index, 0, static_cast<int>(doc.layer_stack.layers.size()) - 1);
+                                        }
+                                        sync_active_text_layer_settings();
+                                    }
+                                    if (!out_preset_path.empty() && fs::exists(out_preset_path)) {
+                                        lifecycle_ops::load_preset_ini_file(out_preset_path, doc.effects);
+                                        custom_ui.set_effects(doc.effects);
+                                    }
+                                }
                                 if (manifest.depth.has_depth && manifest.depth.far_plane > 0.0f) {
                                     active_image.far_plane = manifest.depth.far_plane;
                                     if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
@@ -1384,6 +1939,7 @@ static int run_app(int argc, wchar_t **argv) {
                         if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
                             app_documents[active_doc_idx].image = active_image;
                             app_documents[active_doc_idx].is_dirty = true;
+                            update_doc_layer0_from_image(app_documents[active_doc_idx], active_image);
                         }
                         sync_tabs_to_ui();
                         control_block->view_image_width = active_image.width;
@@ -2001,7 +2557,418 @@ static int run_app(int argc, wchar_t **argv) {
 
             std::wstring add_shader_p;
             if (custom_ui.pop_add_shader_request(add_shader_p)) {
-                // Future shader load hook
+                ShaderLabEffect new_fx;
+                std::string compile_err;
+                const uint32_t target_w = active_image.width > 0 ? active_image.width : 1280u;
+                const uint32_t target_h = active_image.height > 0 ? active_image.height : 720u;
+                if (pipeline.load_and_compile_shader(gfx.get_device(), add_shader_p, target_w, target_h, new_fx, compile_err)) {
+                    auto fx_list = custom_ui.get_effects();
+                    fx_list.push_back(std::move(new_fx));
+                    custom_ui.set_effects(fx_list);
+                    custom_ui.set_selected_effect_idx(static_cast<int>(fx_list.size()) - 1);
+                    custom_ui.select_right_panel_tab(0);
+                    if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                        app_documents[active_doc_idx].effects = fx_list;
+                        app_documents[active_doc_idx].is_dirty = true;
+                        sync_tabs_to_ui();
+                    }
+                    set_host_status(control_block, L"Loaded shader: " + fs::path(add_shader_p).filename().wstring());
+                } else {
+                    set_host_status(control_block, L"Shader compile error: " + utf8_to_wide(compile_err));
+                }
+            }
+
+            // Lifecycle: Save / Save As / Export / Export As / Exit / Preferences / Autosave
+            {
+                static uint32_t s_last_save_proj = 0;
+                static uint32_t s_last_save_proj_as = 0;
+                static uint32_t s_last_export_img = 0;
+                static uint32_t s_last_export_img_as = 0;
+                static auto s_last_autosave_tp = std::chrono::steady_clock::now();
+
+                std::wstring req_path;
+                if (custom_ui.pop_save_project_request() ||
+                    (control_block && control_block->request_save_project != s_last_save_proj)) {
+                    if (control_block) s_last_save_proj = control_block->request_save_project;
+                    do_save_project(active_doc_idx, false);
+                }
+                if (custom_ui.pop_save_project_as_request(req_path) ||
+                    (control_block && control_block->request_save_project_as != s_last_save_proj_as)) {
+                    if (control_block) s_last_save_proj_as = control_block->request_save_project_as;
+                    do_save_project(active_doc_idx, true, req_path);
+                }
+                if (custom_ui.pop_export_image_request() ||
+                    (control_block && control_block->request_export_image != s_last_export_img)) {
+                    if (control_block) s_last_export_img = control_block->request_export_image;
+                    do_export_image(active_doc_idx, false);
+                }
+                if (custom_ui.pop_export_image_as_request(req_path) ||
+                    (control_block && control_block->request_export_image_as != s_last_export_img_as)) {
+                    if (control_block) s_last_export_img_as = control_block->request_export_image_as;
+                    do_export_image(active_doc_idx, true, req_path);
+                }
+                if (custom_ui.pop_open_prefs_request()) {
+                    custom_ui.select_right_panel_tab(5);
+                }
+                if (custom_ui.pop_save_and_exit_request()) {
+                    bool all_saved = true;
+                    save_active_doc_state(active_doc_idx);
+                    for (int di = 0; di < static_cast<int>(app_documents.size()); ++di) {
+                        if (app_documents[di].is_dirty) {
+                            if (!do_save_project(di, false)) {
+                                all_saved = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (all_saved) {
+                        confirmed_exit = true;
+                        PostMessageW(gfx.get_hwnd(), WM_CLOSE, 0, 0);
+                    }
+                }
+                if (custom_ui.pop_force_exit_without_saving_request()) {
+                    confirmed_exit = true;
+                    PostMessageW(gfx.get_hwnd(), WM_CLOSE, 0, 0);
+                }
+                if (prefs.autosave_interval_min > 0 && active_doc_idx >= 0 &&
+                    active_doc_idx < static_cast<int>(app_documents.size())) {
+                    auto elapsed_min = std::chrono::duration_cast<std::chrono::minutes>(now - s_last_autosave_tp).count();
+                    if (elapsed_min >= prefs.autosave_interval_min) {
+                        s_last_autosave_tp = now;
+                        if (app_documents[active_doc_idx].is_dirty && !app_documents[active_doc_idx].project_path.empty()) {
+                            do_save_project(active_doc_idx, false);
+                        }
+                    }
+                }
+            }
+
+            // Sync active layer status & viewport angle to UI
+            custom_ui.sync_viewport_angle(viewport.get_transform().angle);
+            {
+                gui::LayerStatusView lview;
+                gui::TextCaretPreview tpreview;
+                if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    const auto &stack = app_documents[active_doc_idx].layer_stack;
+                    if (const auto *al = stack.active_layer()) {
+                        lview.valid = true;
+                        lview.active_index = stack.active_index;
+                        lview.count = static_cast<int>(stack.layers.size());
+                        lview.layer_name = al->name;
+                        lview.blend_mode_name = blend_mode_name(al->blend_mode);
+                        lview.opacity_pct = static_cast<int>(std::lround(al->opacity * 100.0f));
+                        lview.fill_pct = static_cast<int>(std::lround(al->fill_opacity * 100.0f));
+                        lview.offset_x = al->offset_x;
+                        lview.offset_y = al->offset_y;
+                        lview.rotation_deg = al->rotation_deg;
+                        lview.scale_x = al->scale_x;
+                        lview.scale_y = al->scale_y;
+                        lview.width = al->width;
+                        lview.height = al->height;
+                        lview.visible = al->visible;
+                        lview.lock_alpha = al->lock_alpha;
+                        lview.lock_pixels = al->lock_pixels;
+                        lview.lock_position = al->lock_position;
+
+                        tpreview.active = al->is_text_layer;
+                        tpreview.doc_x = al->offset_x;
+                        tpreview.doc_y = al->offset_y;
+                        tpreview.doc_w = static_cast<float>(al->width);
+                        tpreview.doc_h = static_cast<float>(al->height);
+                        tpreview.editing = (custom_ui.get_right_panel_tab() == 4 ||
+                                            custom_ui.get_active_tool() == CustomUI::ActiveTool::Text);
+                    }
+                }
+                custom_ui.set_active_layer_view(lview);
+                custom_ui.set_text_caret_preview(tpreview);
+            }
+
+            // Canvas Tools: Rotate & Horizon / Flip / Move / Raster Undo-Redo / Crop
+            {
+                float req_angle = 0.0f;
+                bool req_constrain = false;
+                if (custom_ui.pop_rotate_angle_request(req_angle, req_constrain)) {
+                    ViewportTransform xf = viewport.get_transform();
+                    xf.angle = HorizonAlignState::normalize_angle_360(req_angle);
+                    if (req_constrain && active_image.width > 0 && active_image.height > 0) {
+                        const float min_scale = HorizonAlignState::compute_constrain_zoom_scale(
+                            active_image.width, active_image.height, req_angle);
+                        if (xf.zoom < min_scale) {
+                            xf.zoom = min_scale;
+                        }
+                    }
+                    viewport.set_transform(xf);
+                    if (control_block) {
+                        viewport.sync_to_block(control_block);
+                        last_synced_xform_ver = control_block->view_transform_version;
+                    }
+                }
+
+                bool flip_h = custom_ui.pop_flip_horizontal_request();
+                bool flip_v = custom_ui.pop_flip_vertical_request();
+                if ((flip_h || flip_v) && active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    auto &doc = app_documents[active_doc_idx];
+                    if (auto *al = doc.layer_stack.active_layer();
+                        al && !al->lock_pixels && al->width > 0 && al->height > 0 &&
+                        al->rgba_pixels.size() == static_cast<size_t>(al->width) * al->height * 4) {
+                        const uint32_t lw = al->width;
+                        const uint32_t lh = al->height;
+                        std::vector<uint8_t> flipped(al->rgba_pixels.size());
+                        for (uint32_t y = 0; y < lh; ++y) {
+                            const uint32_t sy = flip_v ? (lh - 1 - y) : y;
+                            for (uint32_t x = 0; x < lw; ++x) {
+                                const uint32_t sx = flip_h ? (lw - 1 - x) : x;
+                                const size_t src_i = (static_cast<size_t>(sy) * lw + sx) * 4;
+                                const size_t dst_i = (static_cast<size_t>(y) * lw + x) * 4;
+                                std::memcpy(&flipped[dst_i], &al->rgba_pixels[src_i], 4);
+                            }
+                        }
+                        al->rgba_pixels = std::move(flipped);
+                        al->mark_dirty();
+                        al->sync_to_gpu(gfx.get_device(), gfx.get_context());
+                        doc.is_dirty = true;
+                        sync_tabs_to_ui();
+                    }
+                }
+
+                float mdx = 0.0f, mdy = 0.0f;
+                if (custom_ui.pop_move_delta_request(mdx, mdy) &&
+                    active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    auto &doc = app_documents[active_doc_idx];
+                    if (auto *al = doc.layer_stack.active_layer(); al && !al->lock_position) {
+                        al->offset_x += mdx;
+                        al->offset_y += mdy;
+                        doc.is_dirty = true;
+                        sync_tabs_to_ui();
+                    }
+                }
+
+                float abs_ox = 0.0f, abs_oy = 0.0f;
+                if (custom_ui.pop_set_layer_offset_request(abs_ox, abs_oy) &&
+                    active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    auto &doc = app_documents[active_doc_idx];
+                    if (auto *al = doc.layer_stack.active_layer(); al && !al->lock_position) {
+                        al->offset_x = abs_ox;
+                        al->offset_y = abs_oy;
+                        doc.is_dirty = true;
+                        sync_tabs_to_ui();
+                    }
+                }
+
+                if (custom_ui.pop_center_layer_request() &&
+                    active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    auto &doc = app_documents[active_doc_idx];
+                    if (auto *al = doc.layer_stack.active_layer(); al && !al->lock_position) {
+                        al->offset_x = (static_cast<float>(doc.layer_stack.doc_width) - static_cast<float>(al->width)) * 0.5f;
+                        al->offset_y = (static_cast<float>(doc.layer_stack.doc_height) - static_cast<float>(al->height)) * 0.5f;
+                        doc.is_dirty = true;
+                        sync_tabs_to_ui();
+                    }
+                }
+
+                if (req_layer_undo) {
+                    req_layer_undo = false;
+                    if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                        auto &doc = app_documents[active_doc_idx];
+                        if (!doc.layer_undo_stack.empty()) {
+                            auto snap = std::move(doc.layer_undo_stack.back());
+                            doc.layer_undo_stack.pop_back();
+                            for (auto &layer : doc.layer_stack.layers) {
+                                if (layer.id == snap.layer_id && layer.width == snap.width && layer.height == snap.height) {
+                                    doc.layer_redo_stack.push_back({ layer.id, layer.width, layer.height, layer.rgba_pixels });
+                                    layer.rgba_pixels = std::move(snap.rgba);
+                                    layer.mark_dirty();
+                                    layer.sync_to_gpu(gfx.get_device(), gfx.get_context());
+                                    doc.is_dirty = true;
+                                    sync_tabs_to_ui();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (req_layer_redo) {
+                    req_layer_redo = false;
+                    if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                        auto &doc = app_documents[active_doc_idx];
+                        if (!doc.layer_redo_stack.empty()) {
+                            auto snap = std::move(doc.layer_redo_stack.back());
+                            doc.layer_redo_stack.pop_back();
+                            for (auto &layer : doc.layer_stack.layers) {
+                                if (layer.id == snap.layer_id && layer.width == snap.width && layer.height == snap.height) {
+                                    doc.layer_undo_stack.push_back({ layer.id, layer.width, layer.height, layer.rgba_pixels });
+                                    layer.rgba_pixels = std::move(snap.rgba);
+                                    layer.mark_dirty();
+                                    layer.sync_to_gpu(gfx.get_device(), gfx.get_context());
+                                    doc.is_dirty = true;
+                                    sync_tabs_to_ui();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                int cx = 0, cy = 0, cw = 0, ch = 0;
+                if (custom_ui.pop_crop_request(cx, cy, cw, ch) && cw > 0 && ch > 0 &&
+                    active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    auto &doc = app_documents[active_doc_idx];
+                    const uint32_t old_w = active_image.width;
+                    const uint32_t old_h = active_image.height;
+                    doc.layer_stack.crop_all_layers(
+                        static_cast<uint32_t>((std::max)(0, cx)),
+                        static_cast<uint32_t>((std::max)(0, cy)),
+                        static_cast<uint32_t>(cw),
+                        static_cast<uint32_t>(ch),
+                        gfx.get_device()
+                    );
+                    if (active_image.has_depth && !active_image.depth_pixels.empty() &&
+                        active_image.depth_width > 0 && active_image.depth_height > 0 && old_w > 0 && old_h > 0) {
+                        const float sx = static_cast<float>(active_image.depth_width) / static_cast<float>(old_w);
+                        const float sy = static_cast<float>(active_image.depth_height) / static_cast<float>(old_h);
+                        const int dcx = static_cast<int>(std::lround(cx * sx));
+                        const int dcy = static_cast<int>(std::lround(cy * sy));
+                        const int dcw = (std::max)(1, static_cast<int>(std::lround(cw * sx)));
+                        const int dch = (std::max)(1, static_cast<int>(std::lround(ch * sy)));
+                        std::vector<float> cropped_depth;
+                        if (crop_float_buffer(active_image.depth_pixels, active_image.depth_width, active_image.depth_height,
+                                              dcx, dcy, dcw, dch, cropped_depth)) {
+                            D3D11_TEXTURE2D_DESC td = {};
+                            td.Width = static_cast<UINT>(dcw);
+                            td.Height = static_cast<UINT>(dch);
+                            td.MipLevels = 1;
+                            td.ArraySize = 1;
+                            td.Format = DXGI_FORMAT_R32_FLOAT;
+                            td.SampleDesc.Count = 1;
+                            td.Usage = D3D11_USAGE_IMMUTABLE;
+                            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                            D3D11_SUBRESOURCE_DATA init = {};
+                            init.pSysMem = cropped_depth.data();
+                            init.SysMemPitch = static_cast<UINT>(dcw) * sizeof(float);
+                            ComPtr<ID3D11Texture2D> dtex;
+                            ComPtr<ID3D11ShaderResourceView> dsrv;
+                            if (SUCCEEDED(gfx.get_device()->CreateTexture2D(&td, &init, &dtex)) &&
+                                SUCCEEDED(gfx.get_device()->CreateShaderResourceView(dtex.Get(), nullptr, &dsrv))) {
+                                active_image.depth_texture = dtex;
+                                active_image.depth_srv = dsrv;
+                                active_image.depth_width = static_cast<uint32_t>(dcw);
+                                active_image.depth_height = static_cast<uint32_t>(dch);
+                                active_image.depth_pixels = std::move(cropped_depth);
+                            }
+                        }
+                    }
+                    active_image.width = static_cast<uint32_t>(cw);
+                    active_image.height = static_cast<uint32_t>(ch);
+                    doc.image = active_image;
+                    doc.is_dirty = true;
+                    custom_ui.get_crop_state().reset(active_image.width, active_image.height);
+                    viewport.zoom_fit(active_image.width, active_image.height);
+                    if (control_block) {
+                        control_block->view_image_width = active_image.width;
+                        control_block->view_image_height = active_image.height;
+                    }
+                    sync_depth_to_ipc();
+                    custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+                    sync_tabs_to_ui();
+                }
+            }
+
+            // Feature #14: AI Super-Resolution Upscaler
+            {
+                auto &upscaler = UpscaleManager::get();
+                if (upscaler.pop_upscale_request() &&
+                    active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    auto &doc = app_documents[active_doc_idx];
+                    fs::path ws_dir = get_workspace_root() / doc_stage_dir_key(doc.id);
+                    std::error_code ec;
+                    fs::create_directories(ws_dir, ec);
+                    fs::path in_png = ws_dir / L"upscale_input.png";
+                    ID3D11ShaderResourceView *comp_srv = render_doc_composite_srv(doc, dt);
+                    if (comp_srv && BackbufferDump::save_srv_to_file(
+                            gfx.get_device(), gfx.get_context(), comp_srv, in_png.c_str(), true)) {
+                        fs::path depth_src;
+                        if (active_image.has_depth && !doc.file_path.empty()) {
+                            fs::path candidate = fs::path(doc.file_path).replace_extension(L".sldepth");
+                            if (fs::exists(candidate, ec)) {
+                                depth_src = candidate;
+                            }
+                        }
+                        upscaler.start_upscale(in_png, active_image.width, active_image.height, depth_src);
+                    }
+                }
+
+                fs::path up_img_path, up_depth_path;
+                std::string up_err;
+                if (upscaler.consume_completed_result(up_img_path, up_depth_path, up_err)) {
+                    if (up_err.empty() && !up_img_path.empty() && fs::exists(up_img_path) &&
+                        active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                        LoadedImage up_loaded;
+                        if (ImageLoader::load_from_file(gfx.get_device(), up_img_path.c_str(), up_loaded)) {
+                            auto &doc = app_documents[active_doc_idx];
+                            active_image = up_loaded;
+                            doc.image = active_image;
+                            doc.file_path = up_img_path.wstring();
+                            doc.layer_stack.clear();
+                            update_doc_layer0_from_image(doc, active_image);
+                            doc.is_dirty = true;
+                            custom_ui.get_crop_state().reset(active_image.width, active_image.height);
+                            viewport.zoom_fit(active_image.width, active_image.height);
+                            if (control_block) {
+                                control_block->view_image_width = active_image.width;
+                                control_block->view_image_height = active_image.height;
+                            }
+                            sync_depth_to_ipc();
+                            custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+                            sync_tabs_to_ui();
+                            set_host_status(control_block, L"Upscaled to " + std::to_wstring(active_image.width) + L"x" + std::to_wstring(active_image.height));
+                        }
+                    } else if (!up_err.empty()) {
+                        set_host_status(control_block, L"Upscale failed: " + utf8_to_wide(up_err));
+                    }
+                }
+            }
+
+            // Feature #15: System Text Tool
+            {
+                auto &text_engine = shaderlab::TextToolEngine::get();
+                float tx = 0.0f, ty = 0.0f;
+                if (text_engine.pop_create_layer_request(tx, ty) &&
+                    active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    auto &doc = app_documents[active_doc_idx];
+                    const uint32_t doc_w = doc.layer_stack.doc_width > 0 ? doc.layer_stack.doc_width : active_image.width;
+                    const uint32_t doc_h = doc.layer_stack.doc_height > 0 ? doc.layer_stack.doc_height : active_image.height;
+                    if (doc_w > 0 && doc_h > 0) {
+                        int new_idx = doc.layer_stack.add_empty_layer("Text Layer", gfx.get_device());
+                        if (new_idx >= 0) {
+                            auto &layer = doc.layer_stack.layers[new_idx];
+                            layer.is_text_layer = true;
+                            text_engine.apply_settings_to_layer(layer);
+                            if (text_engine.rasterize_text_layer(gfx.get_device(), layer, doc_w, doc_h, gfx.get_context())) {
+                                if (tx >= 0.0f && ty >= 0.0f) {
+                                    layer.offset_x = tx;
+                                    layer.offset_y = ty;
+                                } else {
+                                    layer.offset_x = (static_cast<float>(doc_w) - static_cast<float>(layer.width)) * 0.5f;
+                                    layer.offset_y = (static_cast<float>(doc_h) - static_cast<float>(layer.height)) * 0.5f;
+                                }
+                            }
+                            doc.is_dirty = true;
+                            sync_tabs_to_ui();
+                        }
+                    }
+                }
+                if (text_engine.pop_live_update_request() &&
+                    active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    auto &doc = app_documents[active_doc_idx];
+                    if (auto *al = doc.layer_stack.active_layer(); al && al->is_text_layer) {
+                        const uint32_t doc_w = doc.layer_stack.doc_width > 0 ? doc.layer_stack.doc_width : active_image.width;
+                        const uint32_t doc_h = doc.layer_stack.doc_height > 0 ? doc.layer_stack.doc_height : active_image.height;
+                        text_engine.apply_settings_to_layer(*al);
+                        text_engine.rasterize_text_layer(gfx.get_device(), *al, doc_w, doc_h, gfx.get_context());
+                        doc.is_dirty = true;
+                        sync_tabs_to_ui();
+                    }
+                }
             }
 
             static bool s_was_depth_processing = false;
@@ -2159,6 +3126,7 @@ static int run_app(int argc, wchar_t **argv) {
                             stage_img.far_plane = tdoc.image.far_plane;
                         }
                         tdoc.image = stage_img;
+                        update_doc_layer0_from_image(tdoc, stage_img);
                         tdoc.erase_strokes.clear();
                         tdoc.erase_undo_stack.clear();
                         tdoc.erase_redo_stack.clear();
@@ -2328,16 +3296,32 @@ static int run_app(int argc, wchar_t **argv) {
                     active_image.far_plane
                 );
             } else if (active_image.srv) {
+                ID3D11ShaderResourceView *comp_srv = active_image.srv.Get();
+                if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    auto &doc = app_documents[active_doc_idx];
+                    if (!doc.layer_stack.layers.empty() && doc.layer_stack.doc_width > 0 && doc.layer_stack.doc_height > 0) {
+                        if (auto *cs = layer_compositor.composite_stack(
+                                gfx.get_context(),
+                                doc.layer_stack.doc_width,
+                                doc.layer_stack.doc_height,
+                                doc.layer_stack.layers)) {
+                            comp_srv = cs;
+                        }
+                    }
+                }
+
                 ID3D11ShaderResourceView *display_srv = nullptr;
                 if (custom_ui.is_master_bypass_active()) {
-                    display_srv = active_image.srv.Get();
+                    display_srv = comp_srv;
                 } else {
                     display_srv = pipeline.process(
                         gfx.get_context(),
-                        active_image.srv.Get(),
+                        comp_srv,
                         active_image.width,
                         active_image.height,
-                        custom_ui.get_effects()
+                        custom_ui.get_effects(),
+                        active_image.has_depth ? active_image.depth_srv.Get() : nullptr,
+                        dt
                     );
                 }
 
@@ -2358,7 +3342,7 @@ static int run_app(int argc, wchar_t **argv) {
                     ID3D11ShaderResourceView *before_srv =
                         (control_block && control_block->erase_history_step > 0 && original_image.srv)
                             ? original_image.srv.Get()
-                            : active_image.srv.Get();
+                            : comp_srv;
                     gfx.get_context()->RSSetState(scissor_rs.Get());
                     gfx.get_context()->RSSetScissorRects(1, &scissor_left);
                     blit.render_transformed(
@@ -2368,7 +3352,8 @@ static int run_app(int argc, wchar_t **argv) {
                         viewable_w,
                         viewable_h,
                         static_cast<float>(active_image.width),
-                        static_cast<float>(active_image.height)
+                        static_cast<float>(active_image.height),
+                        true
                     );
 
                     // 2. Right side (After / Processed)
@@ -2386,7 +3371,8 @@ static int run_app(int argc, wchar_t **argv) {
                         viewable_w,
                         viewable_h,
                         static_cast<float>(active_image.width),
-                        static_cast<float>(active_image.height)
+                        static_cast<float>(active_image.height),
+                        true
                     );
 
                     gfx.get_context()->RSSetState(nullptr);
@@ -2398,7 +3384,8 @@ static int run_app(int argc, wchar_t **argv) {
                         viewable_w,
                         viewable_h,
                         static_cast<float>(active_image.width),
-                        static_cast<float>(active_image.height)
+                        static_cast<float>(active_image.height),
+                        true
                     );
                 }
             }
@@ -2452,6 +3439,9 @@ static int run_app(int argc, wchar_t **argv) {
 
     EraseTool::get().set_stage_callback(nullptr);
     EraseTool::get().stop_worker();
+    UpscaleManager::get().shutdown();
+    shaderlab::TextToolEngine::get().shutdown();
+    layer_compositor.shutdown();
     pipeline.shutdown();
     custom_ui.shutdown();
     std::wcout << L"[Host] Shutting down host application.\n";

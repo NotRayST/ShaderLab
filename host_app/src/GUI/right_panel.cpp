@@ -3,8 +3,11 @@
 #include "tool_requirements.h"
 #include "../erase_tool.h"
 #include "../depth_manager.h"
+#include "../upscale_manager.h"
+#include "../text_tool.h"
 #include <imgui.h>
 #include <algorithm>
+#include <cmath>
 
 namespace gui {
 
@@ -12,15 +15,27 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
     ImGui::SetNextWindowPos(ImVec2(right_offset, top_offset));
     ImGui::SetNextWindowSize(ImVec2(panel_width, panel_height));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-                            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar;
+                            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar |
+                            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
     ImGui::Begin("##RightParametersPanel", nullptr, flags);
+
+    const float content_h = (std::max)(260.0f, ImGui::GetContentRegionAvail().y);
+    const float splitter_h = 6.0f;
+    const float top_h = std::clamp(
+        content_h * gui.m_right_split_ratio,
+        140.0f,
+        (std::max)(140.0f, content_h - 140.0f - splitter_h)
+    );
+
+    ImGui::BeginChild("##TopContextSection", ImVec2(-1.0f, top_h), false,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
     float avail_width = ImGui::GetContentRegionAvail().x;
     float item_spacing_x = ImGui::GetStyle().ItemSpacing.x;
-    float tab_w = (avail_width - 2.0f * item_spacing_x) / 3.0f;
-    float tab_h = 24.0f;
+    float tab_w = (std::max)(40.0f, (avail_width - 2.0f * item_spacing_x) / 3.0f);
+    float tab_h = 22.0f;
 
     auto render_segment_tab = [&](const char *label, int tab_idx, const char *dom_id, const char *alt_dom_id = nullptr) {
         bool is_active = (gui.m_right_panel_tab == tab_idx);
@@ -50,20 +65,33 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
     ImGui::SameLine();
     render_segment_tab("3D Depth", 1, "tab_depth", "accordion_depth");
     ImGui::SameLine();
-    render_segment_tab("Erase", 2, "tab_erase", "accordion_erase");
+    render_segment_tab("AI Inpaint", 2, "tab_ai_inpaint", "tab_erase");
+
+    render_segment_tab("Upscale", 3, "tab_upscale");
+    ImGui::SameLine();
+    render_segment_tab("Text", 4, "tab_text");
+    ImGui::SameLine();
+    render_segment_tab("Prefs", 5, "tab_prefs");
 
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Scrollable properties region leaving room for pinned bottom button
-    float bottom_btn_h = 24.0f;
-    float spacing_y = ImGui::GetStyle().ItemSpacing.y;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f, 6.0f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.13f, 0.6f));
-    ImGui::BeginChild("##PropertiesScrollArea", ImVec2(-1.0f, -(bottom_btn_h + spacing_y)), true);
+    if (gui.m_right_panel_tab == 5) {
+        if (gui.render_prefs_tab_fn) {
+            gui.render_prefs_tab_fn();
+        } else {
+            ImGui::TextDisabled("Preferences unavailable.");
+        }
+    } else {
+        // Scrollable properties region leaving room for pinned bottom button
+        float bottom_btn_h = 24.0f;
+        float spacing_y = ImGui::GetStyle().ItemSpacing.y;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f, 6.0f));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.13f, 0.6f));
+        ImGui::BeginChild("##PropertiesScrollArea", ImVec2(-1.0f, -(bottom_btn_h + spacing_y)), true);
 
-    if (gui.m_right_panel_tab == 0) {
+        if (gui.m_right_panel_tab == 0) {
         // --- TAB 0: SHADERS / EFFECT UNIFORMS ---
         if (gui.m_selected_effect_idx >= 0 && gui.m_selected_effect_idx < static_cast<int>(gui.m_effects.size())) {
             auto &fx = gui.m_effects[gui.m_selected_effect_idx];
@@ -235,17 +263,17 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
             ImGui::PopTextWrapPos();
         }
     } else if (gui.m_right_panel_tab == 2) {
-        // --- TAB 2: ERASE & INPAINT ---
+        // --- TAB 2: AI INPAINT ---
         ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextColored(ImVec4(0.45f, 0.75f, 1.0f, 1.0f), "ERASE BRUSH TOOL");
+        ImGui::TextColored(ImVec4(0.45f, 0.75f, 1.0f, 1.0f), "AI INPAINT TOOL (LAMA)");
         ImGui::PopTextWrapPos();
         ImGui::Separator();
 
-        bool erase_active = (gui.m_active_tool == ActiveTool::Erase && gui.m_erase_active);
-        if (ImGui::Checkbox("Activate Erase Brush (E)", &erase_active)) {
-            gui.set_active_tool(erase_active ? ActiveTool::Erase : ActiveTool::Hand);
+        bool erase_active = (gui.m_active_tool == ActiveTool::AiInpaint && gui.m_erase_active);
+        if (ImGui::Checkbox("Activate AI Inpaint Brush (J)", &erase_active)) {
+            gui.set_active_tool(erase_active ? ActiveTool::AiInpaint : ActiveTool::Hand);
         }
-        gui.register_dom_last_item("erase_checkbox_activate", "Activate Erase Brush", "checkbox", erase_active);
+        gui.register_dom_last_item("erase_checkbox_activate", "Activate AI Inpaint Brush", "checkbox", erase_active);
         ImGui::Spacing();
 
         ImGui::PushTextWrapPos(0.0f);
@@ -366,105 +394,151 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Update 3D depth map after erasing objects");
             if (depth_busy) ImGui::EndDisabled();
         }
+        } else if (gui.m_right_panel_tab == 3) {
+            if (gui.render_upscale_tab_fn) {
+                gui.render_upscale_tab_fn();
+            } else {
+                UpscaleManager::get().render_upscale_tab(
+                    gui, gui.has_loaded_image(), gui.m_last_img_w, gui.m_last_img_h, gui.m_has_depth, false);
+            }
+        } else if (gui.m_right_panel_tab == 4) {
+            if (gui.render_text_tab_fn) {
+                gui.render_text_tab_fn();
+            } else {
+                shaderlab::TextToolEngine::get().render_text_tab(
+                    gui, gui.has_loaded_image(), gui.get_text_caret_preview().active, false);
+            }
+        }
+
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
+
+        // Pinned Bottom Action Button (24px height, matches left panel buttons)
+        if (gui.m_right_panel_tab == 0) {
+            bool has_effect = (gui.m_selected_effect_idx >= 0 && gui.m_selected_effect_idx < static_cast<int>(gui.m_effects.size()));
+            if (!has_effect) ImGui::BeginDisabled();
+            if (ImGui::Button("Reset Parameters to Default", ImVec2(-1.0f, bottom_btn_h))) {
+                if (has_effect) gui.m_effects[gui.m_selected_effect_idx].reset_uniforms();
+            }
+            gui.register_dom_last_item("btn_reset_defaults", "Reset Parameters to Default", "button", false, has_effect);
+            if (!has_effect) ImGui::EndDisabled();
+        } else if (gui.m_right_panel_tab == 1) {
+            auto &depth_mgr = DepthManager::get();
+            auto &req = ToolRequirements::get();
+            bool is_downloading = depth_mgr.is_downloading() || req.is_depth_downloading();
+            bool model_present = depth_mgr.is_model_present(gui.m_depth_encoder) || req.is_depth_model_present(gui.m_depth_encoder);
+            bool is_busy = gui.m_depth_is_busy || depth_mgr.is_processing();
+
+            if (is_busy) {
+                ImGui::BeginDisabled();
+                std::string status = !depth_mgr.get_status().empty() ? depth_mgr.get_status() : gui.m_depth_status_text;
+                if (status.empty()) status = "Generating Depth...";
+                ImGui::Button(status.c_str(), ImVec2(-1.0f, bottom_btn_h));
+                ImGui::EndDisabled();
+                gui.register_dom_last_item("depth_btn_generate", "Generating Depth...", "button", false, false);
+            } else if (is_downloading) {
+                float p = depth_mgr.is_downloading() ? depth_mgr.get_download_progress() : req.get_depth_download_progress();
+                char dl_buf[128];
+                if (p > 0.0f) snprintf(dl_buf, sizeof(dl_buf), "Downloading: %.0f%%", p * 100.0f);
+                else snprintf(dl_buf, sizeof(dl_buf), "Downloading Depth Model...");
+                ImGui::BeginDisabled();
+                ImGui::Button(dl_buf, ImVec2(-1.0f, bottom_btn_h));
+                ImGui::EndDisabled();
+                gui.register_dom_last_item("depth_btn_generate", dl_buf, "button", false, false);
+            } else if (!model_present) {
+                const char *dl_label = "Download & Generate Depth (1.3GB)";
+                if (gui.m_depth_encoder == "vitb") dl_label = "Download & Generate Depth (390MB)";
+                else if (gui.m_depth_encoder == "vits") dl_label = "Download & Generate Depth (100MB)";
+
+                if (ImGui::Button(dl_label, ImVec2(-1.0f, bottom_btn_h))) {
+                    if (!depth_mgr.trigger_model_download(gui.m_depth_encoder)) {
+                        req.trigger_depth_download(gui.m_depth_encoder);
+                    }
+                }
+                gui.register_dom_last_item("depth_btn_generate", dl_label, "button");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Download Depth Anything V2 (%s) model checkpoint", gui.m_depth_encoder.c_str());
+            } else {
+                if (ImGui::Button("Generate 3D Depth Map", ImVec2(-1.0f, bottom_btn_h))) {
+                    gui.m_req_generate_depth = true;
+                    gui.m_depth_status_text = "Running Depth-Anything-V2 (" + gui.m_depth_encoder + ")...";
+                    gui.m_depth_is_busy = true;
+                }
+                gui.register_dom_last_item("depth_btn_generate", "Generate 3D Depth Map", "button");
+            }
+        } else if (gui.m_right_panel_tab == 2) {
+            auto &erase_tool = EraseTool::get();
+            auto &req = ToolRequirements::get();
+            bool is_downloading = erase_tool.is_downloading() || req.is_lama_downloading();
+            bool model_present = erase_tool.is_model_present() || req.is_lama_model_present();
+            bool is_busy = gui.m_inpaint_is_busy || erase_tool.is_processing();
+
+            if (is_busy) {
+                ImGui::BeginDisabled();
+                std::string status = !erase_tool.get_status().empty() ? erase_tool.get_status() : gui.m_inpaint_status_text;
+                if (status.empty()) status = "Inpainting...";
+                ImGui::Button(status.c_str(), ImVec2(-1.0f, bottom_btn_h));
+                ImGui::EndDisabled();
+                gui.register_dom_last_item("erase_btn_inpaint", "Inpainting...", "button", false, false);
+            } else if (is_downloading) {
+                float p = erase_tool.is_downloading() ? erase_tool.get_download_progress() : req.get_lama_download_progress();
+                char dl_buf[128];
+                if (p > 0.0f) snprintf(dl_buf, sizeof(dl_buf), "Downloading: %.0f%%", p * 100.0f);
+                else snprintf(dl_buf, sizeof(dl_buf), "Downloading LaMa Big HD (~196MB)...");
+                ImGui::BeginDisabled();
+                ImGui::Button(dl_buf, ImVec2(-1.0f, bottom_btn_h));
+                ImGui::EndDisabled();
+                gui.register_dom_last_item("erase_btn_inpaint", dl_buf, "button", false, false);
+            } else if (!model_present) {
+                if (ImGui::Button("Download LaMa Big HD (196MB)", ImVec2(-1.0f, bottom_btn_h))) {
+                    if (!erase_tool.trigger_model_download()) {
+                        req.trigger_lama_download();
+                    }
+                }
+                gui.register_dom_last_item("erase_btn_inpaint", "Download LaMa Big HD (196MB)", "button");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Download neural inpainting model (common/big-lama.pt) required for object erasing");
+            } else {
+                bool has_mask = erase_tool.has_mask_edits();
+                if (!has_mask) ImGui::BeginDisabled();
+                if (ImGui::Button("Inpaint Selection (LaMa)", ImVec2(-1.0f, bottom_btn_h))) {
+                    gui.request_inpaint();
+                }
+                gui.register_dom_last_item("erase_btn_inpaint", "Inpaint Selection", "button", false, has_mask);
+                if (!has_mask) ImGui::EndDisabled();
+            }
+        } else if (gui.m_right_panel_tab == 3) {
+            UpscaleManager::get().render_upscale_bottom_button(gui, gui.has_loaded_image());
+        } else if (gui.m_right_panel_tab == 4) {
+            shaderlab::TextToolEngine::get().render_text_bottom_button(
+                gui, gui.has_loaded_image(), gui.get_text_caret_preview().active);
+        }
     }
 
+    ImGui::EndChild(); // ##TopContextSection
+
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.21f, 0.24f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.32f, 0.52f, 0.80f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.38f, 0.62f, 0.92f, 1.0f));
+    ImGui::Button("##right_panel_splitter", ImVec2(-1.0f, splitter_h));
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    }
+    if (ImGui::IsItemActive()) {
+        float dy = ImGui::GetIO().MouseDelta.y;
+        if (std::abs(dy) > 0.0f && content_h > 1.0f) {
+            gui.set_right_split_ratio(gui.get_right_split_ratio() + dy / content_h);
+        }
+    }
+    ImGui::PopStyleColor(3);
+
+    ImGui::BeginChild("##BottomLayersSection", ImVec2(-1.0f, -1.0f), false,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    if (gui.render_layers_panel_fn) {
+        gui.render_layers_panel_fn();
+    } else {
+        ImGui::TextDisabled("Layers panel unavailable.");
+    }
     ImGui::EndChild();
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
-
-    // 4. Pinned Bottom Action Button (24px height, matches left panel buttons)
-    if (gui.m_right_panel_tab == 0) {
-        bool has_effect = (gui.m_selected_effect_idx >= 0 && gui.m_selected_effect_idx < static_cast<int>(gui.m_effects.size()));
-        if (!has_effect) ImGui::BeginDisabled();
-        if (ImGui::Button("Reset Parameters to Default", ImVec2(-1.0f, bottom_btn_h))) {
-            if (has_effect) gui.m_effects[gui.m_selected_effect_idx].reset_uniforms();
-        }
-        gui.register_dom_last_item("btn_reset_defaults", "Reset Parameters to Default", "button", false, has_effect);
-        if (!has_effect) ImGui::EndDisabled();
-    } else if (gui.m_right_panel_tab == 1) {
-        auto &depth_mgr = DepthManager::get();
-        auto &req = ToolRequirements::get();
-        bool is_downloading = depth_mgr.is_downloading() || req.is_depth_downloading();
-        bool model_present = depth_mgr.is_model_present(gui.m_depth_encoder) || req.is_depth_model_present(gui.m_depth_encoder);
-        bool is_busy = gui.m_depth_is_busy || depth_mgr.is_processing();
-
-        if (is_busy) {
-            ImGui::BeginDisabled();
-            std::string status = !depth_mgr.get_status().empty() ? depth_mgr.get_status() : gui.m_depth_status_text;
-            if (status.empty()) status = "Generating Depth...";
-            ImGui::Button(status.c_str(), ImVec2(-1.0f, bottom_btn_h));
-            ImGui::EndDisabled();
-            gui.register_dom_last_item("depth_btn_generate", "Generating Depth...", "button", false, false);
-        } else if (is_downloading) {
-            float p = depth_mgr.is_downloading() ? depth_mgr.get_download_progress() : req.get_depth_download_progress();
-            char dl_buf[128];
-            if (p > 0.0f) snprintf(dl_buf, sizeof(dl_buf), "Downloading: %.0f%%", p * 100.0f);
-            else snprintf(dl_buf, sizeof(dl_buf), "Downloading Depth Model...");
-            ImGui::BeginDisabled();
-            ImGui::Button(dl_buf, ImVec2(-1.0f, bottom_btn_h));
-            ImGui::EndDisabled();
-            gui.register_dom_last_item("depth_btn_generate", dl_buf, "button", false, false);
-        } else if (!model_present) {
-            const char *dl_label = "Download & Generate Depth (1.3GB)";
-            if (gui.m_depth_encoder == "vitb") dl_label = "Download & Generate Depth (390MB)";
-            else if (gui.m_depth_encoder == "vits") dl_label = "Download & Generate Depth (100MB)";
-
-            if (ImGui::Button(dl_label, ImVec2(-1.0f, bottom_btn_h))) {
-                if (!depth_mgr.trigger_model_download(gui.m_depth_encoder)) {
-                    req.trigger_depth_download(gui.m_depth_encoder);
-                }
-            }
-            gui.register_dom_last_item("depth_btn_generate", dl_label, "button");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Download Depth Anything V2 (%s) model checkpoint", gui.m_depth_encoder.c_str());
-        } else {
-            if (ImGui::Button("Generate 3D Depth Map", ImVec2(-1.0f, bottom_btn_h))) {
-                gui.m_req_generate_depth = true;
-                gui.m_depth_status_text = "Running Depth-Anything-V2 (" + gui.m_depth_encoder + ")...";
-                gui.m_depth_is_busy = true;
-            }
-            gui.register_dom_last_item("depth_btn_generate", "Generate 3D Depth Map", "button");
-        }
-    } else if (gui.m_right_panel_tab == 2) {
-        auto &erase_tool = EraseTool::get();
-        auto &req = ToolRequirements::get();
-        bool is_downloading = erase_tool.is_downloading() || req.is_lama_downloading();
-        bool model_present = erase_tool.is_model_present() || req.is_lama_model_present();
-        bool is_busy = gui.m_inpaint_is_busy || erase_tool.is_processing();
-
-        if (is_busy) {
-            ImGui::BeginDisabled();
-            std::string status = !erase_tool.get_status().empty() ? erase_tool.get_status() : gui.m_inpaint_status_text;
-            if (status.empty()) status = "Inpainting...";
-            ImGui::Button(status.c_str(), ImVec2(-1.0f, bottom_btn_h));
-            ImGui::EndDisabled();
-            gui.register_dom_last_item("erase_btn_inpaint", "Inpainting...", "button", false, false);
-        } else if (is_downloading) {
-            float p = erase_tool.is_downloading() ? erase_tool.get_download_progress() : req.get_lama_download_progress();
-            char dl_buf[128];
-            if (p > 0.0f) snprintf(dl_buf, sizeof(dl_buf), "Downloading: %.0f%%", p * 100.0f);
-            else snprintf(dl_buf, sizeof(dl_buf), "Downloading LaMa Big HD (~196MB)...");
-            ImGui::BeginDisabled();
-            ImGui::Button(dl_buf, ImVec2(-1.0f, bottom_btn_h));
-            ImGui::EndDisabled();
-            gui.register_dom_last_item("erase_btn_inpaint", dl_buf, "button", false, false);
-        } else if (!model_present) {
-            if (ImGui::Button("Download LaMa Big HD (196MB)", ImVec2(-1.0f, bottom_btn_h))) {
-                if (!erase_tool.trigger_model_download()) {
-                    req.trigger_lama_download();
-                }
-            }
-            gui.register_dom_last_item("erase_btn_inpaint", "Download LaMa Big HD (196MB)", "button");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Download neural inpainting model (common/big-lama.pt) required for object erasing");
-        } else {
-            bool has_mask = erase_tool.has_mask_edits();
-            if (!has_mask) ImGui::BeginDisabled();
-            if (ImGui::Button("Inpaint Selection (LaMa)", ImVec2(-1.0f, bottom_btn_h))) {
-                gui.request_inpaint();
-            }
-            gui.register_dom_last_item("erase_btn_inpaint", "Inpaint Selection", "button", false, has_mask);
-            if (!has_mask) ImGui::EndDisabled();
-        }
-    }
 
     // Left border drawn in panel window draw list
     ImDrawList *draw = ImGui::GetWindowDrawList();
