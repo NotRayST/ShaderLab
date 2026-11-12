@@ -413,7 +413,7 @@ void EraseTool::render_ui(SharedControlBlock *block, const std::wstring &active_
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, btn_act);
         }
 
-        if (ImGui::Button(active ? "Erase Mode: ACTIVE (E)" : "Enable Erase Mode (E)", ImVec2(-1, 32))) {
+        if (ImGui::Button(active ? "AI Object Erase: ACTIVE (J)" : "Enable AI Object Erase (J)", ImVec2(-1, 32))) {
             set_active(!active);
         }
 
@@ -424,7 +424,9 @@ void EraseTool::render_ui(SharedControlBlock *block, const std::wstring &active_
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
         ImGui::SliderFloat("Brush Radius", &brush_radius, 2.0f, 200.0f, "%.0f px");
-        ImGui::TextDisabled("Left-click to paint, right-click to unmask. [ and ] to resize.");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Left-click to mask, right-click to unmask. [ and ] to resize.");
+        ImGui::PopStyleColor();
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
         ImGui::Checkbox("Auto-apply", &auto_apply);
