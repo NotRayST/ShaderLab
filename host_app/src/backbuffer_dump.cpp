@@ -18,46 +18,7 @@ static std::string wide_to_utf8(const std::wstring &wstr) {
     return out;
 }
 
-bool BackbufferDump::capture_to_file(GfxDevice &gfx, const wchar_t *output_path, uint32_t width, uint32_t height) {
-    if (!gfx.get_device() || !gfx.get_context() || !gfx.get_swap_chain() || !output_path) {
-        return false;
-    }
-
-    D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width = width;
-    desc.Height = height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    desc.SampleDesc.Quality = 0;
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = 0;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-    ComPtr<ID3D11Texture2D> staging;
-    HRESULT hr = gfx.get_device()->CreateTexture2D(&desc, nullptr, &staging);
-    if (FAILED(hr)) {
-        std::wcerr << L"[BackbufferDump] Failed to create staging texture\n";
-        return false;
-    }
-
-    ComPtr<ID3D11Texture2D> back_buffer;
-    hr = gfx.get_swap_chain()->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
-    if (FAILED(hr)) {
-        std::wcerr << L"[BackbufferDump] Failed to get swap chain back buffer\n";
-        return false;
-    }
-
-    gfx.get_context()->CopyResource(staging.Get(), back_buffer.Get());
-
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    hr = gfx.get_context()->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) {
-        std::wcerr << L"[BackbufferDump] Failed to map staging texture\n";
-        return false;
-    }
-
+static bool write_mapped_rgba_to_file(const uint8_t *src_bytes, UINT row_pitch, uint32_t width, uint32_t height, bool is_bgra, const wchar_t *output_path) {
     std::filesystem::path p(output_path);
     if (p.has_parent_path()) {
         std::error_code ec;
@@ -68,19 +29,22 @@ bool BackbufferDump::capture_to_file(GfxDevice &gfx, const wchar_t *output_path,
     std::string ext = p.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(::tolower(c)); });
 
-    int ok = 0;
-    const uint8_t *src_bytes = static_cast<const uint8_t *>(mapped.pData);
-    std::vector<uint8_t> packed(width * height * 4);
+    std::vector<uint8_t> packed(static_cast<size_t>(width) * height * 4);
     for (uint32_t y = 0; y < height; ++y) {
-        const uint8_t *row_src = src_bytes + (y * mapped.RowPitch);
-        uint8_t *row_dst = packed.data() + (y * width * 4);
+        const uint8_t *row_src = src_bytes + (static_cast<size_t>(y) * row_pitch);
+        uint8_t *row_dst = packed.data() + (static_cast<size_t>(y) * width * 4);
         for (uint32_t x = 0; x < width; ++x) {
-            row_dst[x * 4 + 0] = row_src[x * 4 + 0];
-            row_dst[x * 4 + 1] = row_src[x * 4 + 1];
-            row_dst[x * 4 + 2] = row_src[x * 4 + 2];
+            uint8_t c0 = row_src[x * 4 + 0];
+            uint8_t c1 = row_src[x * 4 + 1];
+            uint8_t c2 = row_src[x * 4 + 2];
+            row_dst[x * 4 + 0] = is_bgra ? c2 : c0;
+            row_dst[x * 4 + 1] = c1;
+            row_dst[x * 4 + 2] = is_bgra ? c0 : c2;
             row_dst[x * 4 + 3] = 255;
         }
     }
+
+    int ok = 0;
     if (ext == ".jpg" || ext == ".jpeg") {
         ok = stbi_write_jpg(out_utf8.c_str(), static_cast<int>(width), static_cast<int>(height), 4, packed.data(), 95);
     } else {
@@ -94,10 +58,108 @@ bool BackbufferDump::capture_to_file(GfxDevice &gfx, const wchar_t *output_path,
             static_cast<int>(width * 4)
         );
     }
+    return (ok != 0);
+}
 
+bool BackbufferDump::save_texture_to_file(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Texture2D *src_tex, const wchar_t *output_path) {
+    if (!device || !context || !src_tex || !output_path) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC src_desc = {};
+    src_tex->GetDesc(&src_desc);
+    if (src_desc.Width == 0 || src_desc.Height == 0) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC staging_desc = {};
+    staging_desc.Width = src_desc.Width;
+    staging_desc.Height = src_desc.Height;
+    staging_desc.MipLevels = 1;
+    staging_desc.ArraySize = 1;
+    staging_desc.Format = src_desc.Format;
+    staging_desc.SampleDesc.Count = 1;
+    staging_desc.SampleDesc.Quality = 0;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    ComPtr<ID3D11Texture2D> staging;
+    HRESULT hr = device->CreateTexture2D(&staging_desc, nullptr, &staging);
+    if (FAILED(hr)) {
+        std::wcerr << L"[BackbufferDump] save_texture_to_file: failed to create staging texture (hr=0x" << std::hex << hr << std::dec << L")\n";
+        return false;
+    }
+
+    context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, src_tex, 0, nullptr);
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        std::wcerr << L"[BackbufferDump] save_texture_to_file: failed to map staging texture\n";
+        return false;
+    }
+
+    bool is_bgra = (src_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || src_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+    bool ok = write_mapped_rgba_to_file(static_cast<const uint8_t *>(mapped.pData), mapped.RowPitch, src_desc.Width, src_desc.Height, is_bgra, output_path);
+    context->Unmap(staging.Get(), 0);
+    return ok;
+}
+
+bool BackbufferDump::capture_to_file(GfxDevice &gfx, const wchar_t *output_path, uint32_t width, uint32_t height) {
+    if (!gfx.get_device() || !gfx.get_context() || !gfx.get_swap_chain() || !output_path) {
+        return false;
+    }
+
+    ComPtr<ID3D11Texture2D> back_buffer;
+    HRESULT hr = gfx.get_swap_chain()->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
+    if (FAILED(hr)) {
+        std::wcerr << L"[BackbufferDump] Failed to get swap chain back buffer\n";
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC bb_desc = {};
+    back_buffer->GetDesc(&bb_desc);
+    uint32_t copy_w = (std::min)(width, bb_desc.Width);
+    uint32_t copy_h = (std::min)(height, bb_desc.Height);
+    if (copy_w == 0 || copy_h == 0) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = copy_w;
+    desc.Height = copy_h;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = bb_desc.Format;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    ComPtr<ID3D11Texture2D> staging;
+    hr = gfx.get_device()->CreateTexture2D(&desc, nullptr, &staging);
+    if (FAILED(hr)) {
+        std::wcerr << L"[BackbufferDump] Failed to create staging texture\n";
+        return false;
+    }
+
+    D3D11_BOX src_box = { 0, 0, 0, copy_w, copy_h, 1 };
+    gfx.get_context()->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, back_buffer.Get(), 0, &src_box);
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    hr = gfx.get_context()->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        std::wcerr << L"[BackbufferDump] Failed to map staging texture\n";
+        return false;
+    }
+
+    bool is_bgra = (bb_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || bb_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+    bool ok = write_mapped_rgba_to_file(static_cast<const uint8_t *>(mapped.pData), mapped.RowPitch, copy_w, copy_h, is_bgra, output_path);
     gfx.get_context()->Unmap(staging.Get(), 0);
 
-    return (ok != 0);
+    return ok;
 }
 
 bool BackbufferDump::run_selftest(GfxDevice &gfx, BlitRenderer &blit, const wchar_t *input_path, const wchar_t *output_path) {

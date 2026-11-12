@@ -1,8 +1,5 @@
 #include "erase_tool.h"
 #include "depth_manager.h"
-#include "job_queue.h"
-#include "undo_history.h"
-#include "keybinds.h"
 #include "../../common/depth_file.h"
 #include "../../common/str_utils.h"
 #include "../../third_party/stb/stb_image.h"
@@ -15,6 +12,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <sstream>
 
 namespace fs = std::filesystem;
 using str_utils::wide_to_utf8;
@@ -36,28 +35,29 @@ void EraseTool::set_active(bool active) {
 
 void EraseTool::clear_mask() {
     if (!m_mask.empty()) std::fill(m_mask.begin(), m_mask.end(), (uint8_t)0);
-    m_mask_white_px = 0; m_mask_dirty = true; m_is_drawing = false;
+    m_mask_white_px = 0; m_is_drawing = false;
     m_undo_stack.clear(); m_redo_stack.clear();
+    mark_dirty_all();
 }
 
 bool EraseTool::undo_stroke() {
     if (m_undo_stack.empty()) return false;
     m_redo_stack.push_back(std::move(m_mask));
     m_mask = std::move(m_undo_stack.back()); m_undo_stack.pop_back();
-    recalculate_white_pixels(); m_mask_dirty = true; return true;
+    recalculate_white_pixels(); mark_dirty_all(); return true;
 }
 
 bool EraseTool::redo_stroke() {
     if (m_redo_stack.empty()) return false;
     m_undo_stack.push_back(std::move(m_mask));
     m_mask = std::move(m_redo_stack.back()); m_redo_stack.pop_back();
-    recalculate_white_pixels(); m_mask_dirty = true; return true;
+    recalculate_white_pixels(); mark_dirty_all(); return true;
 }
 
 void EraseTool::ensure_mask_size(uint32_t w, uint32_t h) {
     if (w == 0 || h == 0 || (m_mask_w == w && m_mask_h == h && m_mask.size() == (size_t)w * h)) return;
     m_mask_w = w; m_mask_h = h; m_mask.assign((size_t)w * h, 0);
-    m_mask_white_px = 0; m_undo_stack.clear(); m_redo_stack.clear(); m_mask_dirty = true;
+    m_mask_white_px = 0; m_undo_stack.clear(); m_redo_stack.clear(); mark_dirty_all();
 }
 
 void EraseTool::push_undo() {
@@ -72,24 +72,113 @@ void EraseTool::recalculate_white_pixels() {
     m_mask_white_px = count;
 }
 
+void EraseTool::mark_dirty_rect(int x0, int y0, int x1, int y1) {
+    if (m_mask_w == 0 || m_mask_h == 0) return;
+    x0 = std::clamp(x0, 0, static_cast<int>(m_mask_w) - 1);
+    y0 = std::clamp(y0, 0, static_cast<int>(m_mask_h) - 1);
+    x1 = std::clamp(x1, 0, static_cast<int>(m_mask_w) - 1);
+    y1 = std::clamp(y1, 0, static_cast<int>(m_mask_h) - 1);
+    if (x0 > x1 || y0 > y1) return;
+    if (!m_has_dirty_rect) {
+        m_dirty_x0 = x0;
+        m_dirty_y0 = y0;
+        m_dirty_x1 = x1;
+        m_dirty_y1 = y1;
+        m_has_dirty_rect = true;
+    } else {
+        m_dirty_x0 = (std::min)(m_dirty_x0, x0);
+        m_dirty_y0 = (std::min)(m_dirty_y0, y0);
+        m_dirty_x1 = (std::max)(m_dirty_x1, x1);
+        m_dirty_y1 = (std::max)(m_dirty_y1, y1);
+    }
+    m_mask_dirty = true;
+}
+
+void EraseTool::mark_dirty_all() {
+    if (m_mask_w == 0 || m_mask_h == 0) {
+        m_has_dirty_rect = false;
+        m_mask_dirty = true;
+        return;
+    }
+    m_dirty_x0 = 0;
+    m_dirty_y0 = 0;
+    m_dirty_x1 = static_cast<int>(m_mask_w) - 1;
+    m_dirty_y1 = static_cast<int>(m_mask_h) - 1;
+    m_has_dirty_rect = true;
+    m_mask_dirty = true;
+}
+
 void EraseTool::draw_brush_dab(int cx, int cy, int r, uint8_t val) {
-    if (m_mask.empty()) return;
+    if (m_mask.empty() || m_mask_w == 0 || m_mask_h == 0) return;
+    if (r < 1) r = 1;
     int y0 = (std::max)(0, cy - r), y1 = (std::min)((int)m_mask_h - 1, cy + r), r2 = r * r;
+    int min_x = (int)m_mask_w, max_x = -1;
+    const bool paint = (val > 120);
     for (int y = y0; y <= y1; ++y) {
         int dy = y - cy, max_dx = (int)std::sqrt((std::max)(0, r2 - dy * dy));
         int x0 = (std::max)(0, cx - max_dx), x1 = (std::min)((int)m_mask_w - 1, cx + max_dx);
-        if (x0 <= x1) std::fill_n(m_mask.data() + (size_t)y * m_mask_w + x0, x1 - x0 + 1, val);
+        if (x0 <= x1) {
+            min_x = (std::min)(min_x, x0);
+            max_x = (std::max)(max_x, x1);
+            uint8_t *row = m_mask.data() + (size_t)y * m_mask_w;
+            if (paint) {
+                for (int x = x0; x <= x1; ++x) {
+                    if (row[x] <= 120) ++m_mask_white_px;
+                    row[x] = val;
+                }
+            } else {
+                for (int x = x0; x <= x1; ++x) {
+                    if (row[x] > 120 && m_mask_white_px > 0) --m_mask_white_px;
+                    row[x] = val;
+                }
+            }
+        }
+    }
+    if (min_x <= max_x && y0 <= y1) {
+        mark_dirty_rect(min_x, y0, max_x, y1);
     }
 }
 
 void EraseTool::draw_brush_line(const ImVec2 &p0, const ImVec2 &p1, float radius, bool is_sub) {
-    int r = (std::max)(1, (int)std::round(radius)); float dx = p1.x - p0.x, dy = p1.y - p0.y;
-    int steps = (std::max)(1, (int)std::ceil(std::hypot(dx, dy) / (std::max)(1.0f, radius * 0.35f)));
-    for (int i = 0; i <= steps; ++i) {
-        float t = (float)i / (float)steps;
-        draw_brush_dab((int)std::round(p0.x + t * dx), (int)std::round(p0.y + t * dy), r, is_sub ? 0 : 255);
+    if (m_mask.empty() || m_mask_w == 0 || m_mask_h == 0) return;
+    const float r = (std::max)(1.0f, radius);
+    const float r2 = r * r;
+    const uint8_t val = is_sub ? 0 : 255;
+
+    const int x0 = (std::max)(0, static_cast<int>(std::floor((std::min)(p0.x, p1.x) - r)));
+    const int y0 = (std::max)(0, static_cast<int>(std::floor((std::min)(p0.y, p1.y) - r)));
+    const int x1 = (std::min)(static_cast<int>(m_mask_w) - 1, static_cast<int>(std::ceil((std::max)(p0.x, p1.x) + r)));
+    const int y1 = (std::min)(static_cast<int>(m_mask_h) - 1, static_cast<int>(std::ceil((std::max)(p0.y, p1.y) + r)));
+    if (x0 > x1 || y0 > y1) return;
+
+    const float abx = p1.x - p0.x;
+    const float aby = p1.y - p0.y;
+    const float ab_len2 = abx * abx + aby * aby;
+    const bool single_pt = (ab_len2 <= 1e-6f);
+
+    for (int y = y0; y <= y1; ++y) {
+        uint8_t *row = m_mask.data() + static_cast<size_t>(y) * m_mask_w;
+        const float apy = static_cast<float>(y) - p0.y;
+        for (int x = x0; x <= x1; ++x) {
+            const float apx = static_cast<float>(x) - p0.x;
+            float dx = apx;
+            float dy = apy;
+            if (!single_pt) {
+                const float t = std::clamp((apx * abx + apy * aby) / ab_len2, 0.0f, 1.0f);
+                dx = apx - abx * t;
+                dy = apy - aby * t;
+            }
+            if (dx * dx + dy * dy <= r2) {
+                if (!is_sub) {
+                    if (row[x] <= 120) ++m_mask_white_px;
+                } else {
+                    if (row[x] > 120 && m_mask_white_px > 0) --m_mask_white_px;
+                }
+                row[x] = val;
+            }
+        }
     }
-    m_mask_dirty = true;
+    mark_dirty_rect(x0, y0, x1, y1);
 }
 
 static void compute_view_geom(const SharedControlBlock *b, const ImVec2 &disp, float &cos_a, float &sin_a, float &eff_zoom) {
@@ -171,27 +260,70 @@ void EraseTool::handle_input(SharedControlBlock *block, bool is_processing, bool
 
 void EraseTool::update_gpu_texture(ID3D11Device *dev) {
     if (!dev || m_mask.empty() || !m_mask_dirty) return;
+    bool full_upload = false;
     if (!m_mask_tex || m_tex_w != m_mask_w || m_tex_h != m_mask_h) {
         m_mask_tex.Reset(); m_mask_srv.Reset();
         D3D11_TEXTURE2D_DESC desc = { m_mask_w, m_mask_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE };
         if (FAILED(dev->CreateTexture2D(&desc, nullptr, &m_mask_tex)) ||
             FAILED(dev->CreateShaderResourceView(m_mask_tex.Get(), nullptr, &m_mask_srv))) return;
         m_tex_w = m_mask_w; m_tex_h = m_mask_h;
+        full_upload = true;
     }
     size_t n = (size_t)m_mask_w * m_mask_h;
-    if (m_gpu_rgba.size() != n) m_gpu_rgba.resize(n);
-    for (size_t i = 0; i < n; ++i) m_gpu_rgba[i] = (m_mask[i] > 120) ? IM_COL32(245, 45, 45, 160) : 0;
-    ComPtr<ID3D11DeviceContext> ctx; dev->GetImmediateContext(&ctx);
-    if (ctx) { ctx->UpdateSubresource(m_mask_tex.Get(), 0, nullptr, m_gpu_rgba.data(), m_mask_w * sizeof(uint32_t), 0); m_mask_dirty = false; }
+    if (m_gpu_rgba.size() != n) {
+        m_gpu_rgba.assign(n, 0);
+        full_upload = true;
+    }
+
+    int ux0 = 0;
+    int uy0 = 0;
+    int ux1 = static_cast<int>(m_mask_w) - 1;
+    int uy1 = static_cast<int>(m_mask_h) - 1;
+    if (!full_upload && m_has_dirty_rect) {
+        ux0 = std::clamp(m_dirty_x0, 0, static_cast<int>(m_mask_w) - 1);
+        uy0 = std::clamp(m_dirty_y0, 0, static_cast<int>(m_mask_h) - 1);
+        ux1 = std::clamp(m_dirty_x1, 0, static_cast<int>(m_mask_w) - 1);
+        uy1 = std::clamp(m_dirty_y1, 0, static_cast<int>(m_mask_h) - 1);
+    }
+
+    if (ux0 <= ux1 && uy0 <= uy1) {
+        const uint32_t mask_rgba = IM_COL32(245, 45, 45, 160);
+        for (int y = uy0; y <= uy1; ++y) {
+            const uint8_t *src_row = m_mask.data() + static_cast<size_t>(y) * m_mask_w;
+            uint32_t *dst_row = m_gpu_rgba.data() + static_cast<size_t>(y) * m_mask_w;
+            for (int x = ux0; x <= ux1; ++x) {
+                dst_row[x] = (src_row[x] > 120) ? mask_rgba : 0;
+            }
+        }
+        ComPtr<ID3D11DeviceContext> ctx; dev->GetImmediateContext(&ctx);
+        if (ctx) {
+            if (ux0 == 0 && uy0 == 0 && ux1 == static_cast<int>(m_mask_w) - 1 && uy1 == static_cast<int>(m_mask_h) - 1) {
+                ctx->UpdateSubresource(m_mask_tex.Get(), 0, nullptr, m_gpu_rgba.data(), m_mask_w * sizeof(uint32_t), 0);
+            } else {
+                D3D11_BOX box = {};
+                box.left = static_cast<UINT>(ux0);
+                box.top = static_cast<UINT>(uy0);
+                box.front = 0;
+                box.right = static_cast<UINT>(ux1 + 1);
+                box.bottom = static_cast<UINT>(uy1 + 1);
+                box.back = 1;
+                const uint32_t *src_ptr = m_gpu_rgba.data() + static_cast<size_t>(uy0) * m_mask_w + ux0;
+                ctx->UpdateSubresource(m_mask_tex.Get(), 0, &box, src_ptr, m_mask_w * sizeof(uint32_t), 0);
+            }
+            m_mask_dirty = false;
+            m_has_dirty_rect = false;
+        }
+    } else {
+        m_mask_dirty = false;
+        m_has_dirty_rect = false;
+    }
 }
 
-void EraseTool::render_overlay(SharedControlBlock *b, reshade::api::effect_runtime *runtime) {
+void EraseTool::render_overlay(SharedControlBlock *b, ID3D11Device *device) {
     if (!m_active || !b || b->view_image_width == 0) return;
     ImGuiIO &io = ImGui::GetIO();
-    if (runtime) {
-        auto *dev = runtime->get_device();
-        if (dev && dev->get_api() == reshade::api::device_api::d3d11)
-            update_gpu_texture(reinterpret_cast<ID3D11Device *>(static_cast<uintptr_t>(dev->get_native())));
+    if (device) {
+        update_gpu_texture(device);
     }
     float w = (float)b->view_image_width, h = (float)b->view_image_height;
     ImDrawList *draw = ImGui::GetBackgroundDrawList();
@@ -239,7 +371,7 @@ bool EraseTool::export_mask_png(const std::wstring &out_path, uint32_t width, ui
     fclose(f); return ret != 0;
 }
 
-void EraseTool::handle_frame(SharedControlBlock *block, reshade::api::effect_runtime *runtime, const std::wstring &active_path, bool bg_hovered, bool any_active, bool fine) {
+void EraseTool::handle_frame(SharedControlBlock *block, ID3D11Device *device, const std::wstring &active_path, bool bg_hovered, bool any_active, bool fine) {
     (void)bg_hovered; (void)any_active; (void)fine;
     if (!block || block->export_state != ExportState::Idle) return;
     if (m_active) ipc_set_view_flag(&block->view_interaction_flags, VIEW_FLAG_ERASE_ACTIVE);
@@ -248,7 +380,7 @@ void EraseTool::handle_frame(SharedControlBlock *block, reshade::api::effect_run
 
     bool stroke_finished = false;
     handle_input(block, is_processing(), &stroke_finished);
-    render_overlay(block, runtime);
+    render_overlay(block, device);
 
     bool currently_erasing = is_processing();
     if (m_was_erasing && !currently_erasing && get_last_error().empty()) clear_mask();
@@ -686,18 +818,26 @@ void EraseTool::stop_worker() {
     m_daemon_stopping = false;
 }
 
+static fs::path get_stage_cache_dir(const std::wstring &dir_key) {
+    wchar_t tmp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring key = dir_key.empty() ? L"default" : dir_key;
+    return fs::path(tmp) / L"ShaderLab" / L"workspace" / L"erase_stages" / key;
+}
+
 static bool is_erase_stage_path(const std::wstring &path) {
     std::wstring p = path;
     for (auto &c : p) c = towlower(c);
     return p.find(L"erase_stages") != std::wstring::npos;
 }
 
-static void sync_stage_to_ui(size_t idx, size_t total, const std::wstring &path) {
-    if (auto *cb = JobQueueManager::get().get_control_block()) {
-        cb->erase_history_step = (uint32_t)idx; cb->erase_history_count = (uint32_t)total;
-        wcsncpy_s(cb->preview_path, kMaxPathW, path.c_str(), _TRUNCATE); cb->preview_counter++;
+void EraseTool::sync_stage_to_ui(const std::wstring &dir_key, size_t idx, size_t total, const std::wstring &img_path, const std::wstring &sidecar_path) {
+    if (m_stage_cb) {
+        try {
+            m_stage_cb(dir_key, idx, total, img_path, sidecar_path);
+        } catch (...) {}
     }
-    JobQueueManager::get().set_active_image_path(path);
+    OutputDebugStringW((L"[Erase] Stage (" + (dir_key.empty() ? L"default" : dir_key) + L"): " + std::to_wstring(idx) + L"/" + std::to_wstring(total) + L" - " + img_path + L"\n").c_str());
 }
 
 bool EraseTool::ensure_stage_cache_initialized(const std::wstring &base_image_path) {
@@ -716,10 +856,8 @@ bool EraseTool::ensure_stage_cache_initialized(const std::wstring &base_image_pa
         if (is_erase_stage_path(base_p.wstring())) return true;
     }
 
-    wchar_t tmp[MAX_PATH] = {}; GetTempPathW(MAX_PATH, tmp);
-    fs::path dir = fs::path(tmp) / "ShaderLab" / "workspace" / "erase_stages";
+    fs::path dir = get_stage_cache_dir(m_stage_dir_key);
     fs::create_directories(dir, ec);
-    undo_history::clear_erase_entries();
     for (const auto &e : fs::directory_iterator(dir, ec)) {
         std::error_code eq_ec;
         bool is_same = false;
@@ -742,7 +880,6 @@ bool EraseTool::ensure_stage_cache_initialized(const std::wstring &base_image_pa
     m_base_img = base_p.wstring();
     m_stages = { { s0_img.wstring(), fs::exists(s0_sc, ec) ? s0_sc.wstring() : L"" } };
     m_stage_idx = 0;
-    if (auto *cb = JobQueueManager::get().get_control_block()) { cb->erase_history_step = 0; cb->erase_history_count = 0; }
     return true;
 }
 
@@ -762,7 +899,7 @@ bool EraseTool::trigger_erase(const std::wstring &base_image_path, const std::ws
         m_status = "Inpainting with " + get_model_name() + "..."; m_last_error.clear();
     }
 
-    std::wstring in_img, in_sc, out_img, out_sc; size_t next_idx = 0; bool has_sc = false;
+    std::wstring in_img, in_sc, out_img, out_sc, job_dir_key; size_t next_idx = 0; bool has_sc = false;
     {
         std::lock_guard<std::mutex> l(m_stage_mutex);
         if (m_stages.empty() || m_stage_idx >= m_stages.size()) {
@@ -771,16 +908,18 @@ bool EraseTool::trigger_erase(const std::wstring &base_image_path, const std::ws
             m_last_error = "Invalid stage state";
             return false;
         }
+        job_dir_key = m_stage_dir_key.empty() ? L"default" : m_stage_dir_key;
+        m_processing_dir_key = job_dir_key;
         in_img = m_stages[m_stage_idx].img; in_sc = m_stages[m_stage_idx].sidecar;
         has_sc = !in_sc.empty() && fs::exists(in_sc);
         next_idx = m_stage_idx + 1;
-        fs::path dir = fs::path(in_img).parent_path(), ext = fs::path(in_img).extension();
-        out_img = (dir / (L"stage_" + std::to_wstring(next_idx) + ext.wstring())).wstring();
+        fs::path dir = fs::path(in_img).parent_path();
+        out_img = (dir / (L"stage_" + std::to_wstring(next_idx) + L".png")).wstring();
         out_sc = (dir / (L"stage_" + std::to_wstring(next_idx) + L".sldepth")).wstring();
         if (has_sc) { std::error_code ec; fs::copy_file(in_sc, out_sc, fs::copy_options::overwrite_existing, ec); }
     }
 
-    m_worker = std::thread([this, in_img, out_img, out_sc, has_sc, mask_path, next_idx]() {
+    m_worker = std::thread([this, in_img, out_img, out_sc, has_sc, mask_path, next_idx, job_dir_key]() {
         bool success = false;
         try {
             if (!m_daemon_ready.load() && m_daemon_prewarming.load()) {
@@ -828,7 +967,7 @@ bool EraseTool::trigger_erase(const std::wstring &base_image_path, const std::ws
                 if (!py.empty() && !script.empty() && !model.empty()) {
                     std::wstring cmd = L"\"" + py + L"\" \"" + fs::absolute(script).wstring() + L"\" --input \"" + in_img +
                                        L"\" --mask \"" + fs::absolute(mask_path).wstring() + L"\" --output \"" + out_img +
-                                       L"\" --model \"" + fs::absolute(model).wstring() + L"\"";
+                                       L"\" --model \"" + fs::absolute(model).wstring() + L"\" --device auto";
                     log(0, "Fallback CLI: " + wide_to_utf8(cmd.c_str()));
                     if (run_cmd(cmd, fs::path(script).parent_path().wstring()) && fs::exists(out_img)) {
                         success = true;
@@ -838,24 +977,63 @@ bool EraseTool::trigger_erase(const std::wstring &base_image_path, const std::ws
                 }
             }
 
+            // Verify output image file on disk and wait briefly for full file flush
+            if (success) {
+                bool file_ready = false;
+                for (int attempt = 0; attempt < 50; ++attempt) {
+                    std::error_code ec;
+                    auto sz = fs::file_size(out_img, ec);
+                    if (!ec && sz > 0) {
+                        // Attempt to open read-only in binary mode to ensure no sharing/write locks remain
+                        FILE *tf = nullptr;
+                        if (_wfopen_s(&tf, out_img.c_str(), L"rb") == 0 && tf) {
+                            fclose(tf);
+                            file_ready = true;
+                            break;
+                        }
+                    }
+                    Sleep(20);
+                }
+                if (!file_ready) {
+                    success = false;
+                    std::lock_guard<std::mutex> sl(m_status_mutex);
+                    m_last_error = "Inpaint output file was empty or locked on disk";
+                    log(2, m_last_error);
+                }
+            }
+
             if (success) {
                 m_progress.store(1.0f);
                 { std::lock_guard<std::mutex> l(m_status_mutex); m_status = "Erase complete!"; }
+                std::wstring final_sc = has_sc ? out_sc : L"";
+                size_t total_steps = next_idx;
                 {
                     std::lock_guard<std::mutex> l(m_stage_mutex);
-                    m_stages.resize(next_idx + 1);
-                    m_stages[next_idx] = { out_img, has_sc ? out_sc : L"" };
-                    m_stage_idx = next_idx;
+                    std::wstring cur_key = m_stage_dir_key.empty() ? L"default" : m_stage_dir_key;
+                    if (cur_key == job_dir_key) {
+                        m_stages.resize(next_idx + 1);
+                        m_stages[next_idx] = { out_img, final_sc };
+                        m_stage_idx = next_idx;
+                        total_steps = m_stages.size() - 1;
+                    }
+                    m_processing_dir_key.clear();
                 }
-                sync_stage_to_ui(next_idx, get_total_erase_steps(), out_img);
-                undo_history::record_erase_step((uint32_t)next_idx);
+                sync_stage_to_ui(job_dir_key, next_idx, total_steps, out_img, final_sc);
                 log(3, "Erase completed successfully: stage " + std::to_string(next_idx));
             } else {
+                {
+                    std::lock_guard<std::mutex> l(m_stage_mutex);
+                    m_processing_dir_key.clear();
+                }
                 std::lock_guard<std::mutex> l(m_status_mutex);
                 if (m_last_error.empty()) m_last_error = "Inpainting failed or timed out";
                 log(2, m_last_error);
             }
         } catch (const std::exception &e) {
+            {
+                std::lock_guard<std::mutex> l(m_stage_mutex);
+                m_processing_dir_key.clear();
+            }
             std::lock_guard<std::mutex> l(m_status_mutex);
             m_last_error = std::string("Error: ") + e.what(); log(2, m_last_error);
         }
@@ -866,55 +1044,207 @@ bool EraseTool::trigger_erase(const std::wstring &base_image_path, const std::ws
 
 bool EraseTool::set_stage_index(size_t target_idx) {
     if (m_processing.load()) return false;
-    std::lock_guard<std::mutex> l(m_stage_mutex);
-    if (m_stages.empty() || target_idx >= m_stages.size()) return false;
-    std::error_code ec;
-    if (!fs::exists(m_stages[target_idx].img, ec) || ec) return false;
-    m_stage_idx = target_idx;
-    sync_stage_to_ui(m_stage_idx, m_stages.size() - 1, m_stages[m_stage_idx].img);
+    std::wstring key, img, sc;
+    size_t total = 0;
+    {
+        std::lock_guard<std::mutex> l(m_stage_mutex);
+        if (m_stages.empty() || target_idx >= m_stages.size()) return false;
+        std::error_code ec;
+        if (!fs::exists(m_stages[target_idx].img, ec) || ec) return false;
+        m_stage_idx = target_idx;
+        key = m_stage_dir_key.empty() ? L"default" : m_stage_dir_key;
+        total = m_stages.size() - 1;
+        img = m_stages[m_stage_idx].img;
+        sc = m_stages[m_stage_idx].sidecar;
+    }
+    sync_stage_to_ui(key, target_idx, total, img, sc);
     return true;
 }
 
 bool EraseTool::undo_erase() {
     if (m_processing.load()) return false;
-    std::lock_guard<std::mutex> l(m_stage_mutex);
-    if (m_stage_idx == 0 || m_stages.empty()) return false;
-    size_t target = m_stage_idx - 1;
-    std::error_code ec;
-    if (!fs::exists(m_stages[target].img, ec) || ec) return false;
-    m_stage_idx = target;
-    sync_stage_to_ui(m_stage_idx, m_stages.size() - 1, m_stages[m_stage_idx].img);
+    std::wstring key, img, sc;
+    size_t target = 0, total = 0;
+    {
+        std::lock_guard<std::mutex> l(m_stage_mutex);
+        if (m_stage_idx == 0 || m_stages.empty()) return false;
+        target = m_stage_idx - 1;
+        std::error_code ec;
+        if (!fs::exists(m_stages[target].img, ec) || ec) return false;
+        m_stage_idx = target;
+        key = m_stage_dir_key.empty() ? L"default" : m_stage_dir_key;
+        total = m_stages.size() - 1;
+        img = m_stages[m_stage_idx].img;
+        sc = m_stages[m_stage_idx].sidecar;
+    }
+    sync_stage_to_ui(key, target, total, img, sc);
     return true;
 }
 
 bool EraseTool::redo_erase() {
     if (m_processing.load()) return false;
-    std::lock_guard<std::mutex> l(m_stage_mutex);
-    if (m_stages.empty() || m_stage_idx + 1 >= m_stages.size()) return false;
-    size_t target = m_stage_idx + 1;
-    std::error_code ec;
-    if (!fs::exists(m_stages[target].img, ec) || ec) return false;
-    m_stage_idx = target;
-    sync_stage_to_ui(m_stage_idx, m_stages.size() - 1, m_stages[m_stage_idx].img);
+    std::wstring key, img, sc;
+    size_t target = 0, total = 0;
+    {
+        std::lock_guard<std::mutex> l(m_stage_mutex);
+        if (m_stages.empty() || m_stage_idx + 1 >= m_stages.size()) return false;
+        target = m_stage_idx + 1;
+        std::error_code ec;
+        if (!fs::exists(m_stages[target].img, ec) || ec) return false;
+        m_stage_idx = target;
+        key = m_stage_dir_key.empty() ? L"default" : m_stage_dir_key;
+        total = m_stages.size() - 1;
+        img = m_stages[m_stage_idx].img;
+        sc = m_stages[m_stage_idx].sidecar;
+    }
+    sync_stage_to_ui(key, target, total, img, sc);
     return true;
+}
+
+std::wstring EraseTool::get_current_stage_path() const {
+    std::lock_guard<std::mutex> l(m_stage_mutex);
+    if (m_stages.empty() || m_stage_idx >= m_stages.size()) return L"";
+    return m_stages[m_stage_idx].img;
+}
+
+std::wstring EraseTool::get_base_image_path() const {
+    std::lock_guard<std::mutex> l(m_stage_mutex);
+    return m_base_img;
 }
 
 void EraseTool::clear_erase_history() {
     clear_mask();
+    std::wstring key_to_clean;
+    {
+        std::lock_guard<std::mutex> l(m_stage_mutex);
+        key_to_clean = m_stage_dir_key;
+        m_stages.clear(); m_stage_idx = 0; m_base_img.clear();
+    }
+    {
+        std::lock_guard<std::mutex> sl(m_status_mutex);
+        m_last_error.clear();
+    }
+    remove_stage_cache_dir(key_to_clean);
+}
+
+void EraseTool::set_stage_dir_key(const std::wstring &key) {
     std::lock_guard<std::mutex> l(m_stage_mutex);
-    m_stages.clear(); m_stage_idx = 0; m_base_img.clear();
-    if (auto *cb = JobQueueManager::get().get_control_block()) { cb->erase_history_step = 0; cb->erase_history_count = 0; }
-    wchar_t tmp[MAX_PATH] = {}; GetTempPathW(MAX_PATH, tmp);
-    fs::path dir = fs::path(tmp) / "ShaderLab" / "workspace" / "erase_stages";
-    std::error_code ec; fs::remove_all(dir, ec);
-    undo_history::clear_erase_entries();
+    m_stage_dir_key = key;
+}
+
+void EraseTool::save_document_state(DocumentState &out_state) const {
+    out_state.mask = m_mask;
+    out_state.mask_w = m_mask_w;
+    out_state.mask_h = m_mask_h;
+    out_state.mask_white_px = m_mask_white_px;
+    out_state.undo_stack = m_undo_stack;
+    out_state.redo_stack = m_redo_stack;
+    {
+        std::lock_guard<std::mutex> l(m_stage_mutex);
+        out_state.stage_dir_key = m_stage_dir_key;
+        out_state.base_img = m_base_img;
+        out_state.stages = m_stages;
+        out_state.stage_idx = m_stage_idx;
+    }
+    {
+        std::lock_guard<std::mutex> sl(m_status_mutex);
+        out_state.last_error = m_last_error;
+    }
+}
+
+void EraseTool::restore_document_state(const DocumentState &state, ID3D11Device *dev) {
+    m_is_drawing = false;
+    m_last_sub = false;
+    m_last_pos = ImVec2(-1.0f, -1.0f);
+    m_mask = state.mask;
+    m_mask_w = state.mask_w;
+    m_mask_h = state.mask_h;
+    m_mask_white_px = state.mask_white_px;
+    m_undo_stack = state.undo_stack;
+    m_redo_stack = state.redo_stack;
+    {
+        std::lock_guard<std::mutex> l(m_stage_mutex);
+        m_stage_dir_key = state.stage_dir_key;
+        m_base_img = state.base_img;
+        m_stages = state.stages;
+        m_stage_idx = state.stage_idx;
+    }
+    {
+        std::lock_guard<std::mutex> sl(m_status_mutex);
+        m_last_error = state.last_error;
+    }
+    if (m_mask.empty() || m_mask_w == 0 || m_mask_h == 0) {
+        m_mask_tex.Reset();
+        m_mask_srv.Reset();
+        m_gpu_rgba.clear();
+        m_tex_w = 0;
+        m_tex_h = 0;
+        m_mask_dirty = false;
+        m_has_dirty_rect = false;
+    } else {
+        recalculate_white_pixels();
+        mark_dirty_all();
+        if (dev) {
+            update_gpu_texture(dev);
+        }
+    }
+}
+
+void EraseTool::remove_stage_cache_dir(const std::wstring &dir_key) {
+    fs::path dir = get_stage_cache_dir(dir_key);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+bool EraseTool::copy_stage_cache_dir(const std::wstring &src_dir_key, const std::wstring &dst_dir_key, DocumentState &io_state) {
+    fs::path src_dir = get_stage_cache_dir(src_dir_key);
+    fs::path dst_dir = get_stage_cache_dir(dst_dir_key);
+    std::error_code ec;
+    fs::remove_all(dst_dir, ec);
+    io_state.stage_dir_key = dst_dir_key;
+    if (!fs::exists(src_dir, ec)) {
+        io_state.stages.clear();
+        io_state.stage_idx = 0;
+        return true;
+    }
+    fs::create_directories(dst_dir, ec);
+    fs::copy(src_dir, dst_dir, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    if (ec) return false;
+    for (auto &st : io_state.stages) {
+        if (!st.img.empty()) st.img = (dst_dir / fs::path(st.img).filename()).wstring();
+        if (!st.sidecar.empty()) st.sidecar = (dst_dir / fs::path(st.sidecar).filename()).wstring();
+    }
+    if (!io_state.base_img.empty() && is_erase_stage_path(io_state.base_img)) {
+        io_state.base_img = (dst_dir / fs::path(io_state.base_img).filename()).wstring();
+    }
+    return true;
 }
 
 void EraseTool::log(int severity, const std::string &msg) {
     try {
+        auto now = std::chrono::system_clock::now();
+        auto in_time_t = std::chrono::system_clock::to_time_t(now);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
+        std::stringstream ss;
+        struct tm buf;
+        localtime_s(&buf, &in_time_t);
+        ss << std::put_time(&buf, "%H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << ms.count();
+        std::string ts = ss.str();
+
         const char *s = (severity == 1) ? "WARN" : (severity == 2) ? "ERROR" : (severity == 3) ? "SUCCESS" : "INFO";
-        std::string line = std::string("[") + s + "] [Erase] " + msg;
-        JobQueueManager::get().add_log(utf8_to_wide(line.c_str()));
+        std::string line = "[" + ts + "] [" + s + "] [Erase] " + msg;
+
+        std::cout << line << std::endl;
         OutputDebugStringA((line + "\n").c_str());
+
+        wchar_t exe_path[MAX_PATH] = {};
+        if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH) > 0) {
+            fs::path log_file = fs::path(exe_path).parent_path() / "ShaderLabErase.log";
+            std::ofstream ofs(log_file, std::ios::out | std::ios::app);
+            if (ofs.is_open()) {
+                ofs << line << "\n";
+            }
+        }
     } catch (...) {}
 }

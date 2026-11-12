@@ -39,6 +39,7 @@ bool CliParser::is_cli_invocation(int argc, wchar_t **argv) {
     const wchar_t *first = argv[1];
     if (is_cmd_match(first, L"render") ||
         is_cmd_match(first, L"test-shader") ||
+        is_cmd_match(first, L"test-erase") ||
         is_cmd_match(first, L"depth") ||
         is_cmd_match(first, L"info") ||
         is_cmd_match(first, L"preset") ||
@@ -78,6 +79,9 @@ CliOptions CliParser::parse(int argc, wchar_t **argv) {
         idx = 2;
     } else if (is_cmd_match(first, L"test-shader") || is_cmd_match(first, L"testshader")) {
         opts.subcommand = "test-shader";
+        idx = 2;
+    } else if (is_cmd_match(first, L"test-erase") || is_cmd_match(first, L"testerase")) {
+        opts.subcommand = "test-erase";
         idx = 2;
     } else if (is_cmd_match(first, L"depth")) {
         opts.subcommand = "depth";

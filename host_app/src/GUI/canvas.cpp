@@ -1,5 +1,6 @@
 #include "canvas.h"
 #include "gui_manager.h"
+#include "../erase_tool.h"
 #include <imgui.h>
 #include <algorithm>
 
@@ -8,6 +9,8 @@ namespace gui {
 void render_center_canvas(GuiManager &gui, float left_offset, float top_offset, float canvas_width, float canvas_height,
                           uint32_t img_w, uint32_t img_h,
                           float /*zoom_level*/, float /*pan_x*/, float /*pan_y*/) {
+    if (canvas_width <= 1.0f || canvas_height <= 1.0f) return;
+
     ImDrawList *fg = ImGui::GetBackgroundDrawList();
 
     // 1. splitter lines on left and right borders of canvas are drawn directly in panel windows
@@ -28,12 +31,18 @@ void render_center_canvas(GuiManager &gui, float left_offset, float top_offset, 
         fg->AddText(ImVec2(split_x - 11.0f, handle_y - 7.0f), IM_COL32(230, 230, 230, 255), "< | >");
     }
 
-    // 3. erase brush mask strokes (projected from image UV coords)
-    bool show_mask = (gui.m_active_tool == ActiveTool::Erase) || (!gui.m_erase_strokes.empty() && gui.m_active_tool == ActiveTool::Hand);
+    // 3. erase brush mask (EraseTool GPU texture quad is the single source of truth)
+    EraseTool &erase_tool = EraseTool::get();
+    if (gui.m_device && img_w > 0 && img_h > 0 && erase_tool.is_mask_dirty()) {
+        erase_tool.update_gpu_texture(gui.m_device);
+    }
+    bool has_tool_mask = erase_tool.has_mask_edits();
+    bool show_mask = (gui.m_active_tool == ActiveTool::Erase) ||
+                     (has_tool_mask && gui.m_active_tool == ActiveTool::Hand);
     if (show_mask && img_w > 0 && img_h > 0) {
         float fit_scale = (img_w > 0 && img_h > 0) ?
             (std::min)(canvas_width / static_cast<float>(img_w), canvas_height / static_cast<float>(img_h)) : 1.0f;
-        float eff_zoom = gui.m_last_zoom * fit_scale;
+        float eff_zoom = (std::max)(0.0001f, gui.m_last_zoom * fit_scale);
         float cx = left_offset + canvas_width * 0.5f;
         float cy = top_offset + canvas_height * 0.5f;
 
@@ -55,32 +64,18 @@ void render_center_canvas(GuiManager &gui, float left_offset, float top_offset, 
         if (clip_x1 > clip_x0 && clip_y1 > clip_y0) {
             fg->PushClipRect(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1), true);
 
-            float screen_radius = gui.m_erase_radius * eff_zoom;
-            if (screen_radius < 2.0f) screen_radius = 2.0f;
-
-            ImU32 stroke_col = (gui.m_active_tool == ActiveTool::Erase) ? IM_COL32(235, 45, 45, 130) : IM_COL32(235, 45, 45, 75);
-
-            auto draw_stroke_smooth = [&](const std::vector<ImVec2> &pts) {
-                if (pts.empty()) return;
-                if (pts.size() == 1) {
-                    ImVec2 sp = uv_to_screen(pts[0]);
-                    fg->AddCircleFilled(sp, screen_radius, stroke_col, 20);
-                    return;
-                }
-                for (size_t s = 1; s < pts.size(); ++s) {
-                    ImVec2 p_a = uv_to_screen(pts[s - 1]);
-                    ImVec2 p_b = uv_to_screen(pts[s]);
-                    fg->AddLine(p_a, p_b, stroke_col, screen_radius * 2.0f);
-                }
-                fg->AddCircleFilled(uv_to_screen(pts.front()), screen_radius, stroke_col, 20);
-                fg->AddCircleFilled(uv_to_screen(pts.back()), screen_radius, stroke_col, 20);
-            };
-
-            for (const auto &stroke : gui.m_erase_strokes) {
-                draw_stroke_smooth(stroke);
-            }
-            if (!gui.m_current_stroke.empty()) {
-                draw_stroke_smooth(gui.m_current_stroke);
+            ID3D11ShaderResourceView *mask_srv = erase_tool.get_mask_srv();
+            if (mask_srv && has_tool_mask) {
+                ImVec2 p0 = uv_to_screen(ImVec2(0.0f, 0.0f));
+                ImVec2 p1 = uv_to_screen(ImVec2(1.0f, 0.0f));
+                ImVec2 p2 = uv_to_screen(ImVec2(1.0f, 1.0f));
+                ImVec2 p3 = uv_to_screen(ImVec2(0.0f, 1.0f));
+                ImU32 quad_col = (gui.m_active_tool == ActiveTool::Erase)
+                    ? IM_COL32(255, 255, 255, 255)
+                    : IM_COL32(255, 255, 255, 140);
+                fg->AddImageQuad((ImTextureID)mask_srv, p0, p1, p2, p3,
+                                 ImVec2(0.0f, 0.0f), ImVec2(1.0f, 0.0f),
+                                 ImVec2(1.0f, 1.0f), ImVec2(0.0f, 1.0f), quad_col);
             }
 
             fg->PopClipRect();
@@ -88,10 +83,13 @@ void render_center_canvas(GuiManager &gui, float left_offset, float top_offset, 
 
         // Cursor ring: exact size match to painted stroke
         if (gui.m_active_tool == ActiveTool::Erase) {
-            POINT mouse_pt;
-            GetCursorPos(&mouse_pt);
-            ScreenToClient(gui.m_hwnd, &mouse_pt);
-            if (mouse_pt.x >= left_offset && mouse_pt.x <= left_offset + canvas_width &&
+            POINT mouse_pt = gui.m_last_mouse_pt;
+            POINT os_pt = {};
+            if (GetCursorPos(&os_pt) && ScreenToClient(gui.m_hwnd, &os_pt)) {
+                mouse_pt = os_pt;
+            }
+            if ((gui.m_cursor_in_client || gui.m_is_painting_mask) &&
+                mouse_pt.x >= left_offset && mouse_pt.x <= left_offset + canvas_width &&
                 mouse_pt.y >= top_offset && mouse_pt.y <= top_offset + canvas_height) {
                 bool alt_held = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
                 bool is_sub = gui.m_erase_subtract || alt_held;

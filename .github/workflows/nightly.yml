@@ -29,7 +29,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist -Force
           Copy-Item "build\host_app\Release\ShaderLab.exe" "dist\"
-          Copy-Item "build\addon\Release\ShaderLab.addon" "dist\"
           Copy-Item "Readme.txt" "dist\"
           Copy-Item "CLI_MANUAL.txt" "dist\"
           Copy-Item "LICENSE" "dist\"

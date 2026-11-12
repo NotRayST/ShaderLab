@@ -143,6 +143,7 @@ void render_left_panel(GuiManager &gui, float left_offset, float top_offset, flo
         }
     }
     gui.register_dom_last_item("btn_add_shader", "+ Add Shader", "button");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open and load a shader effect into pipeline");
 
     float btn_w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
     bool can_move_up = (gui.m_selected_effect_idx > 0 && gui.m_selected_effect_idx < static_cast<int>(gui.m_effects.size()));
@@ -154,6 +155,7 @@ void render_left_panel(GuiManager &gui, float left_offset, float top_offset, flo
         }
     }
     gui.register_dom_last_item("btn_move_up", "Move Up", "button", false, can_move_up);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move selected shader earlier in execution order");
     if (!can_move_up) ImGui::EndDisabled();
 
     ImGui::SameLine();
@@ -167,6 +169,7 @@ void render_left_panel(GuiManager &gui, float left_offset, float top_offset, flo
         }
     }
     gui.register_dom_last_item("btn_move_down", "Move Down", "button", false, can_move_down);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move selected shader later in execution order");
     if (!can_move_down) ImGui::EndDisabled();
 
     ImDrawList *draw = ImGui::GetWindowDrawList();

@@ -2,10 +2,10 @@
 #include "image_loader.h"
 #include "blit_renderer.h"
 #include "backbuffer_dump.h"
-#include "warning_overlay.h"
 #include "settle_detector.h"
-#include "hud_renderer.h"
 #include "viewport_controller.h"
+#include "erase_tool.h"
+#include "depth_manager.h"
 #include "GUI/gui_manager.h"
 #include "GUI/tool_requirements.h"
 
@@ -24,6 +24,7 @@ using ShaderLabUniform = gui::ShaderLabUniform;
 #include <string>
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 static std::string wide_to_utf8(const std::wstring &wstr) {
     if (wstr.empty()) return {};
@@ -42,12 +43,32 @@ static std::wstring utf8_to_wide(const std::string &str) {
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, out.data(), size);
     return out;
 }
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
 
 namespace fs = std::filesystem;
+
+struct StageEvent {
+    std::wstring dir_key;
+    size_t step = 0;
+    size_t total = 0;
+    std::wstring img_path;
+    std::wstring sidecar_path;
+};
+
+struct PendingStageReload {
+    std::mutex mtx;
+    std::vector<StageEvent> queue;
+};
+static PendingStageReload g_pending_stage;
+
+static void on_erase_stage_changed(const std::wstring &dir_key, size_t step, size_t total, const std::wstring &img_path, const std::wstring &sidecar_path) {
+    std::lock_guard<std::mutex> lock(g_pending_stage.mtx);
+    g_pending_stage.queue.push_back({ dir_key, step, total, img_path, sidecar_path });
+}
 
 static void set_host_status(SharedControlBlock *block, const std::wstring &msg) {
     if (!block) return;
@@ -71,33 +92,59 @@ static bool is_erase_stage_path(const std::wstring &path) {
     return p.find(L"erase_stages") != std::wstring::npos;
 }
 
-static std::wstring prepare_working_copy(const std::wstring &source_path) {
+static fs::path get_workspace_root() {
+    wchar_t temp_dir[MAX_PATH] = {};
+    if (GetTempPathW(MAX_PATH, temp_dir) == 0) {
+        return {};
+    }
+    return fs::path(temp_dir) / "ShaderLab" / "workspace";
+}
+
+static void clean_stale_workspace_on_startup() {
+    fs::path ws_dir = get_workspace_root();
+    if (ws_dir.empty()) return;
+    std::error_code ec;
+    fs::create_directories(ws_dir, ec);
+    for (const auto &entry : fs::directory_iterator(ws_dir, ec)) {
+        fs::remove_all(entry.path(), ec);
+    }
+}
+
+static void remove_doc_workspace_dir(const std::wstring &doc_dir_key) {
+    if (doc_dir_key.empty()) return;
+    fs::path ws_dir = get_workspace_root();
+    if (ws_dir.empty()) return;
+    std::error_code ec;
+    fs::remove_all(ws_dir / doc_dir_key, ec);
+}
+
+static std::wstring prepare_working_copy(const std::wstring &source_path, const std::wstring &doc_dir_key = L"") {
     if (source_path.empty() || !fs::exists(source_path) || is_erase_stage_path(source_path)) {
         return source_path;
     }
 
-    wchar_t temp_dir[MAX_PATH] = {};
-    if (GetTempPathW(MAX_PATH, temp_dir) == 0) {
+    fs::path ws_dir = get_workspace_root();
+    if (ws_dir.empty()) {
         return source_path;
     }
-
-    fs::path ws_dir = fs::path(temp_dir) / "ShaderLab" / "workspace";
     std::error_code ec;
     fs::create_directories(ws_dir, ec);
 
     fs::path src(source_path);
-    if (path_is_within(src, ws_dir)) {
+    fs::path doc_ws_dir = doc_dir_key.empty() ? ws_dir : (ws_dir / doc_dir_key);
+    if (doc_dir_key.empty() && path_is_within(src, ws_dir)) {
         return source_path;
     }
 
-    fs::path dst = ws_dir / src.filename();
-
-    // clean previous workspace contents so stale sidecars or leftover files dont stick around
-    for (const auto &entry : fs::directory_iterator(ws_dir, ec)) {
-        if (entry.path().filename() != L"erase_stages") {
-            fs::remove_all(entry.path(), ec);
+    if (!doc_dir_key.empty()) {
+        if (path_is_within(src, doc_ws_dir)) {
+            return source_path;
         }
+        fs::remove_all(doc_ws_dir, ec);
+        fs::create_directories(doc_ws_dir, ec);
     }
+
+    fs::path dst = doc_ws_dir / src.filename();
 
     fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
     if (ec) {
@@ -116,50 +163,22 @@ static std::wstring prepare_working_copy(const std::wstring &source_path) {
 }
 
 
-static bool on_warning_input_hook(void *user_data, UINT msg, WPARAM wParam, LPARAM lParam) {
-    auto *overlay = static_cast<WarningOverlay *>(user_data);
-    if (!overlay || !overlay->is_active()) return false;
-
-    switch (msg) {
-    case WM_MOUSEMOVE: {
-        int x = static_cast<short>(LOWORD(lParam));
-        int y = static_cast<short>(HIWORD(lParam));
-        overlay->on_mouse_move(x, y);
-        return false;
-    }
-    case WM_LBUTTONDOWN: {
-        int x = static_cast<short>(LOWORD(lParam));
-        int y = static_cast<short>(HIWORD(lParam));
-        return overlay->on_mouse_click(x, y);
-    }
-    case WM_KEYDOWN: {
-        if (wParam == VK_F11) return false; // let f11 pass through even if warning active
-        overlay->on_key_down(wParam);
-        return true;
-    }
-    }
-    return false;
-}
-
 struct ViewportHookContext {
     ViewportController *controller = nullptr;
     GfxDevice *gfx = nullptr;
     LoadedImage *active_image = nullptr;
     SharedControlBlock *block = nullptr;
-    ToastHud *toast_hud = nullptr;
     CustomUI *custom_ui = nullptr;
+    uint32_t *last_synced_xform_ver = nullptr;
 };
 
 static uint64_t g_last_fullscreen_toggle_ms = 0;
-static void toggle_fullscreen_safe(GfxDevice &gfx, ToastHud *toast, SharedControlBlock *block) {
+static void toggle_fullscreen_safe(GfxDevice &gfx, SharedControlBlock *block) {
     uint64_t now_ms = GetTickCount64();
     if (now_ms - g_last_fullscreen_toggle_ms < 300) return;
     g_last_fullscreen_toggle_ms = now_ms;
 
     gfx.toggle_fullscreen();
-    if (toast) {
-        toast->show(gfx.is_fullscreen() ? L"Borderless Fullscreen" : L"Windowed");
-    }
     if (block) {
         block->is_fullscreen = gfx.is_fullscreen() ? 1u : 0u;
     }
@@ -178,7 +197,7 @@ static bool on_viewport_input_hook(void *user_data, UINT msg, WPARAM wParam, LPA
         if (ctx->controller->matches_keybind(IpcAction::ToggleFullscreen, wParam, ctrl_down, shift_down, alt_down) ||
             (!ctrl_down && !shift_down && !alt_down && wParam == VK_F11)) {
             if (!was_down) {
-                toggle_fullscreen_safe(*ctx->gfx, ctx->toast_hud, ctx->block);
+                toggle_fullscreen_safe(*ctx->gfx, ctx->block);
             }
             return true;
         }
@@ -259,6 +278,9 @@ static bool on_viewport_input_hook(void *user_data, UINT msg, WPARAM wParam, LPA
             // sync native WndProc-driven changes into the SharedControlBlock so the addon
             // can still read them even with the overlay closed
             ctx->controller->sync_to_block(ctx->block);
+            if (ctx->last_synced_xform_ver) {
+                *ctx->last_synced_xform_ver = ctx->block->view_transform_version;
+            }
         }
     } else {
         if (ctx->block && ctx->controller) {
@@ -316,20 +338,6 @@ static void setup_cli_console() {
     std::wcerr.clear();
 }
 
-struct GdiplusScope {
-    ULONG_PTR token = 0;
-    GdiplusScope() {
-        Gdiplus::GdiplusStartupInput input;
-        Gdiplus::GdiplusStartup(&token, &input, nullptr);
-    }
-    ~GdiplusScope() {
-        if (token) {
-            Gdiplus::GdiplusShutdown(token);
-            token = 0;
-        }
-    }
-};
-
 static void register_host_path_in_registry() {
     wchar_t exe_path[MAX_PATH] = {};
     if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH) > 0) {
@@ -380,9 +388,8 @@ static int run_app(int argc, wchar_t **argv) {
     }
 
     register_host_path_in_registry();
-    GdiplusScope gdiplus_scope;
 
-    // set up the shared block first, before any gpu stuff, so the addon can latch onto it asap
+    // set up shared memory mapping for IPC / ctl automation
     wchar_t shm_name[kMaxPathW] = {};
     make_shared_mem_name(shm_name, _countof(shm_name));
     std::wcout << L"[Host] Creating shared memory mapping: " << shm_name << L"\n";
@@ -473,6 +480,7 @@ static int run_app(int argc, wchar_t **argv) {
     struct AppDocument {
         uint32_t id = 0;
         std::wstring file_path;
+        std::wstring source_path;
         std::wstring display_name;
         LoadedImage image;
         LoadedImage original_image;
@@ -484,82 +492,68 @@ static int run_app(int argc, wchar_t **argv) {
         std::vector<std::vector<ImVec2>> erase_strokes;
         std::vector<std::vector<std::vector<ImVec2>>> erase_undo_stack;
         std::vector<std::vector<std::vector<ImVec2>>> erase_redo_stack;
+        EraseTool::DocumentState erase_state;
         std::vector<ShaderLabEffect> effects;
+        int selected_effect_idx = 0;
         bool effects_initialized = false;
+        bool depth_invert = false;
+        bool live_depth_peek = false;
+        bool master_bypass = false;
+        std::string inpaint_status_text;
+        std::string depth_status_text;
         bool is_dirty = false;
+        uint32_t erase_step = 0;
+        uint32_t erase_count = 0;
     };
 
     std::vector<AppDocument> app_documents;
     int active_doc_idx = -1;
     uint32_t next_doc_id = 1;
 
-    struct BackgroundAiState {
-        std::atomic<bool> is_running{ false };
-        std::atomic<bool> completed{ false };
-        std::atomic<bool> failed{ false };
-        std::string task_type;
-        std::string status_msg;
-        std::string error_msg;
-        std::wstring result_path;
-        std::thread worker;
-
-        ~BackgroundAiState() {
-            if (worker.joinable()) worker.join();
-        }
-    };
-    BackgroundAiState ai_state;
-
     ViewportController viewport;
     SettleDetector settle_detector;
-    CompassHud compass_hud;
-    ZoomHud zoom_hud;
-    ToastHud toast_hud;
-    WelcomeHud welcome_hud;
     CustomUI custom_ui;
     EffectPipeline pipeline;
 
-    HudFontManager::get().initialize();
-
-    compass_hud.initialize(gfx.get_device());
-    zoom_hud.initialize(gfx.get_device());
-    toast_hud.initialize(gfx.get_device());
-    welcome_hud.initialize(gfx.get_device());
-    custom_ui.initialize(gfx.get_hwnd(), gfx.get_device(), gfx.get_context());
-    pipeline.initialize(gfx.get_device());
-    gfx.add_input_hook(CustomUI::input_hook, &custom_ui);
-
-    // if reshade is missing, show a big "go install it" overlay instead of just... nothing
-    bool has_reshade = fs::exists(L"dxgi.dll") || fs::exists(L"ReShade64.dll");
-    if (has_reshade) {
-        control_block->host_flags |= HOST_FLAG_EXTERNAL_HUD;
-    }
-
-    WarningOverlay warning;
-    if (warning.initialize(gfx.get_device())) {
-        // check both naming conventions, reshade setup can go either way
-        if (!has_reshade) {
-            warning.set_active(false);
-        }
-    }
-
-    // input hooks: warning overlay goes first since it's modal, then ViewportController
-    gfx.add_input_hook(on_warning_input_hook, &warning);
+    uint32_t last_synced_xform_ver = 0;
 
     ViewportHookContext vp_ctx;
     vp_ctx.controller = &viewport;
     vp_ctx.gfx = &gfx;
     vp_ctx.active_image = &active_image;
     vp_ctx.block = control_block;
-    vp_ctx.toast_hud = &toast_hud;
     vp_ctx.custom_ui = &custom_ui;
-    gfx.add_input_hook(on_viewport_input_hook, &vp_ctx);
+    vp_ctx.last_synced_xform_ver = &last_synced_xform_ver;
+
+    custom_ui.initialize(gfx.get_hwnd(), gfx.get_device(), gfx.get_context());
+    const std::vector<ShaderLabEffect> default_effects = custom_ui.get_effects();
+    clean_stale_workspace_on_startup();
+    CustomUI::ViewportCallbacks ui_vp_cb;
+    ui_vp_cb.is_panning = [](void *p) { return static_cast<ViewportHookContext *>(p)->controller->is_panning(); };
+    ui_vp_cb.is_capturing = [](void *p) { return static_cast<ViewportHookContext *>(p)->controller->is_capturing(); };
+    ui_vp_cb.handle_input = on_viewport_input_hook;
+    ui_vp_cb.cancel_input = [](void *p) {
+        auto *c = static_cast<ViewportHookContext *>(p);
+        c->controller->cancel_interaction();
+        if (c->block) {
+            c->controller->sync_to_block(c->block);
+            if (c->last_synced_xform_ver) *c->last_synced_xform_ver = c->block->view_transform_version;
+        }
+    };
+    ui_vp_cb.set_space_pan = [](void *p, bool active) {
+        static_cast<ViewportHookContext *>(p)->controller->set_space_pan_active(active);
+    };
+    ui_vp_cb.user_data = &vp_ctx;
+    custom_ui.set_viewport_callbacks(ui_vp_cb);
+
+    pipeline.initialize(gfx.get_device());
+    gfx.add_input_hook(CustomUI::input_hook, &custom_ui);
+    EraseTool::get().set_stage_callback(on_erase_stage_changed);
 
     std::wcout << L"[Host] Graphics device initialized. Entering live render loop.\n";
 
     uint32_t last_preview_counter = 0;
-    uint32_t last_synced_xform_ver = 0;
     uint32_t last_request_toggle_fullscreen = 0;
-    uint32_t last_lock_flags = control_block->view_interaction_flags & (VIEW_FLAG_LOCK_PAN | VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT);
     uint32_t settle_cap = 60;
     uint32_t export_canvas_w = 0;
     uint32_t export_canvas_h = 0;
@@ -572,22 +566,6 @@ static int run_app(int argc, wchar_t **argv) {
     uint32_t export_capture_wait_frames = 0;
     uint32_t export_loading_frames = 0;
     auto last_export_tick = std::chrono::steady_clock::now();
-
-    // external hud composite tracking
-    uint32_t last_addon_heartbeat = 0;
-    auto last_addon_beat_time = std::chrono::steady_clock::now();
-    bool addon_alive = false;
-
-    auto publish_hud = [&](const uint64_t (&handles)[kHudLayers]) {
-        bool changed = false;
-        for (uint32_t i = 0; i < kHudLayers; ++i) {
-            if (control_block->hud_srv[i] != handles[i]) {
-                control_block->hud_srv[i] = handles[i];
-                changed = true;
-            }
-        }
-        if (changed) control_block->hud_version++;
-    };
 
     auto sync_depth_to_ipc = [&]() {
         uint64_t srv_handle = reinterpret_cast<uint64_t>(gfx.get_depth_canvas_srv());
@@ -633,6 +611,38 @@ static int run_app(int argc, wchar_t **argv) {
         custom_ui.set_tabs(ui_tabs, active_doc_idx);
     };
 
+    auto doc_stage_dir_key = [](uint32_t id) -> std::wstring {
+        return L"doc_" + std::to_wstring(id);
+    };
+
+    auto find_doc_by_id = [&](uint32_t id) -> int {
+        for (int i = 0; i < static_cast<int>(app_documents.size()); ++i) {
+            if (app_documents[i].id == id) return i;
+        }
+        return -1;
+    };
+
+    auto find_doc_by_dir_key = [&](const std::wstring &dir_key) -> int {
+        for (int i = 0; i < static_cast<int>(app_documents.size()); ++i) {
+            std::wstring key = app_documents[i].erase_state.stage_dir_key.empty()
+                ? doc_stage_dir_key(app_documents[i].id)
+                : app_documents[i].erase_state.stage_dir_key;
+            if (_wcsicmp(key.c_str(), dir_key.c_str()) == 0) return i;
+        }
+        return -1;
+    };
+
+    auto find_open_doc_by_path = [&](const std::wstring &path) -> int {
+        if (path.empty()) return -1;
+        for (int i = 0; i < static_cast<int>(app_documents.size()); ++i) {
+            if ((!app_documents[i].file_path.empty() && _wcsicmp(app_documents[i].file_path.c_str(), path.c_str()) == 0) ||
+                (!app_documents[i].source_path.empty() && _wcsicmp(app_documents[i].source_path.c_str(), path.c_str()) == 0)) {
+                return i;
+            }
+        }
+        return -1;
+    };
+
     auto save_active_doc_state = [&](int idx) {
         if (idx < 0 || idx >= static_cast<int>(app_documents.size())) return;
         auto &doc = app_documents[idx];
@@ -647,8 +657,24 @@ static int run_app(int argc, wchar_t **argv) {
         doc.erase_strokes = custom_ui.get_erase_strokes();
         doc.erase_undo_stack = custom_ui.get_erase_undo_stack();
         doc.erase_redo_stack = custom_ui.get_erase_redo_stack();
+        if (EraseTool::get().get_stage_dir_key().empty()) {
+            EraseTool::get().set_stage_dir_key(doc_stage_dir_key(doc.id));
+        }
+        EraseTool::get().save_document_state(doc.erase_state);
         doc.effects = custom_ui.get_effects();
-        doc.is_dirty = !doc.erase_strokes.empty();
+        doc.selected_effect_idx = custom_ui.get_selected_effect_idx();
+        doc.depth_invert = custom_ui.is_depth_invert();
+        doc.live_depth_peek = custom_ui.is_live_depth_peek();
+        doc.master_bypass = custom_ui.is_master_bypass_active();
+        if (!custom_ui.is_inpaint_busy()) {
+            doc.inpaint_status_text = custom_ui.get_inpaint_status_text();
+        }
+        if (!custom_ui.is_depth_busy()) {
+            doc.depth_status_text = custom_ui.get_depth_status_text();
+        }
+        doc.erase_step = static_cast<uint32_t>(doc.erase_state.stage_idx);
+        doc.erase_count = doc.erase_state.stages.empty() ? 0u : static_cast<uint32_t>(doc.erase_state.stages.size() - 1);
+        doc.is_dirty = doc.is_dirty || (doc.erase_step > 0) || !doc.erase_strokes.empty() || EraseTool::get().has_mask_edits();
     };
 
     auto restore_active_doc_state = [&](int idx, bool reset_viewport = false) {
@@ -662,25 +688,62 @@ static int run_app(int argc, wchar_t **argv) {
             original_image = active_image;
             current_image_path.clear();
             display_image_name.clear();
-            custom_ui.clear_erase_strokes();
+            custom_ui.clear_pending_doc_requests();
+            custom_ui.set_erase_strokes({}, {}, {});
+            custom_ui.set_effects(default_effects);
+            custom_ui.set_selected_effect_idx(0);
+            custom_ui.set_depth_invert(false);
+            custom_ui.set_live_depth_peek(false);
+            custom_ui.set_master_bypass(false);
+            custom_ui.set_inpaint_status_text("", false);
+            custom_ui.set_depth_status_text("", false);
             custom_ui.set_depth_status(false, 0, 0, 1000.0f);
-            control_block->view_image_width = 0;
-            control_block->view_image_height = 0;
+            EraseTool::DocumentState empty_erase_state;
+            EraseTool::get().restore_document_state(empty_erase_state, gfx.get_device());
+            if (control_block) {
+                control_block->erase_history_step = 0;
+                control_block->erase_history_count = 0;
+                control_block->view_image_width = 0;
+                control_block->view_image_height = 0;
+                control_block->preview_path[0] = L'\0';
+            }
             sync_depth_to_ipc();
             update_window_title(L"ShaderLab");
             return;
         }
         auto &doc = app_documents[idx];
+        if (doc.erase_state.stage_dir_key.empty()) {
+            doc.erase_state.stage_dir_key = doc_stage_dir_key(doc.id);
+        }
         active_image = doc.image;
         original_image = doc.original_image;
         current_image_path = doc.file_path;
         display_image_name = doc.display_name;
 
+        custom_ui.clear_pending_doc_requests();
         custom_ui.set_erase_strokes(doc.erase_strokes, doc.erase_undo_stack, doc.erase_redo_stack);
-        if (!doc.effects.empty()) {
-            custom_ui.set_effects(doc.effects);
-        }
+        EraseTool::get().restore_document_state(doc.erase_state, gfx.get_device());
+        custom_ui.set_effects(doc.effects.empty() ? default_effects : doc.effects);
+        custom_ui.set_selected_effect_idx(doc.selected_effect_idx);
+        custom_ui.set_depth_invert(doc.depth_invert);
+        custom_ui.set_live_depth_peek(doc.live_depth_peek);
+        custom_ui.set_master_bypass(doc.master_bypass);
+
+        bool this_doc_erasing = EraseTool::get().is_processing() &&
+            (_wcsicmp(EraseTool::get().get_processing_dir_key().c_str(), doc.erase_state.stage_dir_key.c_str()) == 0);
+        custom_ui.set_inpaint_status_text(
+            this_doc_erasing ? EraseTool::get().get_status() : doc.inpaint_status_text,
+            this_doc_erasing
+        );
+        custom_ui.set_depth_status_text(doc.depth_status_text, false);
         custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+        if (control_block) {
+            control_block->erase_history_step = static_cast<uint32_t>(EraseTool::get().get_current_erase_step());
+            control_block->erase_history_count = static_cast<uint32_t>(EraseTool::get().get_total_erase_steps());
+            doc.erase_step = control_block->erase_history_step;
+            doc.erase_count = control_block->erase_history_count;
+            wcsncpy_s(control_block->preview_path, kMaxPathW, doc.file_path.c_str(), _TRUNCATE);
+        }
 
         if (reset_viewport || !doc.viewport_initialized) {
             viewport.zoom_fit(active_image.width, active_image.height);
@@ -703,35 +766,46 @@ static int run_app(int argc, wchar_t **argv) {
         update_window_title(L"ShaderLab - [" + display_image_name + L"] (" + std::to_wstring(active_image.width) + L"x" + std::to_wstring(active_image.height) + L")" + depth_info);
     };
 
-    auto add_or_open_document = [&](const std::wstring &path, LoadedImage &&loaded, bool is_project = false) {
+    auto add_or_open_document = [&](const std::wstring &path, LoadedImage &&loaded, bool is_project = false, uint32_t preallocated_id = 0, const std::wstring &source_path = L"") {
         (void)is_project;
         if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
             save_active_doc_state(active_doc_idx);
         }
 
-        for (int i = 0; i < static_cast<int>(app_documents.size()); ++i) {
-            if (!path.empty() && _wcsicmp(app_documents[i].file_path.c_str(), path.c_str()) == 0) {
-                active_doc_idx = i;
-                restore_active_doc_state(active_doc_idx, false);
-                custom_ui.select_tab(active_doc_idx);
-                sync_tabs_to_ui();
-                return;
-            }
+        int existing_idx = find_open_doc_by_path(source_path.empty() ? path : source_path);
+        if (existing_idx < 0) {
+            existing_idx = find_open_doc_by_path(path);
+        }
+        if (existing_idx >= 0) {
+            active_doc_idx = existing_idx;
+            restore_active_doc_state(active_doc_idx, false);
+            custom_ui.select_tab(active_doc_idx);
+            sync_tabs_to_ui();
+            return;
         }
 
         AppDocument doc;
-        doc.id = next_doc_id++;
+        doc.id = (preallocated_id != 0) ? preallocated_id : next_doc_id++;
         doc.file_path = path;
-        doc.display_name = fs::path(path).filename().wstring();
+        doc.source_path = source_path;
+        std::wstring name_src = source_path.empty() ? path : source_path;
+        doc.display_name = fs::path(name_src).filename().wstring();
         if (doc.display_name.empty()) {
             doc.display_name = L"Untitled-" + std::to_wstring(doc.id);
         }
         doc.image = std::move(loaded);
         doc.original_image = doc.image;
-        doc.effects = custom_ui.get_effects();
+        doc.effects = default_effects;
+        doc.selected_effect_idx = 0;
         doc.effects_initialized = true;
+        doc.depth_invert = false;
+        doc.live_depth_peek = false;
+        doc.master_bypass = false;
         doc.viewport_initialized = false;
         doc.is_dirty = false;
+        doc.erase_step = 0;
+        doc.erase_count = 0;
+        doc.erase_state.stage_dir_key = doc_stage_dir_key(doc.id);
 
         app_documents.push_back(std::move(doc));
         active_doc_idx = static_cast<int>(app_documents.size()) - 1;
@@ -740,9 +814,89 @@ static int run_app(int argc, wchar_t **argv) {
         sync_tabs_to_ui();
     };
 
-    auto close_document = [&](int idx) {
+    auto open_image_path_as_tab = [&](const std::wstring &orig_path, bool update_ipc = true) -> bool {
+        if (orig_path.empty() || !fs::exists(orig_path)) return false;
+
+        int existing_idx = find_open_doc_by_path(orig_path);
+        if (existing_idx >= 0) {
+            if (active_doc_idx != existing_idx) {
+                if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    save_active_doc_state(active_doc_idx);
+                }
+                active_doc_idx = existing_idx;
+                restore_active_doc_state(active_doc_idx, false);
+                custom_ui.select_tab(active_doc_idx);
+                sync_tabs_to_ui();
+            }
+            if (update_ipc && control_block) {
+                control_block->view_image_width = active_image.width;
+                control_block->view_image_height = active_image.height;
+                sync_depth_to_ipc();
+            }
+            return true;
+        }
+
+        uint32_t alloc_id = next_doc_id++;
+        std::wstring doc_key = doc_stage_dir_key(alloc_id);
+        std::wstring work_path = prepare_working_copy(orig_path, doc_key);
+        LoadedImage new_preview;
+        if (!ImageLoader::load_from_file(gfx.get_device(), work_path.c_str(), new_preview)) {
+            remove_doc_workspace_dir(doc_key);
+            return false;
+        }
+
+        add_or_open_document(work_path, std::move(new_preview), false, alloc_id, orig_path);
+        if (update_ipc && control_block) {
+            if (orig_path != work_path) {
+                wcsncpy_s(control_block->dropped_file_path, kMaxPathW, orig_path.c_str(), _TRUNCATE);
+                control_block->dropped_file_counter++;
+            }
+            wcsncpy_s(control_block->preview_path, kMaxPathW, work_path.c_str(), _TRUNCATE);
+            control_block->active_project_path[0] = L'\0';
+            control_block->project_dirty = 0;
+            control_block->active_project_version++;
+            control_block->view_image_width = active_image.width;
+            control_block->view_image_height = active_image.height;
+            sync_depth_to_ipc();
+        }
+        custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+        std::wstring depth_info = active_image.has_depth ? (L" [Depth Active, F=" + std::to_wstring(static_cast<int>(active_image.far_plane)) + L"]") : L" [2D]";
+        set_host_status(control_block, L"Loaded: " + display_image_name +
+                        L" (" + std::to_wstring(active_image.width) + L"x" + std::to_wstring(active_image.height) + L")" + depth_info);
+        update_window_title(L"ShaderLab - " + display_image_name);
+        return true;
+    };
+
+    auto close_document = [&](int idx, bool force = false) {
         if (idx < 0 || idx >= static_cast<int>(app_documents.size())) return;
+        save_active_doc_state(active_doc_idx);
+        auto &doc = app_documents[idx];
+        if (!force && doc.is_dirty) {
+            std::wstring name = doc.display_name.empty() ? L"Untitled" : doc.display_name;
+            std::wstring prompt = L"Document \"" + name + L"\" has unsaved changes.\n\nDo you want to save before closing?";
+            int res = MessageBoxW(gfx.get_hwnd(), prompt.c_str(), L"ShaderLab - Unsaved Changes", MB_YESNOCANCEL | MB_ICONWARNING);
+            if (res == IDCANCEL) {
+                return;
+            }
+            if (res == IDYES) {
+                std::wstring save_p;
+                if (gui::save_file_dialog(gfx.get_hwnd(), L"PNG Image (*.png)\0*.png\0JPEG Image (*.jpg)\0*.jpg\0All Files (*.*)\0*.*\0", L"png", save_p)) {
+                    BackbufferDump::capture_to_file(gfx, save_p.c_str(), gfx.get_render_width(), gfx.get_render_height());
+                } else {
+                    return; // user cancelled save dialog
+                }
+            }
+        }
+
+        std::wstring closed_doc_key = doc_stage_dir_key(doc.id);
+        std::wstring closed_stage_key = doc.erase_state.stage_dir_key.empty() ? closed_doc_key : doc.erase_state.stage_dir_key;
         app_documents.erase(app_documents.begin() + idx);
+        remove_doc_workspace_dir(closed_doc_key);
+        if (!(EraseTool::get().is_processing() &&
+              _wcsicmp(EraseTool::get().get_processing_dir_key().c_str(), closed_stage_key.c_str()) == 0)) {
+            EraseTool::remove_stage_cache_dir(closed_stage_key);
+        }
+
         if (app_documents.empty()) {
             active_doc_idx = -1;
             restore_active_doc_state(-1, false);
@@ -760,13 +914,19 @@ static int run_app(int argc, wchar_t **argv) {
 
     auto close_other_documents = [&](int keep_idx) {
         if (keep_idx < 0 || keep_idx >= static_cast<int>(app_documents.size())) return;
-        AppDocument kept = std::move(app_documents[keep_idx]);
-        app_documents.clear();
-        app_documents.push_back(std::move(kept));
-        active_doc_idx = 0;
-        restore_active_doc_state(0, false);
-        custom_ui.select_tab(0);
-        sync_tabs_to_ui();
+        save_active_doc_state(active_doc_idx);
+        for (int i = static_cast<int>(app_documents.size()) - 1; i >= 0; --i) {
+            if (i == keep_idx) continue;
+            close_document(i, false);
+            if (i < keep_idx) keep_idx--;
+        }
+    };
+
+    auto close_all_documents = [&]() {
+        save_active_doc_state(active_doc_idx);
+        for (int i = static_cast<int>(app_documents.size()) - 1; i >= 0; --i) {
+            close_document(i, false);
+        }
     };
 
     auto duplicate_document = [&](int idx) {
@@ -775,6 +935,18 @@ static int run_app(int argc, wchar_t **argv) {
         AppDocument copy = app_documents[idx];
         copy.id = next_doc_id++;
         copy.display_name = copy.display_name + L" (Copy)";
+        copy.source_path.clear();
+        std::wstring old_key = app_documents[idx].erase_state.stage_dir_key.empty()
+            ? doc_stage_dir_key(app_documents[idx].id)
+            : app_documents[idx].erase_state.stage_dir_key;
+        std::wstring new_key = doc_stage_dir_key(copy.id);
+        if (!copy.file_path.empty() && fs::exists(copy.file_path) && !is_erase_stage_path(copy.file_path)) {
+            copy.file_path = prepare_working_copy(copy.file_path, new_key);
+        }
+        EraseTool::copy_stage_cache_dir(old_key, new_key, copy.erase_state);
+        if (!copy.file_path.empty() && !is_erase_stage_path(copy.erase_state.base_img)) {
+            copy.erase_state.base_img = copy.file_path;
+        }
         app_documents.push_back(std::move(copy));
         active_doc_idx = static_cast<int>(app_documents.size()) - 1;
         restore_active_doc_state(active_doc_idx, false);
@@ -828,14 +1000,8 @@ static int run_app(int argc, wchar_t **argv) {
     const float idle_color[4] = { 0.06f, 0.06f, 0.08f, 1.0f };
     auto last_time = std::chrono::steady_clock::now();
 
-    // first-run nudge: addon flags this in shared memory on the very first launch,
-    // host resizes the swapchain by a couple pixels and back to force reshade to
-    // reload and apply the InputProcessing setting right away
-    int nudge_stage = 0; // 0 = idle, 1 = shrunk (restore next frame)
-
     while (running) {
         if (control_block) {
-            viewport.set_erase_active((control_block->view_interaction_flags & VIEW_FLAG_ERASE_ACTIVE) != 0);
             if (control_block->export_state == ExportState::Idle && control_block->view_transform_version != last_synced_xform_ver) {
                 last_synced_xform_ver = control_block->view_transform_version;
                 viewport.sync_from_block(control_block);
@@ -853,6 +1019,19 @@ static int run_app(int argc, wchar_t **argv) {
                 running = false;
                 break;
             }
+            if (msg.message == WM_CLOSE && msg.hwnd == gfx.get_hwnd()) {
+                save_active_doc_state(active_doc_idx);
+                bool any_dirty = false;
+                for (const auto &d : app_documents) {
+                    if (d.is_dirty) { any_dirty = true; break; }
+                }
+                if (any_dirty) {
+                    int res = MessageBoxW(gfx.get_hwnd(), L"You have documents with unsaved changes.\n\nDo you want to discard changes and exit?", L"ShaderLab - Exit Confirmation", MB_YESNO | MB_ICONWARNING);
+                    if (res != IDYES) {
+                        continue; // ignore close
+                    }
+                }
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -864,22 +1043,12 @@ static int run_app(int argc, wchar_t **argv) {
         last_time = now;
         dt = (std::min)(dt, 0.1f); // cap dt so a hiccup doesnt send the fade animation flying
 
-        // first-run nudge, driven by the addon's flag in shared memory
-        if (control_block->first_run_nudge != 0 && nudge_stage == 0) {
-            gfx.resize_buffers(gfx.get_render_width() - 4, gfx.get_render_height() - 4);
-            nudge_stage = 1;
-        } else if (nudge_stage == 1) {
-            gfx.resize_buffers(gfx.get_render_width() + 4, gfx.get_render_height() + 4);
-            nudge_stage = 0;
-            control_block->first_run_nudge = 0;
-        }
-
         control_block->heartbeat++;
 
-        // keep the fine-tune key synced with whatever the addon has configured
+        // keep the fine-tune key synced
         viewport.set_fine_vk(control_block->fine_tune_vk);
 
-        // poll f11 directly as fallback if reshade swallowed the keydown event
+        // poll f11 directly as fallback
         static bool s_f11_prev = false;
         bool f11_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
         if (f11_down && !s_f11_prev) {
@@ -887,131 +1056,12 @@ static int run_app(int argc, wchar_t **argv) {
             HWND fg = GetForegroundWindow();
             if (fg) GetWindowThreadProcessId(fg, &fg_pid);
             if (fg_pid == GetCurrentProcessId()) {
-                toggle_fullscreen_safe(gfx, &toast_hud, control_block);
+                toggle_fullscreen_safe(gfx, control_block);
             }
         }
         s_f11_prev = f11_down;
 
-        // track addon liveness so we can fall back to local HUD compositing if the
-        // addon somehow failed to load even with reshade present
-        if (control_block->addon_heartbeat != last_addon_heartbeat) {
-            last_addon_heartbeat = control_block->addon_heartbeat;
-            last_addon_beat_time = now;
-            addon_alive = true;
-        } else if (std::chrono::duration<float>(now - last_addon_beat_time).count() > 2.0f) {
-            addon_alive = false;
-        }
-
-        const bool external_hud = has_reshade && addon_alive && (control_block->effects_enabled != 0);
-
-        // render the HUD layers: either published for external composite after reshade
-        // effects, or blended locally if reshade effects are off or addon not connected
-        auto render_hud_layers = [&]() {
-            float cx = 0.0f, cy = 0.0f, sw = 0.0f, sh = 0.0f;
-            viewport.get_screen_image_geometry(
-                gfx.get_render_width(), gfx.get_render_height(),
-                active_image.width, active_image.height,
-                cx, cy, sw, sh
-            );
-
-            uint64_t now_ms = GetTickCount64();
-            float idle_rotate_s = static_cast<float>(now_ms - control_block->view_last_rotate_ms) / 1000.0f;
-            float idle_zoom_s   = static_cast<float>(now_ms - control_block->view_last_zoom_ms) / 1000.0f;
-
-            bool is_rot_locked = viewport.is_lock_rotate() || ((control_block->view_interaction_flags & VIEW_FLAG_LOCK_ROT) != 0);
-            bool is_rotating_or_attempt = viewport.is_rotating() || viewport.is_rotate_locked_attempt() ||
-                                          ((control_block->view_interaction_flags & VIEW_FLAG_ROTATING) != 0) ||
-                                          (is_rot_locked && idle_rotate_s < 1.0f);
-
-            compass_hud.update(
-                dt,
-                is_rotating_or_attempt,
-                idle_rotate_s,
-                viewport.get_snapped_angle(),
-                viewport.is_snapped(),
-                viewport.is_fine(),
-                cx, cy, sw, sh,
-                is_rot_locked
-            );
-            if (compass_hud.is_visible()) {
-                compass_hud.render(gfx.get_context(), gfx.get_render_width(), gfx.get_render_height());
-                if (!external_hud && compass_hud.get_srv()) {
-                    blit.render_blend(gfx.get_context(), compass_hud.get_srv());
-                }
-            }
-
-            bool is_zoom_locked = viewport.is_lock_zoom() || ((control_block->view_interaction_flags & VIEW_FLAG_LOCK_ZOOM) != 0);
-            zoom_hud.update(dt, viewport.get_transform().zoom, idle_zoom_s, is_zoom_locked, viewport.is_fine());
-            if (zoom_hud.is_visible()) {
-                zoom_hud.render(gfx.get_context(), gfx.get_render_width(), gfx.get_render_height());
-                if (!external_hud && zoom_hud.get_srv()) {
-                    blit.render_blend(gfx.get_context(), zoom_hud.get_srv());
-                }
-            }
-
-            DWORD fg_pid = 0;
-            HWND fg_hwnd = GetForegroundWindow();
-            if (fg_hwnd) GetWindowThreadProcessId(fg_hwnd, &fg_pid);
-            bool is_app_focused = (fg_pid == GetCurrentProcessId());
-            bool want_text = (control_block->view_interaction_flags & VIEW_FLAG_TEXT_INPUT) != 0;
-            bool is_d_pressed = (GetAsyncKeyState('D') & 0x8000) != 0;
-            bool depth_peek = active_image.has_depth && active_image.depth_srv && is_d_pressed && is_app_focused && !want_text;
-            bool pan_locked_held = (control_block->view_interaction_flags & VIEW_FLAG_PAN_LOCKED_ATTEMPT) != 0 ||
-                                   viewport.is_pan_locked_attempt();
-            bool is_dragging_ba_pos = viewport.is_before_after_enabled() && viewport.is_dragging_split_pos();
-            bool is_dragging_ba_rot = viewport.is_before_after_enabled() && viewport.is_dragging_split_rot();
-
-            if (depth_peek) {
-                toast_hud.show_held(L"Depth Peek (Holding D)");
-            } else if (pan_locked_held) {
-                toast_hud.show_held(L"Pan Locked");
-            } else if (is_dragging_ba_pos) {
-                int pct = static_cast<int>(std::round((viewport.get_before_after_split() + 0.5f) * 100.0f));
-                wchar_t buf[48];
-                swprintf_s(buf, L"Split: %d%%", pct);
-                toast_hud.show_held(buf);
-            } else if (is_dragging_ba_rot) {
-                float ang = viewport.get_before_after_angle();
-                bool snapped = (std::fmod(ang, 45.0f) == 0.0f);
-                wchar_t buf[64];
-                if (snapped) {
-                    swprintf_s(buf, L"Split Angle: %.0f° (Snapped)", ang);
-                } else {
-                    swprintf_s(buf, L"Split Angle: %.1f°", ang);
-                }
-                toast_hud.show_held(buf);
-            } else {
-                toast_hud.release_held();
-            }
-
-            toast_hud.update(dt);
-            if (toast_hud.is_visible()) {
-                toast_hud.render(gfx.get_context(), gfx.get_render_width(), gfx.get_render_height());
-                if (!external_hud && toast_hud.get_srv()) {
-                    blit.render_blend(gfx.get_context(), toast_hud.get_srv());
-                }
-            }
-
-            if (warning.is_active()) {
-                warning.update_and_render(gfx.get_context(), gfx.get_render_width(), gfx.get_render_height(), dt);
-                if (warning.get_srv()) {
-                    blit.render_blend(gfx.get_context(), warning.get_srv());
-                }
-            }
-
-            if (external_hud) {
-                uint64_t handles[kHudLayers] = { 0, 0, 0 };
-                if (compass_hud.is_visible()) handles[0] = compass_hud.get_srv_handle();
-                if (zoom_hud.is_visible())    handles[1] = zoom_hud.get_srv_handle();
-                if (toast_hud.is_visible())   handles[2] = toast_hud.get_srv_handle();
-                publish_hud(handles);
-            } else {
-                uint64_t zero_handles[kHudLayers] = { 0, 0, 0 };
-                publish_hud(zero_handles);
-            }
-        };
-
-        // sync the view transform if the addon modified it, e.g. while the reshade overlay is open
+        // sync the view transform if ipc modified it
         if (control_block->export_state == ExportState::Idle && control_block->view_transform_version != last_synced_xform_ver) {
             last_synced_xform_ver = control_block->view_transform_version;
             viewport.sync_from_block(control_block);
@@ -1034,49 +1084,9 @@ static int run_app(int argc, wchar_t **argv) {
             }
         }
 
-        // toggle fullscreen if requested by reshade helper overlay
         if (control_block->request_toggle_fullscreen != last_request_toggle_fullscreen) {
             last_request_toggle_fullscreen = control_block->request_toggle_fullscreen;
-            toggle_fullscreen_safe(gfx, &toast_hud, control_block);
-        }
-
-        // show toast notification if requested by addon or other components
-        static uint32_t s_last_toast_ver = 0;
-        if (control_block->toast_version != s_last_toast_ver) {
-            s_last_toast_ver = control_block->toast_version;
-            if (control_block->toast_message[0] != L'\0') {
-                toast_hud.show(control_block->toast_message);
-            }
-        }
-
-        // detect before/after toggle or lock flag changes to show top notification
-        static uint32_t s_last_ba_flag = 0;
-        uint32_t cur_ba_flag = control_block->view_interaction_flags & VIEW_FLAG_BEFORE_AFTER;
-        static uint32_t s_last_erase_flag = 0;
-        uint32_t cur_erase_flag = control_block->view_interaction_flags & VIEW_FLAG_ERASE_ACTIVE;
-        uint32_t cur_lock_flags = control_block->view_interaction_flags & (VIEW_FLAG_LOCK_PAN | VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT);
-        if (cur_erase_flag != s_last_erase_flag) {
-            s_last_erase_flag = cur_erase_flag;
-            toast_hud.show(cur_erase_flag ? L"Erase Mode Active" : L"Erase Mode Disabled");
-        } else if (cur_ba_flag != s_last_ba_flag) {
-            s_last_ba_flag = cur_ba_flag;
-            toast_hud.show(cur_ba_flag ? L"Before / After Comparison Active" : L"Before / After Disabled");
-            last_lock_flags = cur_lock_flags;
-        } else if (cur_lock_flags != last_lock_flags) {
-            uint32_t diff = cur_lock_flags ^ last_lock_flags;
-            uint32_t all_mask = (VIEW_FLAG_LOCK_PAN | VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT);
-            if ((diff & (diff - 1)) != 0) {
-                // multiple locks toggled at once (e.g. Lock View / All)
-                bool all_on = (cur_lock_flags & all_mask) == all_mask;
-                toast_hud.show(all_on ? L"View Locked (All)" : L"View Unlocked");
-            } else if (diff & VIEW_FLAG_LOCK_PAN) {
-                toast_hud.show((cur_lock_flags & VIEW_FLAG_LOCK_PAN) ? L"Pan Locked" : L"Pan Unlocked");
-            } else if (diff & VIEW_FLAG_LOCK_ZOOM) {
-                toast_hud.show((cur_lock_flags & VIEW_FLAG_LOCK_ZOOM) ? L"Zoom Locked" : L"Zoom Unlocked");
-            } else if (diff & VIEW_FLAG_LOCK_ROT) {
-                toast_hud.show((cur_lock_flags & VIEW_FLAG_LOCK_ROT) ? L"Rotation Locked" : L"Rotation Unlocked");
-            }
-            last_lock_flags = cur_lock_flags;
+            toggle_fullscreen_safe(gfx, control_block);
         }
 
         // process host-targeted mailbox commands from CLI / MCP / automation
@@ -1123,6 +1133,8 @@ static int run_app(int argc, wchar_t **argv) {
                 custom_ui.queue_mouse_event(mx, my, act);
                 viewport.simulate_mouse(mx, my, act);
                 custom_ui.simulate_canvas_mouse(mx, my, act);
+                viewport.sync_to_block(control_block);
+                last_synced_xform_ver = control_block->view_transform_version;
                 control_block->mailbox.status = 1;
                 swprintf_s(control_block->mailbox.response_text, L"Mouse event: (%.0f, %.0f) act=%d", mx, my, act);
                 MemoryBarrier();
@@ -1147,7 +1159,11 @@ static int run_app(int argc, wchar_t **argv) {
                 control_block->mailbox.seq_handled = control_block->mailbox.seq_request;
             } else if (cmd == static_cast<uint32_t>(IpcCmd::TriggerAction)) {
                 uint32_t action_id = static_cast<uint32_t>(control_block->mailbox.values[0]);
-                if (action_id == static_cast<uint32_t>(IpcAction::ResetRotation)) {
+                if (action_id == static_cast<uint32_t>(IpcAction::Undo)) {
+                    custom_ui.undo_erase_stroke();
+                } else if (action_id == static_cast<uint32_t>(IpcAction::Redo)) {
+                    custom_ui.redo_erase_stroke();
+                } else if (action_id == static_cast<uint32_t>(IpcAction::ResetRotation)) {
                     control_block->view_angle = 0.0f;
                     control_block->view_raw_angle = 0.0f;
                     control_block->view_transform_version++;
@@ -1175,7 +1191,7 @@ static int run_app(int argc, wchar_t **argv) {
                         ipc_set_view_flag(&control_block->view_interaction_flags, all_mask);
                     }
                 } else if (action_id == static_cast<uint32_t>(IpcAction::ToggleFullscreen)) {
-                    toggle_fullscreen_safe(gfx, &toast_hud, control_block);
+                    toggle_fullscreen_safe(gfx, control_block);
                 } else if (action_id == static_cast<uint32_t>(IpcAction::FineTune)) {
                     ipc_toggle_view_flag(&control_block->view_interaction_flags, VIEW_FLAG_FINE);
                 } else if (action_id == static_cast<uint32_t>(IpcAction::NudgeLeft)) {
@@ -1279,129 +1295,116 @@ static int run_app(int argc, wchar_t **argv) {
             if (wcslen(control_block->preview_path) > 0 && fs::exists(control_block->preview_path)) {
                 if (project_file::is_project_file(control_block->preview_path)) {
                     std::wstring proj_src_path = control_block->preview_path;
-                    wchar_t temp_dir[MAX_PATH] = {};
-                    GetTempPathW(MAX_PATH, temp_dir);
-                    fs::path ws_dir = fs::path(temp_dir) / "ShaderLab" / "workspace";
-                    std::error_code ec;
-                    fs::create_directories(ws_dir, ec);
-
-                    // clean previous workspace contents so stale sidecars or files dont linger
-                    for (const auto &entry : fs::directory_iterator(ws_dir, ec)) {
-                        fs::remove_all(entry.path(), ec);
-                    }
-
-                    std::wstring out_img_path, out_preset_path, load_err;
-                    project_file::ProjectManifest manifest;
-                    if (project_file::load_project(proj_src_path, ws_dir.wstring(), out_img_path, out_preset_path, manifest, load_err)) {
-                        LoadedImage new_preview;
-                        if (ImageLoader::load_from_file(gfx.get_device(), out_img_path.c_str(), new_preview)) {
-                            add_or_open_document(proj_src_path, std::move(new_preview), true);
-                            control_block->erase_history_step = 0;
-                            control_block->erase_history_count = 0;
-                            if (manifest.depth.has_depth && manifest.depth.far_plane > 0.0f) {
-                                active_image.far_plane = manifest.depth.far_plane;
-                                if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
-                                    app_documents[active_doc_idx].image.far_plane = manifest.depth.far_plane;
-                                    app_documents[active_doc_idx].image.has_depth = true;
-                                }
-                            }
-                            control_block->view_image_width = active_image.width;
-                            control_block->view_image_height = active_image.height;
-                            sync_depth_to_ipc();
-                            custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+                    int existing_proj_idx = find_open_doc_by_path(proj_src_path);
+                    if (existing_proj_idx >= 0) {
+                        if (active_doc_idx != existing_proj_idx) {
+                            save_active_doc_state(active_doc_idx);
+                            active_doc_idx = existing_proj_idx;
+                            restore_active_doc_state(active_doc_idx, false);
+                            custom_ui.select_tab(active_doc_idx);
                             sync_tabs_to_ui();
-
-                            // restore camera transform and interaction locks
-                            control_block->view_zoom = manifest.view.zoom > 0.0f ? manifest.view.zoom : 1.0f;
-                            control_block->view_angle = manifest.view.angle;
-                            control_block->view_raw_angle = manifest.view.angle;
-                            control_block->view_pan[0] = static_cast<int32_t>(std::round(manifest.view.pan[0]));
-                            control_block->view_pan[1] = static_cast<int32_t>(std::round(manifest.view.pan[1]));
-
-                            uint32_t flags = 0;
-                            if (manifest.view.lock_zoom) flags |= VIEW_FLAG_LOCK_ZOOM;
-                            if (manifest.view.lock_rot)  flags |= VIEW_FLAG_LOCK_ROT;
-                            if (manifest.view.lock_pan)  flags |= VIEW_FLAG_LOCK_PAN;
-                            constexpr uint32_t kProjectLockMask = VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT | VIEW_FLAG_LOCK_PAN;
-                            ipc_update_view_flags(&control_block->view_interaction_flags, kProjectLockMask, flags);
-                            control_block->view_transform_version++;
-                            viewport.sync_from_block(control_block);
-
-                            // update preview_path to point to the extracted working image
-                            wcsncpy_s(control_block->preview_path, kMaxPathW, out_img_path.c_str(), _TRUNCATE);
-
-                            // track active project path so Ctrl+S saves directly to this project
-                            fs::path abs_proj = fs::absolute(proj_src_path);
-                            wcsncpy_s(control_block->active_project_path, kMaxPathW, abs_proj.wstring().c_str(), _TRUNCATE);
-                            control_block->project_dirty = 0;
-                            control_block->active_project_version++;
-
-                            // restore reshade preset if present
-                            if (control_block->export_state == ExportState::Idle && !out_preset_path.empty() && fs::exists(out_preset_path)) {
-                                fs::path abs_preset = fs::absolute(out_preset_path);
-                                wcsncpy_s(control_block->requested_preset_path, kMaxPathW, abs_preset.wstring().c_str(), _TRUNCATE);
-                                control_block->requested_preset_version++;
-                            }
-
-                            std::wstring depth_info = active_image.has_depth ? (L" [Depth Active, F=" + std::to_wstring(static_cast<int>(active_image.far_plane)) + L"]") : L" [2D]";
-                            set_host_status(control_block, L"Loaded Project: " + display_image_name + depth_info);
-                            update_window_title(L"ShaderLab - " + display_image_name);
-                        } else {
-                            set_host_status(control_block, L"Project error: failed to decode image inside " + fs::path(proj_src_path).filename().wstring());
                         }
                     } else {
-                        set_host_status(control_block, L"Failed to load project: " + load_err);
-                    }
-                } else {
-                    std::wstring orig_source_path = control_block->preview_path;
-                    std::wstring work_path = prepare_working_copy(orig_source_path);
-                    if (work_path != control_block->preview_path) {
-                        wcsncpy_s(control_block->preview_path, kMaxPathW, work_path.c_str(), _TRUNCATE);
-                    }
-                    if (orig_source_path != work_path) {
-                        wcsncpy_s(control_block->dropped_file_path, kMaxPathW, orig_source_path.c_str(), _TRUNCATE);
-                        control_block->dropped_file_counter++;
-                    }
+                        uint32_t alloc_id = next_doc_id++;
+                        fs::path ws_dir = get_workspace_root();
+                        fs::path proj_ws = ws_dir.empty() ? fs::path() : (ws_dir / doc_stage_dir_key(alloc_id));
+                        std::error_code ec;
+                        if (!proj_ws.empty()) {
+                            fs::remove_all(proj_ws, ec);
+                            fs::create_directories(proj_ws, ec);
+                        }
 
+                        std::wstring out_img_path, out_preset_path, load_err;
+                        project_file::ProjectManifest manifest;
+                        if (project_file::load_project(proj_src_path, proj_ws.wstring(), out_img_path, out_preset_path, manifest, load_err)) {
+                            LoadedImage new_preview;
+                            if (ImageLoader::load_from_file(gfx.get_device(), out_img_path.c_str(), new_preview)) {
+                                add_or_open_document(out_img_path, std::move(new_preview), true, alloc_id, proj_src_path);
+                                if (manifest.depth.has_depth && manifest.depth.far_plane > 0.0f) {
+                                    active_image.far_plane = manifest.depth.far_plane;
+                                    if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                                        app_documents[active_doc_idx].image.far_plane = manifest.depth.far_plane;
+                                        app_documents[active_doc_idx].image.has_depth = true;
+                                    }
+                                }
+                                control_block->view_image_width = active_image.width;
+                                control_block->view_image_height = active_image.height;
+                                sync_depth_to_ipc();
+                                custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+                                sync_tabs_to_ui();
+
+                                // restore camera transform and interaction locks
+                                control_block->view_zoom = manifest.view.zoom > 0.0f ? manifest.view.zoom : 1.0f;
+                                control_block->view_angle = manifest.view.angle;
+                                control_block->view_raw_angle = manifest.view.angle;
+                                control_block->view_pan[0] = static_cast<int32_t>(std::round(manifest.view.pan[0]));
+                                control_block->view_pan[1] = static_cast<int32_t>(std::round(manifest.view.pan[1]));
+
+                                uint32_t flags = 0;
+                                if (manifest.view.lock_zoom) flags |= VIEW_FLAG_LOCK_ZOOM;
+                                if (manifest.view.lock_rot)  flags |= VIEW_FLAG_LOCK_ROT;
+                                if (manifest.view.lock_pan)  flags |= VIEW_FLAG_LOCK_PAN;
+                                constexpr uint32_t kProjectLockMask = VIEW_FLAG_LOCK_ZOOM | VIEW_FLAG_LOCK_ROT | VIEW_FLAG_LOCK_PAN;
+                                ipc_update_view_flags(&control_block->view_interaction_flags, kProjectLockMask, flags);
+                                control_block->view_transform_version++;
+                                viewport.sync_from_block(control_block);
+
+                                // update preview_path to point to the extracted working image
+                                wcsncpy_s(control_block->preview_path, kMaxPathW, out_img_path.c_str(), _TRUNCATE);
+
+                                // track active project path so Ctrl+S saves directly to this project
+                                fs::path abs_proj = fs::absolute(proj_src_path);
+                                wcsncpy_s(control_block->active_project_path, kMaxPathW, abs_proj.wstring().c_str(), _TRUNCATE);
+                                control_block->project_dirty = 0;
+                                control_block->active_project_version++;
+
+                                // restore reshade preset if present
+                                if (control_block->export_state == ExportState::Idle && !out_preset_path.empty() && fs::exists(out_preset_path)) {
+                                    fs::path abs_preset = fs::absolute(out_preset_path);
+                                    wcsncpy_s(control_block->requested_preset_path, kMaxPathW, abs_preset.wstring().c_str(), _TRUNCATE);
+                                    control_block->requested_preset_version++;
+                                }
+
+                                std::wstring depth_info = active_image.has_depth ? (L" [Depth Active, F=" + std::to_wstring(static_cast<int>(active_image.far_plane)) + L"]") : L" [2D]";
+                                set_host_status(control_block, L"Loaded Project: " + display_image_name + depth_info);
+                                update_window_title(L"ShaderLab - " + display_image_name);
+                            } else {
+                                remove_doc_workspace_dir(doc_stage_dir_key(alloc_id));
+                                set_host_status(control_block, L"Project error: failed to decode image inside " + fs::path(proj_src_path).filename().wstring());
+                            }
+                        } else {
+                            remove_doc_workspace_dir(doc_stage_dir_key(alloc_id));
+                            set_host_status(control_block, L"Failed to load project: " + load_err);
+                        }
+                    }
+                } else if (is_erase_stage_path(control_block->preview_path)) {
                     LoadedImage new_preview;
                     if (ImageLoader::load_from_file(gfx.get_device(), control_block->preview_path, new_preview)) {
-                        if (is_erase_stage_path(control_block->preview_path)) {
-                            active_image = new_preview;
-                            if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
-                                app_documents[active_doc_idx].image = active_image;
-                                app_documents[active_doc_idx].is_dirty = true;
-                            }
-                            sync_tabs_to_ui();
-                        } else {
-                            add_or_open_document(control_block->preview_path, std::move(new_preview));
-                            control_block->erase_history_step = 0;
-                            control_block->erase_history_count = 0;
-                            control_block->active_project_path[0] = L'\0';
-                            control_block->project_dirty = 0;
-                            control_block->active_project_version++;
+                        active_image = new_preview;
+                        if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                            app_documents[active_doc_idx].image = active_image;
+                            app_documents[active_doc_idx].is_dirty = true;
                         }
+                        sync_tabs_to_ui();
                         control_block->view_image_width = active_image.width;
                         control_block->view_image_height = active_image.height;
                         sync_depth_to_ipc();
                         custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
-
-                        std::wstring depth_info = active_image.has_depth ? (L" [Depth Active, F=" + std::to_wstring(static_cast<int>(active_image.far_plane)) + L"]") : L" [2D]";
-                        set_host_status(control_block, L"Loaded: " + display_image_name +
-                                        L" (" + std::to_wstring(active_image.width) + L"x" + std::to_wstring(active_image.height) + L")" + depth_info);
-                        update_window_title(L"ShaderLab - " + display_image_name);
-
+                    }
+                } else {
+                    std::wstring orig_source_path = control_block->preview_path;
+                    if (open_image_path_as_tab(orig_source_path, true)) {
                         static bool s_loaded_initial_extra_files = false;
                         if (!s_loaded_initial_extra_files && initial_launch_files.size() > 1) {
                             s_loaded_initial_extra_files = true;
                             for (size_t k = 1; k < initial_launch_files.size(); ++k) {
-                                LoadedImage extra_img;
-                                if (ImageLoader::load_from_file(gfx.get_device(), initial_launch_files[k].c_str(), extra_img)) {
-                                    add_or_open_document(initial_launch_files[k], std::move(extra_img));
-                                }
+                                open_image_path_as_tab(initial_launch_files[k], false);
                             }
                             if (!app_documents.empty()) {
+                                save_active_doc_state(active_doc_idx);
                                 active_doc_idx = 0;
                                 restore_active_doc_state(0, false);
+                                custom_ui.select_tab(0);
                                 sync_tabs_to_ui();
                             }
                         }
@@ -1535,28 +1538,7 @@ static int run_app(int argc, wchar_t **argv) {
                 last_export_tick = std::chrono::steady_clock::now();
             }
 
-            // wait until reshade_finish_effects fires so effects are fully loaded on new canvas.
-            // only require effects_ready to advance past the snapshot: once finish_effects has
-            // fired at least one frame the runtime is live and effects rendered cleanly.
-            // don't gate on effects_compiling == 0: preset sync inside on_reshade_finish_effects
-            // can set it back to 1 in the same callback that cleared it, which spins a whole
-            // second recompile cycle even though effects were already rendering fine
-            bool effects_enabled = has_reshade && addon_alive && (control_block->effects_enabled != 0);
-            if (effects_enabled && !export_effects_initialized) {
-                bool finish_effects_fired = (control_block->effects_ready > export_start_effects_ready);
-                if (!finish_effects_fired) {
-                    update_window_title(L"ShaderLab - Compiling ReShade Shaders...");
-                    set_host_status(control_block, L"Compiling ReShade shaders across canvas...");
-                    export_reload_wait_frames++;
-                    // safety timeout 1800 frames (~30s at 60fps) to avoid hanging if compilation fails
-                    if (export_reload_wait_frames < 1800) {
-                        break; // keep presenting frames so reshade compiles on worker threads
-                    }
-                }
-                export_effects_initialized = true;
-                control_block->export_frame_index = 0;
-                settle_detector.reset();
-            } else if (!effects_enabled && !export_effects_initialized) {
+            if (!export_effects_initialized) {
                 export_effects_initialized = true;
                 control_block->export_frame_index = 0;
                 settle_detector.reset();
@@ -1588,23 +1570,14 @@ static int run_app(int argc, wchar_t **argv) {
                 }
             } else if (auto_converge) {
                 // smart settle convergence analysis
-                bool effects_active = has_reshade && addon_alive && (control_block->effects_enabled != 0);
                 converged = settle_detector.check_convergence(
                     gfx.get_device(),
                     gfx.get_context(),
                     gfx.get_swap_chain(),
                     delta,
-                    effects_active
+                    false
                 );
                 control_block->export_last_delta = delta;
-
-                // when effects are active (DoF, TAA, Bloom, motion blur), enforce a minimum
-                // warmup of 60 frames (1 full second) before allowing early convergence, ensuring
-                // slow-settling effects have started accumulating and autofocus has begun
-                constexpr uint32_t kMinWarmupFrames = 60;
-                if (effects_active && control_block->export_frame_index < kMinWarmupFrames) {
-                    converged = false;
-                }
 
                 if (converged) {
                     control_block->export_converged = 1;
@@ -1665,20 +1638,7 @@ static int run_app(int argc, wchar_t **argv) {
 
             export_capture_wait_frames++;
 
-            // addon already completed or failed export in on_reshade_finish_effects: skip
-            // host fallback capture so we never overwrite the addon's output
-            if (control_block->export_state == ExportState::Done || control_block->export_state == ExportState::Failed) {
-                export_capture_wait_frames = 0;
-                gfx.present(1, 0);
-                break;
-            }
-
-            // addon owns the capture in on_reshade_finish_effects while effects are active
-            // and connected; host captures directly only when effects are inactive, or as a
-            // safety fallback after 180 frames (~3s at 60fps)
-            bool reshade_effects_active = has_reshade && addon_alive && (control_block->effects_enabled != 0);
-            if (!reshade_effects_active || export_capture_wait_frames >= 180) {
-                if (control_block->export_state == ExportState::Capturing) {
+            if (control_block->export_state == ExportState::Capturing) {
                     bool ok = BackbufferDump::capture_to_file(gfx, control_block->export_output_path, export_canvas_w, export_canvas_h);
                     if (ok) {
                         bool req_embed = (control_block->export_flags & EXPORT_FLAG_EMBED_DEPTH) != 0;
@@ -1744,9 +1704,8 @@ static int run_app(int argc, wchar_t **argv) {
                         wcsncpy_s(control_block->export_status, kMaxPathW, L"Export failed (file write error)", _TRUNCATE);
                         control_block->export_state = ExportState::Failed;
                     }
+                    export_capture_wait_frames = 0;
                 }
-                export_capture_wait_frames = 0;
-            }
 
             gfx.present(1, 0);
             break;
@@ -1951,10 +1910,7 @@ static int run_app(int argc, wchar_t **argv) {
 
             std::wstring open_path;
             if (custom_ui.pop_open_image_request(open_path)) {
-                LoadedImage new_img;
-                if (ImageLoader::load_from_file(gfx.get_device(), open_path.c_str(), new_img)) {
-                    add_or_open_document(open_path, std::move(new_img));
-                }
+                open_image_path_as_tab(open_path, true);
             }
 
             int switch_to_tab = -1;
@@ -1978,10 +1934,7 @@ static int run_app(int argc, wchar_t **argv) {
             }
 
             if (custom_ui.pop_close_all_tabs_request()) {
-                app_documents.clear();
-                active_doc_idx = -1;
-                restore_active_doc_state(-1, false);
-                sync_tabs_to_ui();
+                close_all_documents();
             }
 
             int dup_tab_idx = -1;
@@ -2028,40 +1981,322 @@ static int run_app(int argc, wchar_t **argv) {
             if (custom_ui.pop_200_view_request()) {
                 viewport.zoom_200(active_image.width, active_image.height);
             }
+            if (custom_ui.pop_zoom_in_request()) {
+                viewport.zoom_by(1.25f);
+            }
+            if (custom_ui.pop_zoom_out_request()) {
+                viewport.zoom_by(0.80f);
+            }
+
+            if (custom_ui.pop_clear_mask_request()) {
+                custom_ui.clear_erase_strokes();
+                if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                    app_documents[active_doc_idx].erase_strokes.clear();
+                    app_documents[active_doc_idx].erase_undo_stack.clear();
+                    app_documents[active_doc_idx].erase_redo_stack.clear();
+                    EraseTool::get().save_document_state(app_documents[active_doc_idx].erase_state);
+                    sync_tabs_to_ui();
+                }
+            }
 
             std::wstring add_shader_p;
             if (custom_ui.pop_add_shader_request(add_shader_p)) {
                 // Future shader load hook
             }
 
+            static bool s_was_depth_processing = false;
+            static uint32_t s_depth_target_doc_id = 0;
+            static size_t s_depth_target_erase_step = 0;
+            static std::wstring s_depth_target_path;
+            static bool s_was_erase_processing = false;
+            static uint32_t s_erase_target_doc_id = 0;
+
             std::string depth_enc;
             float depth_far = 1000.0f;
             if (custom_ui.pop_generate_depth_request(depth_enc, depth_far)) {
-                wchar_t exe_buf[MAX_PATH] = {};
-                GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
-                fs::path base_p = fs::path(exe_buf).parent_path();
-                fs::path script_p = base_p / "tools" / "depth_anything_v2" / "run_depth_anything.py";
-                if (!fs::exists(script_p)) {
-                    script_p = base_p / "run_depth_anything.py";
+                std::wstring active_path = (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size()))
+                    ? app_documents[active_doc_idx].file_path : current_image_path;
+                size_t cur_erase_step = EraseTool::get().get_current_erase_step();
+                if (cur_erase_step > 0) {
+                    std::wstring stage_p = EraseTool::get().get_current_stage_path();
+                    if (!stage_p.empty() && fs::exists(stage_p)) {
+                        active_path = stage_p;
+                    }
                 }
-                if (!fs::exists(script_p)) {
-                    custom_ui.set_depth_status_text("AI model not found: tools/depth_anything_v2. Place models in tools/.", false);
+                if (active_path.empty() || !fs::exists(active_path)) {
+                    custom_ui.set_depth_status_text("Save or open an image file before generating depth.", false);
+                    if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                        app_documents[active_doc_idx].depth_status_text = custom_ui.get_depth_status_text();
+                    }
                 } else {
-                    custom_ui.set_depth_status_text("Depth Anything v2 ready. Use Attach .sldepth to load map.", false);
+                    s_depth_target_doc_id = (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size()))
+                        ? app_documents[active_doc_idx].id : 0;
+                    s_depth_target_erase_step = cur_erase_step;
+                    s_depth_target_path = active_path;
+                    bool triggered = DepthManager::get().trigger_depth_estimate(
+                        active_path,
+                        depth_far,
+                        false,
+                        depth_enc
+                    );
+                    if (triggered) {
+                        s_was_depth_processing = true;
+                        custom_ui.set_depth_status_text("Running Depth-Anything-V2 (" + depth_enc + ")...", true);
+                    } else {
+                        std::string err = DepthManager::get().get_last_error();
+                        custom_ui.set_depth_status_text(err.empty() ? "Failed to trigger depth estimation." : err, false);
+                        if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                            app_documents[active_doc_idx].depth_status_text = custom_ui.get_depth_status_text();
+                        }
+                    }
+                }
+            }
+
+            if (DepthManager::get().is_processing()) {
+                s_was_depth_processing = true;
+                bool on_depth_doc = (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size()) &&
+                    app_documents[active_doc_idx].id == s_depth_target_doc_id);
+                if (on_depth_doc) {
+                    std::string dst = DepthManager::get().get_status();
+                    if (!dst.empty()) custom_ui.set_depth_status_text(dst, true);
+                } else {
+                    std::string saved_st = (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size()))
+                        ? app_documents[active_doc_idx].depth_status_text : "";
+                    custom_ui.set_depth_status_text(saved_st, false);
+                }
+            } else if (s_was_depth_processing) {
+                s_was_depth_processing = false;
+                int target_doc_idx = (s_depth_target_doc_id != 0) ? find_doc_by_id(s_depth_target_doc_id) : active_doc_idx;
+                bool on_target_doc = (target_doc_idx >= 0 && target_doc_idx == active_doc_idx);
+                std::string err = DepthManager::get().get_last_error();
+                if (!err.empty()) {
+                    if (target_doc_idx >= 0 && target_doc_idx < static_cast<int>(app_documents.size())) {
+                        app_documents[target_doc_idx].depth_status_text = err;
+                    }
+                    if (on_target_doc) {
+                        custom_ui.set_depth_status_text(err, false);
+                    }
+                } else if (target_doc_idx >= 0 && target_doc_idx < static_cast<int>(app_documents.size()) &&
+                           !s_depth_target_path.empty() && fs::exists(s_depth_target_path)) {
+                    LoadedImage depth_reloaded;
+                    if (ImageLoader::load_from_file(gfx.get_device(), s_depth_target_path.c_str(), depth_reloaded) &&
+                        depth_reloaded.has_depth && depth_reloaded.depth_srv) {
+                        auto apply_depth = [&](LoadedImage &img) {
+                            img.has_depth = depth_reloaded.has_depth;
+                            img.depth_srv = depth_reloaded.depth_srv;
+                            img.depth_texture = depth_reloaded.depth_texture;
+                            img.depth_width = depth_reloaded.depth_width;
+                            img.depth_height = depth_reloaded.depth_height;
+                            img.is_flat = depth_reloaded.is_flat;
+                            img.min_depth = depth_reloaded.min_depth;
+                            img.max_depth = depth_reloaded.max_depth;
+                            img.depth_pixels = std::move(depth_reloaded.depth_pixels);
+                            img.far_plane = depth_reloaded.far_plane;
+                        };
+                        auto &tdoc = app_documents[target_doc_idx];
+                        apply_depth(tdoc.image);
+                        tdoc.depth_status_text.clear();
+                        if (s_depth_target_erase_step > 0) {
+                            fs::path sc_p = s_depth_target_path;
+                            sc_p.replace_extension(L".sldepth");
+                            if (fs::exists(sc_p) && s_depth_target_erase_step < tdoc.erase_state.stages.size()) {
+                                tdoc.erase_state.stages[s_depth_target_erase_step].sidecar = sc_p.wstring();
+                            }
+                        }
+                        if (on_target_doc) {
+                            active_image = tdoc.image;
+                            sync_depth_to_ipc();
+                            custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+                            custom_ui.set_depth_status_text("", false);
+                        }
+                        sync_tabs_to_ui();
+                    } else {
+                        app_documents[target_doc_idx].depth_status_text = "Depth generated, but sidecar failed to load.";
+                        if (on_target_doc) {
+                            custom_ui.set_depth_status_text("Depth generated, but sidecar failed to load.", false);
+                        }
+                    }
+                } else if (on_target_doc) {
+                    custom_ui.set_depth_status_text("", false);
+                }
+            }
+
+            // Apply completed EraseTool stage transitions (from LaMa daemon/CLI worker or Undo/Redo Erase)
+            {
+                std::vector<StageEvent> stage_events;
+                {
+                    std::lock_guard<std::mutex> lock(g_pending_stage.mtx);
+                    if (!g_pending_stage.queue.empty()) {
+                        stage_events = std::move(g_pending_stage.queue);
+                        g_pending_stage.queue.clear();
+                    }
+                }
+
+                for (const auto &ev : stage_events) {
+                    if (ev.img_path.empty()) continue;
+                    int target_doc_idx = ev.dir_key.empty() ? active_doc_idx : find_doc_by_dir_key(ev.dir_key);
+                    if (target_doc_idx < 0 || target_doc_idx >= static_cast<int>(app_documents.size())) {
+                        if (!ev.dir_key.empty()) {
+                            EraseTool::remove_stage_cache_dir(ev.dir_key);
+                        }
+                        continue;
+                    }
+
+                    auto &tdoc = app_documents[target_doc_idx];
+                    bool is_active_doc = (target_doc_idx == active_doc_idx);
+                    LoadedImage stage_img;
+                    if (ImageLoader::load_from_file(gfx.get_device(), ev.img_path.c_str(), stage_img) && stage_img.srv) {
+                        if (!stage_img.has_depth && tdoc.image.has_depth && tdoc.image.depth_srv) {
+                            stage_img.has_depth = tdoc.image.has_depth;
+                            stage_img.depth_srv = tdoc.image.depth_srv;
+                            stage_img.depth_texture = tdoc.image.depth_texture;
+                            stage_img.depth_width = tdoc.image.depth_width;
+                            stage_img.depth_height = tdoc.image.depth_height;
+                            stage_img.is_flat = tdoc.image.is_flat;
+                            stage_img.min_depth = tdoc.image.min_depth;
+                            stage_img.max_depth = tdoc.image.max_depth;
+                            stage_img.depth_pixels = tdoc.image.depth_pixels;
+                            stage_img.far_plane = tdoc.image.far_plane;
+                        }
+                        tdoc.image = stage_img;
+                        tdoc.erase_strokes.clear();
+                        tdoc.erase_undo_stack.clear();
+                        tdoc.erase_redo_stack.clear();
+                        tdoc.erase_step = static_cast<uint32_t>(ev.step);
+                        tdoc.erase_count = static_cast<uint32_t>(ev.total);
+                        tdoc.is_dirty = (ev.step > 0);
+                        tdoc.inpaint_status_text.clear();
+
+                        if (is_active_doc) {
+                            active_image = stage_img;
+                            custom_ui.clear_erase_strokes();
+                            custom_ui.set_erase_strokes({}, {}, {});
+                            EraseTool::get().save_document_state(tdoc.erase_state);
+                            if (control_block) {
+                                control_block->erase_history_step = static_cast<uint32_t>(ev.step);
+                                control_block->erase_history_count = static_cast<uint32_t>(ev.total);
+                            }
+                            sync_depth_to_ipc();
+                            custom_ui.set_depth_status(active_image.has_depth, active_image.depth_width, active_image.depth_height, active_image.far_plane);
+                            custom_ui.set_inpaint_status_text("", false);
+                        } else {
+                            tdoc.erase_state.mask.clear();
+                            tdoc.erase_state.mask_white_px = 0;
+                            tdoc.erase_state.undo_stack.clear();
+                            tdoc.erase_state.redo_stack.clear();
+                            tdoc.erase_state.last_error.clear();
+                            tdoc.erase_state.stages.resize(ev.step + 1);
+                            tdoc.erase_state.stages[ev.step] = { ev.img_path, ev.sidecar_path };
+                            tdoc.erase_state.stage_idx = ev.step;
+                            tdoc.erase_count = tdoc.erase_state.stages.empty() ? 0u : static_cast<uint32_t>(tdoc.erase_state.stages.size() - 1);
+                        }
+                        sync_tabs_to_ui();
+                        std::cout << "[Inpaint] Reloaded stage " << ev.step << "/" << ev.total << " (" << wide_to_utf8(ev.dir_key.c_str()) << "): " << wide_to_utf8(ev.img_path) << std::endl;
+                    } else {
+                        std::string load_err = wide_to_utf8(stage_img.error_msg);
+                        if (load_err.empty()) load_err = "Failed to load inpainting stage texture.";
+                        std::cerr << "[Inpaint] ERROR: " << load_err << std::endl;
+                        tdoc.inpaint_status_text = "Failed to load inpainting result: " + load_err;
+                        if (is_active_doc) {
+                            custom_ui.set_inpaint_status_text(tdoc.inpaint_status_text, false);
+                        }
+                    }
+                }
+            }
+
+            if (EraseTool::get().is_processing()) {
+                s_was_erase_processing = true;
+                std::wstring proc_key = EraseTool::get().get_processing_dir_key();
+                std::wstring active_key = (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size()))
+                    ? app_documents[active_doc_idx].erase_state.stage_dir_key : L"";
+                if (proc_key.empty() || _wcsicmp(proc_key.c_str(), active_key.c_str()) == 0) {
+                    std::string st = EraseTool::get().get_status();
+                    custom_ui.set_inpaint_status_text(st.empty() ? "Inpainting with LaMa Big HD..." : st, true);
+                } else {
+                    std::string saved_st = (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size()))
+                        ? app_documents[active_doc_idx].inpaint_status_text : "";
+                    custom_ui.set_inpaint_status_text(saved_st, false);
+                }
+            } else if (s_was_erase_processing) {
+                s_was_erase_processing = false;
+                int target_doc_idx = (s_erase_target_doc_id != 0) ? find_doc_by_id(s_erase_target_doc_id) : active_doc_idx;
+                bool on_target_doc = (target_doc_idx >= 0 && target_doc_idx == active_doc_idx);
+                std::string err = EraseTool::get().get_last_error();
+                if (!err.empty()) {
+                    if (target_doc_idx >= 0 && target_doc_idx < static_cast<int>(app_documents.size())) {
+                        app_documents[target_doc_idx].inpaint_status_text = "Failed: " + err;
+                        app_documents[target_doc_idx].erase_state.last_error = err;
+                    }
+                    if (on_target_doc) {
+                        custom_ui.set_inpaint_status_text("Failed: " + err, false);
+                    }
+                } else if (on_target_doc) {
+                    custom_ui.set_inpaint_status_text("", false);
                 }
             }
 
             std::vector<std::vector<ImVec2>> inpaint_strokes;
             float inpaint_rad = 24.0f;
             if (custom_ui.pop_inpaint_request(inpaint_strokes, inpaint_rad)) {
-                wchar_t exe_buf[MAX_PATH] = {};
-                GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
-                fs::path base_p = fs::path(exe_buf).parent_path();
-                fs::path lama_script = base_p / "tools" / "lama" / "run_lama.py";
-                if (!fs::exists(lama_script)) {
-                    custom_ui.set_inpaint_status_text("Inpaint model not found: tools/lama. Place LaMa weights in tools/.", false);
+                auto &erase_tool = EraseTool::get();
+                if (erase_tool.is_processing()) {
+                    custom_ui.set_inpaint_status_text("Inpainting already in progress...", true);
+                } else if (!active_image.texture || active_image.width == 0 || active_image.height == 0) {
+                    custom_ui.set_inpaint_status_text("No active image to inpaint.", false);
                 } else {
-                    custom_ui.set_inpaint_status_text("LaMa inpaint ready. Mask registered.", false);
+                    if (!erase_tool.has_mask_edits() && !inpaint_strokes.empty()) {
+                        custom_ui.sync_erase_strokes_to_tool(active_image.width, active_image.height);
+                    }
+                    if (!erase_tool.has_mask_edits()) {
+                        custom_ui.set_inpaint_status_text("Erase mask is empty. Paint a region first.", false);
+                    } else if (!erase_tool.is_model_present()) {
+                        custom_ui.set_inpaint_status_text("LaMa model weights not found. Click Download.", false);
+                    } else if (erase_tool.find_lama_script_path().empty()) {
+                        custom_ui.set_inpaint_status_text("Inpaint script not found: tools/lama/run_lama.py", false);
+                    } else {
+                        std::wstring doc_key = L"default";
+                        if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                            doc_key = app_documents[active_doc_idx].erase_state.stage_dir_key;
+                            if (doc_key.empty()) {
+                                doc_key = doc_stage_dir_key(app_documents[active_doc_idx].id);
+                                app_documents[active_doc_idx].erase_state.stage_dir_key = doc_key;
+                            }
+                        }
+                        erase_tool.set_stage_dir_key(doc_key);
+
+                        fs::path ws_dir = get_workspace_root() / doc_key;
+                        std::error_code ec;
+                        fs::create_directories(ws_dir, ec);
+
+                        std::wstring active_path = (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size()))
+                            ? app_documents[active_doc_idx].file_path : current_image_path;
+
+                        std::wstring tool_base = erase_tool.get_base_image_path();
+                        bool needs_tex_export = active_path.empty() || !fs::exists(active_path, ec) ||
+                            (control_block && control_block->erase_history_step > 0 && !tool_base.empty() && _wcsicmp(tool_base.c_str(), active_path.c_str()) != 0);
+                        if (needs_tex_export) {
+                            fs::path base_tmp = ws_dir / L"erase_active_base.png";
+                            if (BackbufferDump::save_texture_to_file(gfx.get_device(), gfx.get_context(), active_image.texture.Get(), base_tmp.c_str())) {
+                                active_path = base_tmp.wstring();
+                            }
+                        }
+
+                        fs::path mask_temp = ws_dir / L"erase_mask.png";
+                        if (!erase_tool.export_mask_png(mask_temp.wstring(), active_image.width, active_image.height)) {
+                            custom_ui.set_inpaint_status_text("Failed to export inpaint mask file.", false);
+                        } else if (erase_tool.trigger_erase(active_path, mask_temp.wstring())) {
+                            s_was_erase_processing = true;
+                            s_erase_target_doc_id = (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size()))
+                                ? app_documents[active_doc_idx].id : 0;
+                            if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
+                                erase_tool.save_document_state(app_documents[active_doc_idx].erase_state);
+                            }
+                            custom_ui.set_inpaint_status_text("Inpainting with LaMa Big HD...", true);
+                        } else {
+                            std::string err = erase_tool.get_last_error();
+                            custom_ui.set_inpaint_status_text(err.empty() ? "Failed to start LaMa inpainting." : err, false);
+                        }
+                    }
                 }
             }
 
@@ -2120,11 +2355,15 @@ static int run_app(int argc, wchar_t **argv) {
                     scissor_left.right = static_cast<LONG>(viewable_x + split_px);
                     scissor_left.bottom = static_cast<LONG>(viewable_y + viewable_h);
 
+                    ID3D11ShaderResourceView *before_srv =
+                        (control_block && control_block->erase_history_step > 0 && original_image.srv)
+                            ? original_image.srv.Get()
+                            : active_image.srv.Get();
                     gfx.get_context()->RSSetState(scissor_rs.Get());
                     gfx.get_context()->RSSetScissorRects(1, &scissor_left);
                     blit.render_transformed(
                         gfx.get_context(),
-                        active_image.srv.Get(),
+                        before_srv,
                         viewport.get_transform(),
                         viewable_w,
                         viewable_h,
@@ -2167,9 +2406,9 @@ static int run_app(int argc, wchar_t **argv) {
             gfx.reset_viewport();
 
             if (active_doc_idx >= 0 && active_doc_idx < static_cast<int>(app_documents.size())) {
-                bool has_strokes = !custom_ui.get_erase_strokes().empty();
-                if (has_strokes != app_documents[active_doc_idx].is_dirty) {
-                    app_documents[active_doc_idx].is_dirty = has_strokes;
+                bool has_mask = !custom_ui.get_erase_strokes().empty() || EraseTool::get().has_mask_edits();
+                if (has_mask && !app_documents[active_doc_idx].is_dirty) {
+                    app_documents[active_doc_idx].is_dirty = true;
                     sync_tabs_to_ui();
                 }
             }
@@ -2211,6 +2450,8 @@ static int run_app(int argc, wchar_t **argv) {
         }
     }
 
+    EraseTool::get().set_stage_callback(nullptr);
+    EraseTool::get().stop_worker();
     pipeline.shutdown();
     custom_ui.shutdown();
     std::wcout << L"[Host] Shutting down host application.\n";

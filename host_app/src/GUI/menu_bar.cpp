@@ -1,5 +1,7 @@
 #include "menu_bar.h"
 #include "gui_manager.h"
+#include "theme.h"
+#include "../erase_tool.h"
 #include <imgui.h>
 
 namespace gui {
@@ -44,11 +46,23 @@ void render_menu_bar(GuiManager &gui) {
         }
 
         if (ImGui::BeginMenu("Edit")) {
+            bool can_undo_erase = (gui.m_active_tool == ActiveTool::Erase && !gui.m_erase_undo_stack.empty());
+            if (ImGui::MenuItem("Undo Mask Stroke", "Ctrl+Z", false, can_undo_erase)) {
+                gui.undo_erase_stroke();
+            }
+            bool can_redo_erase = (gui.m_active_tool == ActiveTool::Erase && !gui.m_erase_redo_stack.empty());
+            if (ImGui::MenuItem("Redo Mask Stroke", "Ctrl+Y", false, can_redo_erase)) {
+                gui.redo_erase_stroke();
+            }
+            ImGui::Separator();
+            bool has_mask = !gui.m_erase_strokes.empty() || EraseTool::get().has_mask_edits();
+            if (ImGui::MenuItem("Clear Erase Mask", "Esc", false, has_mask)) {
+                gui.clear_erase_strokes();
+                gui.m_req_clear_mask = true;
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("Reset View", "Home")) {
                 gui.m_req_reset_view = true;
-            }
-            if (ImGui::MenuItem("Clear Erase Mask", "Esc")) {
-                gui.m_req_clear_mask = true;
             }
             ImGui::EndMenu();
         }
@@ -68,21 +82,70 @@ void render_menu_bar(GuiManager &gui) {
         }
 
         if (ImGui::BeginMenu("Shaders")) {
-            if (ImGui::MenuItem("Add ReShade Shader (.fx)...")) {}
-            if (ImGui::MenuItem("Import Unity Shader (.shader)...")) {}
-            if (ImGui::MenuItem("Import Godot Shader (.gdshader)...")) {}
-            if (ImGui::MenuItem("Import Raw HLSL (.hlsl)...")) {}
+            if (ImGui::MenuItem("Add ReShade Shader (.fx)...")) {
+                std::wstring path;
+                if (open_file_dialog(gui.m_hwnd, L"ReShade FX Files (*.fx)\0*.fx\0All Files (*.*)\0*.*\0", path)) {
+                    gui.m_req_add_shader = true;
+                    gui.m_add_shader_path = path;
+                }
+            }
+            if (ImGui::MenuItem("Import Unity Shader (.shader)...")) {
+                std::wstring path;
+                if (open_file_dialog(gui.m_hwnd, L"Unity Shaders (*.shader)\0*.shader\0All Files (*.*)\0*.*\0", path)) {
+                    gui.m_req_add_shader = true;
+                    gui.m_add_shader_path = path;
+                }
+            }
+            if (ImGui::MenuItem("Import Godot Shader (.gdshader)...")) {
+                std::wstring path;
+                if (open_file_dialog(gui.m_hwnd, L"Godot Shaders (*.gdshader)\0*.gdshader\0All Files (*.*)\0*.*\0", path)) {
+                    gui.m_req_add_shader = true;
+                    gui.m_add_shader_path = path;
+                }
+            }
+            if (ImGui::MenuItem("Import Raw HLSL (.hlsl)...")) {
+                std::wstring path;
+                if (open_file_dialog(gui.m_hwnd, L"HLSL Files (*.hlsl)\0*.hlsl\0All Files (*.*)\0*.*\0", path)) {
+                    gui.m_req_add_shader = true;
+                    gui.m_add_shader_path = path;
+                }
+            }
             ImGui::Separator();
-            if (ImGui::MenuItem("Reload All Shaders", "F5")) {}
+            if (ImGui::MenuItem("Enable All Shaders")) {
+                for (auto &fx : gui.m_effects) {
+                    fx.enabled = true;
+                }
+            }
+            if (ImGui::MenuItem("Disable All Shaders")) {
+                for (auto &fx : gui.m_effects) {
+                    fx.enabled = false;
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Reload All Shaders", "F5")) {
+                gui.m_effects.clear();
+                add_sample_effects(gui.m_effects);
+                gui.m_selected_effect_idx = 0;
+            }
             ImGui::EndMenu();
         }
 
         if (ImGui::BeginMenu("View")) {
+            if (ImGui::MenuItem("Zoom In", "Ctrl++ / Ctrl+=")) {
+                gui.m_req_zoom_in = true;
+            }
+            if (ImGui::MenuItem("Zoom Out", "Ctrl+-")) {
+                gui.m_req_zoom_out = true;
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("Fit Canvas to Screen", "Ctrl+0")) {
                 gui.m_req_fit_view = true;
             }
             if (ImGui::MenuItem("Actual Size (100%)", "Ctrl+1")) {
                 gui.m_req_100_view = true;
+            }
+            if (ImGui::MenuItem("Zoom 200%", "Ctrl+2")) {
+                gui.m_req_200_view = true;
             }
             ImGui::Separator();
             bool split_active = (gui.m_active_tool == ActiveTool::Split);
@@ -90,13 +153,19 @@ void render_menu_bar(GuiManager &gui) {
                 gui.set_active_tool(split_active ? ActiveTool::Split : ActiveTool::Hand);
             }
             bool depth_active = (gui.m_active_tool == ActiveTool::Depth);
-            if (ImGui::MenuItem("Peek 3D Depth (D)", nullptr, &depth_active)) {
+            if (ImGui::MenuItem("3D Depth Calibration", "Hold D to peek", &depth_active)) {
                 gui.set_active_tool(depth_active ? ActiveTool::Depth : ActiveTool::Hand);
             }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Toggle Side Panels", "Tab", &gui.m_hide_panels)) {}
             ImGui::EndMenu();
         }
 
         if (ImGui::BeginMenu("Help")) {
+            if (ImGui::MenuItem("Keyboard Shortcuts", "F1")) {
+                gui.m_show_shortcuts_dialog = true;
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("About ShaderLab")) {
                 gui.m_show_about_dialog = true;
             }

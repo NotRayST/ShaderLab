@@ -13,7 +13,6 @@
 #define ImTextureID ImU64
 #endif
 #include <imgui.h>
-#include <reshade.hpp>
 #include "../../common/ipc_protocol.h"
 
 using Microsoft::WRL::ComPtr;
@@ -38,12 +37,25 @@ public:
     size_t get_mask_white_px() const { return m_mask_white_px; }
     bool export_mask_png(const std::wstring &path, uint32_t w, uint32_t h, size_t *out_white_px = nullptr);
 
+    // Direct stroke painting interface for UI / canvas interaction
+    void ensure_mask_size(uint32_t w, uint32_t h);
+    void push_undo();
+    void draw_brush_dab(int cx, int cy, int r, uint8_t val);
+    void draw_brush_line(const ImVec2 &p0, const ImVec2 &p1, float radius, bool is_sub);
+
     // Frame update, brush input, overlay & UI
     void handle_input(SharedControlBlock *b, bool is_processing, bool *out_stroke_finished = nullptr);
-    void render_overlay(SharedControlBlock *b, reshade::api::effect_runtime *runtime = nullptr);
-    void handle_frame(SharedControlBlock *b, reshade::api::effect_runtime *runtime, const std::wstring &active_path, bool bg_hovered, bool any_active, bool fine);
+    void render_overlay(SharedControlBlock *b, ID3D11Device *device = nullptr);
+    void handle_frame(SharedControlBlock *b, ID3D11Device *device, const std::wstring &active_path, bool bg_hovered = false, bool any_active = false, bool fine = false);
     void render_ui(SharedControlBlock *b, const std::wstring &active_path);
     void set_ui_rect(float x0, float y0, float x1, float y1) { m_ui_min = ImVec2(x0, y0); m_ui_max = ImVec2(x1, y1); }
+
+    // D3D11 GPU Mask texture access for viewport quad rendering
+    void update_gpu_texture(ID3D11Device *dev);
+    bool is_mask_dirty() const { return m_mask_dirty; }
+    ID3D11ShaderResourceView *get_mask_srv() const { return m_mask_srv.Get(); }
+    uint32_t get_mask_width() const { return m_mask_w; }
+    uint32_t get_mask_height() const { return m_mask_h; }
 
     // Tool settings
     float brush_radius = 24.0f;
@@ -57,6 +69,21 @@ public:
     std::string get_status() const { std::lock_guard<std::mutex> l(m_status_mutex); return m_status; }
     std::string get_last_error() const { std::lock_guard<std::mutex> l(m_status_mutex); return m_last_error; }
 
+    struct EraseStage { std::wstring img, sidecar; };
+    struct DocumentState {
+        std::wstring stage_dir_key;
+        std::wstring base_img;
+        std::vector<EraseStage> stages;
+        size_t stage_idx = 0;
+        std::vector<uint8_t> mask;
+        uint32_t mask_w = 0;
+        uint32_t mask_h = 0;
+        size_t mask_white_px = 0;
+        std::vector<std::vector<uint8_t>> undo_stack;
+        std::vector<std::vector<uint8_t>> redo_stack;
+        std::string last_error;
+    };
+
     bool ensure_stage_cache_initialized(const std::wstring &base_image_path);
     bool set_stage_index(size_t target_idx);
     bool undo_erase();
@@ -66,7 +93,17 @@ public:
     bool can_redo_erase() const { std::lock_guard<std::mutex> l(m_stage_mutex); return !m_stages.empty() && (m_stage_idx + 1 < m_stages.size()); }
     size_t get_current_erase_step() const { std::lock_guard<std::mutex> l(m_stage_mutex); return m_stage_idx; }
     size_t get_total_erase_steps() const { std::lock_guard<std::mutex> l(m_stage_mutex); return m_stages.empty() ? 0 : m_stages.size() - 1; }
+    std::wstring get_current_stage_path() const;
+    std::wstring get_base_image_path() const;
     void clear_erase_history();
+
+    void save_document_state(DocumentState &out_state) const;
+    void restore_document_state(const DocumentState &state, ID3D11Device *dev = nullptr);
+    void set_stage_dir_key(const std::wstring &key);
+    std::wstring get_stage_dir_key() const { std::lock_guard<std::mutex> l(m_stage_mutex); return m_stage_dir_key; }
+    std::wstring get_processing_dir_key() const { std::lock_guard<std::mutex> l(m_stage_mutex); return m_processing_dir_key; }
+    static void remove_stage_cache_dir(const std::wstring &dir_key);
+    static bool copy_stage_cache_dir(const std::wstring &src_dir_key, const std::wstring &dst_dir_key, DocumentState &io_state);
 
     // Model & daemon worker
     bool is_model_present() const;
@@ -100,20 +137,24 @@ public:
 
     void log(int severity, const std::string &msg);
 
+    // Image/Stage synchronization hook
+    using StageCallback = void(*)(const std::wstring &dir_key, size_t step, size_t total, const std::wstring &img_path, const std::wstring &sidecar_path);
+    void set_stage_callback(StageCallback cb) { m_stage_cb = cb; }
+
 private:
     EraseTool();
 
     ImVec2 screen_to_image(const ImVec2 &sp, const SharedControlBlock *b, const ImVec2 &disp) const;
     ImVec2 image_to_screen(const ImVec2 &ip, const SharedControlBlock *b, const ImVec2 &disp) const;
-    void ensure_mask_size(uint32_t w, uint32_t h);
-    void push_undo();
     void recalculate_white_pixels();
-    void draw_brush_dab(int cx, int cy, int r, uint8_t val);
-    void draw_brush_line(const ImVec2 &p0, const ImVec2 &p1, float radius, bool is_sub);
-    void update_gpu_texture(ID3D11Device *dev);
+    void mark_dirty_rect(int x0, int y0, int x1, int y1);
+    void mark_dirty_all();
+    void sync_stage_to_ui(const std::wstring &dir_key, size_t idx, size_t total, const std::wstring &img_path, const std::wstring &sidecar_path);
     std::vector<std::filesystem::path> get_base_dirs() const;
 
     bool m_active = false, m_is_drawing = false, m_last_sub = false, m_mask_dirty = false, m_was_erasing = false;
+    bool m_has_dirty_rect = false;
+    int m_dirty_x0 = 0, m_dirty_y0 = 0, m_dirty_x1 = -1, m_dirty_y1 = -1;
     ImVec2 m_last_pos{ -1, -1 }, m_ui_min{ 0, 0 }, m_ui_max{ 0, 0 };
     std::vector<uint8_t> m_mask;
     uint32_t m_mask_w = 0, m_mask_h = 0;
@@ -125,11 +166,13 @@ private:
     std::vector<uint32_t> m_gpu_rgba;
     uint32_t m_tex_w = 0, m_tex_h = 0;
 
-    struct EraseStage { std::wstring img, sidecar; };
     mutable std::mutex m_stage_mutex;
+    std::wstring m_stage_dir_key;
+    std::wstring m_processing_dir_key;
     std::wstring m_base_img;
     std::vector<EraseStage> m_stages;
     size_t m_stage_idx = 0;
+    StageCallback m_stage_cb = nullptr;
 
     std::atomic<bool> m_processing{ false };
     std::atomic<float> m_progress{ -1.0f };

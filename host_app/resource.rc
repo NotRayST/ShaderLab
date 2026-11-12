@@ -1,7 +1,10 @@
 #include "resource.h"
 #include <windows.h>
 
-IDI_APP_ICON ICON "app.ico"
+IDI_APP_ICON    ICON   "app.ico"
+IDC_CURSOR_GRAB CURSOR "cursor_grab.cur"
+IDC_CURSOR_GRIP CURSOR "cursor_grip.cur"
+
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION     1,2,2,0

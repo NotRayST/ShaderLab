@@ -5,22 +5,30 @@
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto *self = reinterpret_cast<GfxDevice *>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
 
-    // Never allow input hooks to intercept non-client window messages (dragging titlebar, close button, etc.)
-    if (msg == WM_NCHITTEST || msg == WM_SYSCOMMAND || msg == WM_CLOSE || msg == WM_DESTROY ||
-        (msg >= WM_NCMOUSEMOVE && msg <= WM_NCXBUTTONDBLCLK)) {
-        if (GetCapture() == hWnd) {
-            ReleaseCapture();
+    // never let input hooks hijack OS hit-testing or window frame commands; release capture only on real frame actions (not WM_NCHITTEST queries from WindowFromPoint)
+    const bool is_nc_msg = (msg == WM_NCHITTEST || msg == WM_SYSCOMMAND || msg == WM_CLOSE || msg == WM_DESTROY ||
+                            (msg >= WM_NCMOUSEMOVE && msg <= WM_NCXBUTTONDBLCLK));
+    if (is_nc_msg) {
+        if (msg == WM_SYSCOMMAND || msg == WM_CLOSE || msg == WM_DESTROY ||
+            (msg >= WM_NCLBUTTONDOWN && msg <= WM_NCXBUTTONDBLCLK)) {
+            if (GetCapture() == hWnd) {
+                ReleaseCapture();
+            }
         }
     } else {
         if (self && self->dispatch_input_hook(msg, wParam, lParam)) {
-            return 0;
+            return (msg == WM_SETCURSOR) ? TRUE : 0;
         }
     }
 
     switch (msg) {
     case WM_KILLFOCUS:
-    case WM_CAPTURECHANGED:
         if (GetCapture() == hWnd) {
+            ReleaseCapture();
+        }
+        break;
+    case WM_CAPTURECHANGED:
+        if (reinterpret_cast<HWND>(lParam) != hWnd && GetCapture() == hWnd) {
             ReleaseCapture();
         }
         break;

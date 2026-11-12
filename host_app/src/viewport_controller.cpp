@@ -100,7 +100,6 @@ void ViewportController::set_before_after_enabled(bool enabled) {
         m_lock_pan = m_saved_lock_pan;
         m_is_dragging_split_pos = false;
         m_is_dragging_split_rot = false;
-        ReleaseCapture();
     }
 }
 
@@ -259,6 +258,15 @@ void ViewportController::zoom_by(float factor) {
     m_transform.zoom = std::clamp(m_transform.zoom * factor, 0.25f, 32.0f);
 }
 
+void ViewportController::cancel_interaction() {
+    m_is_panning = false;
+    m_is_rotating = false;
+    m_is_pan_locked_attempt = false;
+    m_is_rotate_locked_attempt = false;
+    m_is_dragging_split_pos = false;
+    m_is_dragging_split_rot = false;
+}
+
 void ViewportController::clamp_pan(uint32_t /*render_w*/, uint32_t /*render_h*/, uint32_t img_w, uint32_t img_h) {
     if (img_w == 0 || img_h == 0) return;
 
@@ -274,11 +282,7 @@ bool ViewportController::handle_input(
     uint32_t img_w, uint32_t img_h
 ) {
     if (m_is_locked) {
-        if (m_is_panning || m_is_rotating) {
-            ReleaseCapture();
-            m_is_panning = false;
-            m_is_rotating = false;
-        }
+        cancel_interaction();
         return false;
     }
 
@@ -286,11 +290,11 @@ bool ViewportController::handle_input(
     GetClientRect(hwnd, &client_rect);
     float client_w = static_cast<float>(client_rect.right - client_rect.left);
     float client_h = static_cast<float>(client_rect.bottom - client_rect.top);
-    if (client_w <= 0.0f) client_w = static_cast<float>(render_w);
-    if (client_h <= 0.0f) client_h = static_cast<float>(render_h);
+    if (client_w <= 0.0f) client_w = static_cast<float>((std::max)(1u, render_w));
+    if (client_h <= 0.0f) client_h = static_cast<float>((std::max)(1u, render_h));
 
-    float scale_x = static_cast<float>(render_w) / client_w;
-    float scale_y = static_cast<float>(render_h) / client_h;
+    float scale_x = static_cast<float>(render_w) / (std::max)(1.0f, client_w);
+    float scale_y = static_cast<float>(render_h) / (std::max)(1.0f, client_h);
 
     float center_x = (m_viewable_w > 0.0f) ? (m_viewable_x + m_viewable_w * 0.5f) : (static_cast<float>(render_w) * 0.5f);
     float center_y = (m_viewable_h > 0.0f) ? (m_viewable_y + m_viewable_h * 0.5f) : (static_cast<float>(render_h) * 0.5f);
@@ -300,22 +304,6 @@ bool ViewportController::handle_input(
     m_is_fine = shift_down;
 
     switch (msg) {
-    case WM_KILLFOCUS:
-    case WM_CAPTURECHANGED:
-    case WM_CANCELMODE: {
-        if (m_is_panning || m_is_rotating || m_is_pan_locked_attempt || m_is_rotate_locked_attempt ||
-            m_is_dragging_split_pos || m_is_dragging_split_rot) {
-            m_is_panning = false;
-            m_is_rotating = false;
-            m_is_pan_locked_attempt = false;
-            m_is_rotate_locked_attempt = false;
-            m_is_dragging_split_pos = false;
-            m_is_dragging_split_rot = false;
-            ReleaseCapture();
-        }
-        return false;
-    }
-
     case WM_MOUSEWHEEL: {
         if (m_lock_zoom) return false;
         short wheel_delta = GET_WHEEL_DELTA_WPARAM(wParam);
@@ -368,6 +356,7 @@ bool ViewportController::handle_input(
     }
 
     case WM_LBUTTONDOWN: {
+        if (img_w == 0 || img_h == 0) return false;
         int client_x = GET_X_LPARAM(lParam);
         int client_y = GET_Y_LPARAM(lParam);
         m_last_mouse_client = { client_x, client_y };
@@ -381,17 +370,15 @@ bool ViewportController::handle_input(
         }
         if (!in_canvas) return false;
 
-        bool space_down = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+        bool space_down = m_space_pan_active || ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0);
         if (space_down || m_hand_tool_active) {
             if (m_lock_pan) {
                 m_is_pan_locked_attempt = true;
-                SetCapture(hwnd);
                 return true;
             }
             m_is_pan_locked_attempt = false;
             m_is_panning = true;
             m_is_rotating = false;
-            SetCapture(hwnd);
             return true;
         }
 
@@ -411,8 +398,6 @@ bool ViewportController::handle_input(
 
             if (dist_client <= 14.0f) {
                 m_is_dragging_split_pos = true;
-                SetCapture(hwnd);
-                SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
                 return true;
             }
             return true;
@@ -421,13 +406,11 @@ bool ViewportController::handle_input(
         if (alt_down) {
             if (m_lock_rotate) {
                 m_is_rotate_locked_attempt = true;
-                SetCapture(hwnd);
                 return true;
             }
             m_is_rotate_locked_attempt = false;
             m_is_rotating = true;
             m_is_panning = false;
-            SetCapture(hwnd);
 
             float cur_render_x = static_cast<float>(client_x) * scale_x;
             float cur_render_y = static_cast<float>(client_y) * scale_y;
@@ -439,30 +422,27 @@ bool ViewportController::handle_input(
         } else {
             if (m_lock_pan) {
                 m_is_pan_locked_attempt = true;
-                SetCapture(hwnd);
                 return true;
             }
             m_is_pan_locked_attempt = false;
             m_is_panning = true;
             m_is_rotating = false;
-            SetCapture(hwnd);
             return true;
         }
     }
 
     case WM_MBUTTONDOWN: {
+        if (img_w == 0 || img_h == 0) return false;
         if (m_lock_pan) {
             m_is_pan_locked_attempt = true;
-            SetCapture(hwnd);
             return true;
         }
-        m_is_pan_locked_attempt = false;
-        m_is_panning = true;
-        m_is_rotating = false;
         int client_x = GET_X_LPARAM(lParam);
         int client_y = GET_Y_LPARAM(lParam);
         m_last_mouse_client = { client_x, client_y };
-        SetCapture(hwnd);
+        m_is_pan_locked_attempt = false;
+        m_is_panning = true;
+        m_is_rotating = false;
         return true;
     }
 
@@ -478,7 +458,6 @@ bool ViewportController::handle_input(
             float px = cur_render_x - center_x;
             float py = cur_render_y - center_y;
             m_is_dragging_split_rot = true;
-            SetCapture(hwnd);
             if (px * px + py * py > 16.0f) {
                 m_last_drag_angle = std::atan2(px, -py) * (180.0f / kPi);
                 if (m_last_drag_angle < 0.0f) m_last_drag_angle += 360.0f;
@@ -491,14 +470,12 @@ bool ViewportController::handle_input(
 
         if (m_lock_rotate) {
             m_is_rotate_locked_attempt = true;
-            SetCapture(hwnd);
             return true;
         }
         m_is_rotate_locked_attempt = false;
 
         m_is_rotating = true;
         m_is_panning = false;
-        SetCapture(hwnd);
 
         float cur_render_x = static_cast<float>(client_x) * scale_x;
         float cur_render_y = static_cast<float>(client_y) * scale_y;
@@ -545,7 +522,6 @@ bool ViewportController::handle_input(
             m_transform.pan_y -= rot_dy / eff_zoom;
 
             clamp_pan(render_w, render_h, img_w, img_h);
-            SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
             return true;
         }
 
@@ -561,7 +537,6 @@ bool ViewportController::handle_input(
             if (m_is_dragging_split_pos) {
                 float proj = px * nx + py * ny;
                 m_before_after_split = std::clamp(proj / (extent > 0.0f ? extent : 1.0f), -0.5f, 0.5f);
-                SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
                 m_last_mouse_client = { client_x, client_y };
                 return true;
             }
@@ -597,9 +572,6 @@ bool ViewportController::handle_input(
             float split_offset_px = m_before_after_split * (extent > 0.0f ? extent : 1.0f);
             float dist_px = std::abs((px * nx + py * ny) - split_offset_px);
             m_is_hovering_split = (dist_px / (scale_x > 0.0f ? scale_x : 1.0f) <= 14.0f);
-            if (m_is_hovering_split) {
-                SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
-            }
             m_last_mouse_client = { client_x, client_y };
             return true;
         }
@@ -640,19 +612,16 @@ bool ViewportController::handle_input(
     case WM_LBUTTONUP: {
         if (m_is_dragging_split_pos) {
             m_is_dragging_split_pos = false;
-            ReleaseCapture();
             return true;
         }
         if (m_is_pan_locked_attempt || m_is_rotate_locked_attempt) {
             m_is_pan_locked_attempt = false;
             m_is_rotate_locked_attempt = false;
-            ReleaseCapture();
             return true;
         }
         if (m_is_panning || m_is_rotating) {
             m_is_panning = false;
             m_is_rotating = false;
-            ReleaseCapture();
             return true;
         }
         break;
@@ -661,17 +630,14 @@ bool ViewportController::handle_input(
     case WM_RBUTTONUP: {
         if (m_is_dragging_split_rot) {
             m_is_dragging_split_rot = false;
-            ReleaseCapture();
             return true;
         }
         if (m_is_rotate_locked_attempt) {
             m_is_rotate_locked_attempt = false;
-            ReleaseCapture();
             return true;
         }
         if (m_is_rotating) {
             m_is_rotating = false;
-            ReleaseCapture();
             return true;
         }
         break;
@@ -680,12 +646,10 @@ bool ViewportController::handle_input(
     case WM_MBUTTONUP: {
         if (m_is_pan_locked_attempt) {
             m_is_pan_locked_attempt = false;
-            ReleaseCapture();
             return true;
         }
         if (m_is_panning) {
             m_is_panning = false;
-            ReleaseCapture();
             return true;
         }
         break;
@@ -707,25 +671,6 @@ bool ViewportController::handle_input(
             m_raw_split_angle = 0.0f;
             m_angle_changed = true;
             return true;
-        }
-        break;
-    }
-
-    case WM_SETCURSOR: {
-        bool space_down = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
-        if (space_down || m_hand_tool_active) {
-            SetCursor(LoadCursor(nullptr, m_is_panning ? IDC_SIZEALL : IDC_HAND));
-            return true;
-        }
-        if (m_is_panning) {
-            SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
-            return true;
-        }
-        if (m_before_after_enabled && LOWORD(lParam) == HTCLIENT) {
-            if (m_is_dragging_split_pos || m_is_dragging_split_rot || m_is_hovering_split) {
-                SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
-                return true;
-            }
         }
         break;
     }
@@ -819,7 +764,6 @@ bool ViewportController::handle_input(
                 m_lock_pan = !m_lock_pan;
                 if (m_lock_pan && m_is_panning) {
                     m_is_panning = false;
-                    ReleaseCapture();
                 }
                 m_last_lock_ms = now_lock_ms;
                 return true;
@@ -831,7 +775,6 @@ bool ViewportController::handle_input(
                 m_lock_rotate = !m_lock_rotate;
                 if (m_lock_rotate && m_is_rotating) {
                     m_is_rotating = false;
-                    ReleaseCapture();
                 }
                 m_last_lock_ms = now_lock_ms;
                 return true;
@@ -842,11 +785,9 @@ bool ViewportController::handle_input(
                 m_lock_pan = any_unlocked;
                 if (m_lock_rotate && m_is_rotating) {
                     m_is_rotating = false;
-                    ReleaseCapture();
                 }
                 if (m_lock_pan && m_is_panning) {
                     m_is_panning = false;
-                    ReleaseCapture();
                 }
                 m_last_lock_ms = now_lock_ms;
                 return true;

@@ -40,6 +40,10 @@ public:
     bool is_fine() const { return m_is_fine; }
     bool is_rotating() const { return m_is_rotating; }
     bool is_panning() const { return m_is_panning; }
+    bool is_capturing() const {
+        return m_is_panning || m_is_rotating || m_is_pan_locked_attempt || m_is_rotate_locked_attempt ||
+               m_is_dragging_split_pos || m_is_dragging_split_rot;
+    }
 
     void set_locked(bool locked) { m_is_locked = locked; }
     bool is_locked() const { return m_is_locked; }
@@ -48,6 +52,9 @@ public:
 
     void sync_to_block(SharedControlBlock *block);
     void sync_from_block(const SharedControlBlock *block);
+
+    void cancel_interaction();
+    void set_space_pan_active(bool active) { m_space_pan_active = active; }
 
     // computes the rotated bounding box dimensions for the export canvas
     static void get_rotated_aabb(uint32_t in_w, uint32_t in_h, float angle_deg, uint32_t &out_w, uint32_t &out_h);
@@ -120,6 +127,7 @@ private:
     bool m_is_locked = false;
     bool m_erase_active = false;
     bool m_hand_tool_active = true;
+    bool m_space_pan_active = false;
     bool m_lock_zoom = false;
     bool m_lock_rotate = false;
     bool m_lock_pan = false;

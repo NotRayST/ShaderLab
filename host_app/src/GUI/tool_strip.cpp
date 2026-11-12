@@ -155,7 +155,7 @@ void render_tool_strip(GuiManager &gui, float top_offset, float height) {
         }
     });
 
-    render_tool_btn("D", "3D Depth (D)\nPeek or configure depth buffer", gui.m_active_tool == ActiveTool::Depth, ToolIconType::Depth, [&]() {
+    render_tool_btn("D", "3D Depth (Hold D to peek)\nConfigure 3D depth map and settings", gui.m_active_tool == ActiveTool::Depth, ToolIconType::Depth, [&]() {
         if (gui.m_active_tool == ActiveTool::Depth) {
             gui.set_active_tool(ActiveTool::Hand);
         } else {

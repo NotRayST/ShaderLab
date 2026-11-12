@@ -1,7 +1,5 @@
 #include "depth_manager.h"
 #include "erase_tool.h"
-#include "job_queue.h"
-#include "undo_history.h"
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -18,7 +16,6 @@
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "urlmon.lib")
 
-#define STB_IMAGE_IMPLEMENTATION
 #include "../../third_party/stb/stb_image.h"
 #include "../../third_party/stb/stb_image_write.h"
 
@@ -256,7 +253,7 @@ void DepthManager::log(int severity, const std::string &msg) {
             }
         }
 
-        JobQueueManager::get().add_log(utf8_to_wide(line.c_str()));
+        std::cout << line << std::endl;
         OutputDebugStringA((line + "\n").c_str());
     } catch (...) {
     }
@@ -1123,7 +1120,7 @@ bool DepthManager::attach_depth_from_image(
     }
 
     // trigger reload in host
-    JobQueueManager::get().set_preview_image(base_p.wstring());
+    // JobQueueManager::get().set_preview_image(base_p.wstring());
     return true;
 }
 
@@ -1509,7 +1506,7 @@ bool DepthManager::trigger_depth_estimate(
                 }
                 log(3, "Depth generation complete! Triggering host reload...");
                 // trigger reload in host
-                JobQueueManager::get().set_preview_image(base_p.wstring());
+                // JobQueueManager::get().set_preview_image(base_p.wstring());
             } else {
                 m_progress.store(-1.0f);
                 std::lock_guard<std::mutex> lock(m_status_mutex);
@@ -1633,7 +1630,7 @@ bool DepthManager::remove_depth(const std::wstring &base_image_path, std::string
     }
 
     log(0, "Removed depth from active image: " + wide_to_utf8(base_p.wstring().c_str()));
-    JobQueueManager::get().set_preview_image(base_p.wstring());
+    // JobQueueManager::get().set_preview_image(base_p.wstring());
     return true;
 }
 

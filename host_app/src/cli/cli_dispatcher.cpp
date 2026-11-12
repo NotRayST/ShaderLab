@@ -2,6 +2,7 @@
 #include "cli_parser.h"
 #include "cli_render.h"
 #include "cli_test_shader.h"
+#include "cli_test_erase.h"
 #include "cli_depth.h"
 #include "cli_info.h"
 #include "cli_preset.h"
@@ -38,6 +39,10 @@ int CliDispatcher::dispatch(int argc, wchar_t **argv) {
 
     if (opts.subcommand == "test-shader") {
         return CliTestShader::execute(opts);
+    }
+
+    if (opts.subcommand == "test-erase") {
+        return CliTestErase::execute(opts);
     }
 
     if (opts.subcommand == "depth") {

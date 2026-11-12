@@ -15,12 +15,12 @@ set(HOST_SOURCES
     src/backbuffer_dump.cpp
     src/settle_detector.h
     src/settle_detector.cpp
-    src/hud_renderer.h
-    src/hud_renderer.cpp
     src/viewport_controller.h
     src/viewport_controller.cpp
-    src/warning_overlay.h
-    src/warning_overlay.cpp
+    src/erase_tool.h
+    src/erase_tool.cpp
+    src/depth_manager.h
+    src/depth_manager.cpp
     src/GUI/types.h
     src/GUI/tool_requirements.h
     src/GUI/tool_requirements.cpp
@@ -60,6 +60,8 @@ set(HOST_SOURCES
     src/cli/cli_depth.cpp
     src/cli/cli_test_shader.h
     src/cli/cli_test_shader.cpp
+    src/cli/cli_test_erase.h
+    src/cli/cli_test_erase.cpp
     src/cli/cli_render.h
     src/cli/cli_render.cpp
     src/cli/cli_dispatcher.h
@@ -98,7 +100,6 @@ target_link_libraries(host_app PRIVATE
     d3dcompiler
     user32
     shell32
-    gdiplus
     winmm
     comdlg32
     urlmon

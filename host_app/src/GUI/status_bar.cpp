@@ -28,18 +28,22 @@ void render_bottom_status_bar(GuiManager &gui, float top_offset, float width, fl
 
         if (gui.m_master_bypass) {
             ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
             ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f), "[Bypass: Raw Original]");
         }
-        if (gui.m_active_tool == ActiveTool::Depth && gui.m_depth_peek) {
+        if (gui.m_active_tool != ActiveTool::Depth && gui.is_depth_peek_active()) {
             ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
             ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "[Depth Peek]");
         }
         if (gui.m_active_tool == ActiveTool::Split && gui.m_before_after) {
             ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
             ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "[Split]");
         }
         if (gui.m_active_tool == ActiveTool::Erase && gui.m_erase_active) {
             ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "[Erase Brush]");
         }
     } else {
@@ -55,18 +59,21 @@ void render_bottom_status_bar(GuiManager &gui, float top_offset, float width, fl
         }
         gui.register_dom_last_item("status_btn_fit", "Fit", "button");
         gui.register_dom_last_item("opt_fit", "Fit", "button");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fit canvas to viewport (Ctrl+0)");
         ImGui::SameLine();
         if (ImGui::SmallButton("100%")) {
             gui.m_req_100_view = true;
         }
         gui.register_dom_last_item("status_btn_100", "100%", "button");
         gui.register_dom_last_item("opt_100", "100%", "button");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Actual pixel size (Ctrl+1)");
         ImGui::SameLine();
         if (ImGui::SmallButton("200%")) {
             gui.m_req_200_view = true;
         }
         gui.register_dom_last_item("status_btn_200", "200%", "button");
         gui.register_dom_last_item("opt_200", "200%", "button");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Double size (200%)");
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("[Tab: Hide Panels]");

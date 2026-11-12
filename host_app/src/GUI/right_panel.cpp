@@ -1,6 +1,8 @@
 #include "right_panel.h"
 #include "gui_manager.h"
 #include "tool_requirements.h"
+#include "../erase_tool.h"
+#include "../depth_manager.h"
 #include <imgui.h>
 #include <algorithm>
 
@@ -16,7 +18,8 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
     ImGui::Begin("##RightParametersPanel", nullptr, flags);
 
     float avail_width = ImGui::GetContentRegionAvail().x;
-    float tab_w = avail_width / 3.0f;
+    float item_spacing_x = ImGui::GetStyle().ItemSpacing.x;
+    float tab_w = (avail_width - 2.0f * item_spacing_x) / 3.0f;
     float tab_h = 24.0f;
 
     auto render_segment_tab = [&](const char *label, int tab_idx, const char *dom_id, const char *alt_dom_id = nullptr) {
@@ -32,7 +35,7 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
         }
 
         std::string btn_id = std::string(label) + "##seg_tab";
-        if (ImGui::Button(btn_id.c_str(), ImVec2(tab_w - 2.0f, tab_h))) {
+        if (ImGui::Button(btn_id.c_str(), ImVec2(tab_w, tab_h))) {
             gui.select_right_panel_tab(tab_idx);
         }
         gui.register_dom_last_item(dom_id, label, "tab", is_active);
@@ -170,24 +173,24 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
         }
     } else if (gui.m_right_panel_tab == 1) {
         // --- TAB 1: 3D DEPTH ---
-        if (gui.m_has_depth) {
-            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Status: 3D Depth Active (%ux%u)", gui.m_depth_w, gui.m_depth_h);
-        } else {
-            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Status: No 3D Depth Attached");
+        if (!gui.m_has_depth) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("No 3D depth map.");
+            ImGui::PopTextWrapPos();
+            ImGui::Spacing();
         }
-        ImGui::Separator();
-        ImGui::Spacing();
 
         ImGui::PushTextWrapPos(0.0f);
         ImGui::TextColored(ImVec4(0.45f, 0.75f, 1.0f, 1.0f), "CALIBRATION & PREVIEW");
         ImGui::PopTextWrapPos();
         ImGui::Separator();
 
-        bool depth_peek = (gui.m_active_tool == ActiveTool::Depth && gui.m_depth_peek);
-        if (ImGui::Checkbox("Live Depth Peek (Hold D or Click)", &depth_peek)) {
-            gui.set_active_tool(depth_peek ? ActiveTool::Depth : ActiveTool::Hand);
+        bool depth_peek = gui.is_live_depth_peek();
+        if (ImGui::Checkbox("Pin Depth Preview", &depth_peek)) {
+            gui.set_depth_peek_active(depth_peek);
         }
-        gui.register_dom_last_item("depth_checkbox_peek", "Live Depth Peek", "checkbox", depth_peek);
+        gui.register_dom_last_item("depth_checkbox_peek", "Pin Depth Preview", "checkbox", depth_peek);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keep depth map visible when switching to other tabs");
 
         ImGui::Checkbox("Invert Depth Buffer", &gui.m_depth_invert);
         gui.register_dom_last_item("depth_checkbox_invert", "Invert Depth Buffer", "checkbox", gui.m_depth_invert);
@@ -217,6 +220,7 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
             else gui.m_depth_encoder = "vits";
         }
         gui.register_dom_last_item("depth_combo_model", "Machine Learning Depth Estimation", "combo");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Select Depth-Anything-V2 neural encoder checkpoint:\nViT-L: Maximum depth precision (1.3GB)\nViT-B: Balanced accuracy/speed (390MB)\nViT-S: Fastest inference (100MB)");
 
         auto &req = ToolRequirements::get();
         if (req.is_depth_downloading()) {
@@ -227,7 +231,7 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
         } else if (!gui.m_depth_status_text.empty() && !gui.m_depth_is_busy) {
             ImGui::Spacing();
             ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s", gui.m_depth_status_text.c_str());
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f), "%s", gui.m_depth_status_text.c_str());
             ImGui::PopTextWrapPos();
         }
     } else if (gui.m_right_panel_tab == 2) {
@@ -248,45 +252,119 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
         ImGui::TextUnformatted("Brush Radius ( [ / ] )");
         ImGui::PopTextWrapPos();
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::SliderFloat("##Radius", &gui.m_erase_radius, 4.0f, 128.0f, "%.0f px");
-        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) gui.m_erase_radius = 24.0f;
+        if (ImGui::SliderFloat("##Radius", &gui.m_erase_radius, 4.0f, 128.0f, "%.0f px")) {
+            EraseTool::get().brush_radius = gui.m_erase_radius;
+        }
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+            gui.m_erase_radius = 24.0f;
+            EraseTool::get().brush_radius = 24.0f;
+        }
         gui.register_dom_last_item("erase_slider_radius", "Brush Radius", "slider");
 
         ImGui::Checkbox("Subtract Mask Mode (Alt)", &gui.m_erase_subtract);
         gui.register_dom_last_item("erase_checkbox_subtract", "Subtract Mask Mode", "checkbox", gui.m_erase_subtract);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Erase/subtract from current painted mask.\nHold Alt while painting to invert brush temporarily.");
+
+        auto &erase_tool = EraseTool::get();
+        ImGui::Checkbox("Auto-apply on stroke release", &erase_tool.auto_apply);
+        gui.register_dom_last_item("erase_checkbox_auto_apply", "Auto-apply on stroke release", "checkbox", erase_tool.auto_apply);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Automatically run LaMa inpainting right after releasing a mask stroke.\nTurn off to paint multiple strokes or press Enter / Inpaint manually.");
         ImGui::Spacing();
 
+        bool is_erasing_busy = gui.m_inpaint_is_busy || erase_tool.is_processing();
         float half_btn = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        bool can_undo = erase_tool.can_undo_stroke() && !is_erasing_busy;
+        if (!can_undo) ImGui::BeginDisabled();
         if (ImGui::Button("Undo Stroke (Ctrl+Z)", ImVec2(half_btn, 24.0f))) {
             gui.undo_erase_stroke();
         }
-        gui.register_dom_last_item("erase_btn_undo", "Undo Stroke", "button");
+        gui.register_dom_last_item("erase_btn_undo", "Undo Stroke", "button", false, can_undo);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Undo last painted mask stroke (Ctrl+Z)");
+        if (!can_undo) ImGui::EndDisabled();
         ImGui::SameLine();
+        bool has_mask_edits = erase_tool.has_mask_edits() && !is_erasing_busy;
+        if (!has_mask_edits) ImGui::BeginDisabled();
         if (ImGui::Button("Clear Mask (Esc)", ImVec2(half_btn, 24.0f))) {
             gui.clear_erase_strokes();
             gui.m_req_clear_mask = true;
         }
-        gui.register_dom_last_item("erase_btn_clear", "Clear Mask", "button");
+        gui.register_dom_last_item("erase_btn_clear", "Clear Mask", "button", false, has_mask_edits);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Clear the entire painted mask (Esc)");
+        if (!has_mask_edits) ImGui::EndDisabled();
         ImGui::Spacing();
 
+        auto &req = ToolRequirements::get();
+        if (erase_tool.is_processing()) {
+            float p = erase_tool.get_progress();
+            std::string st = erase_tool.get_status();
+            ImGui::ProgressBar(p >= 0.0f ? p : -1.0f, ImVec2(-1.0f, 20.0f), st.empty() ? "Inpainting..." : st.c_str());
+            ImGui::Spacing();
+        } else if (erase_tool.is_downloading() || req.is_lama_downloading()) {
+            float dp = erase_tool.is_downloading() ? erase_tool.get_download_progress() : req.get_lama_download_progress();
+            std::string dl_st = erase_tool.is_downloading() ? erase_tool.get_download_status() : req.get_lama_download_status();
+            ImGui::ProgressBar(dp > 0.0f ? dp : -1.0f, ImVec2(-1.0f, 20.0f), dl_st.empty() ? "Downloading LaMa Big HD..." : dl_st.c_str());
+            ImGui::Spacing();
+        } else {
+            std::string last_err = erase_tool.get_last_error();
+            if (!last_err.empty()) {
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f), "Error: %s", last_err.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::Spacing();
+            } else if (!gui.m_inpaint_status_text.empty() && !gui.m_inpaint_is_busy) {
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f), "%s", gui.m_inpaint_status_text.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::Spacing();
+            }
+        }
         ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextColored(ImVec4(0.45f, 0.75f, 1.0f, 1.0f), "AI INPAINTING (LAMA)");
+        ImGui::TextColored(ImVec4(0.45f, 0.75f, 1.0f, 1.0f), "ERASE HISTORY");
         ImGui::PopTextWrapPos();
         ImGui::Separator();
 
-        auto &req = ToolRequirements::get();
-        if (req.is_lama_downloading()) {
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "%s", req.get_lama_download_status().c_str());
-            ImGui::PopTextWrapPos();
-        } else if (!gui.m_inpaint_status_text.empty() && !gui.m_inpaint_is_busy) {
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s", gui.m_inpaint_status_text.c_str());
-            ImGui::PopTextWrapPos();
+        size_t cur_step = erase_tool.get_current_erase_step();
+        size_t total_steps = erase_tool.get_total_erase_steps();
+        ImGui::PushTextWrapPos(0.0f);
+        if (total_steps > 0) {
+            ImGui::Text("Stage %u of %u", static_cast<unsigned>(cur_step), static_cast<unsigned>(total_steps));
         } else {
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextDisabled("Paint over unwanted areas with Erase Brush, then click Inpaint below.");
-            ImGui::PopTextWrapPos();
+            ImGui::TextDisabled("No erase edits yet.");
+        }
+        ImGui::PopTextWrapPos();
+
+        bool can_undo_erase = erase_tool.can_undo_erase() && !is_erasing_busy;
+        if (!can_undo_erase) ImGui::BeginDisabled();
+        if (ImGui::Button("Undo Erase", ImVec2(half_btn, 24.0f))) {
+            erase_tool.undo_erase();
+        }
+        gui.register_dom_last_item("erase_btn_undo_erase", "Undo Erase", "button", false, can_undo_erase);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Step backward to previous image stage");
+        if (!can_undo_erase) ImGui::EndDisabled();
+        ImGui::SameLine();
+
+        bool can_redo_erase = erase_tool.can_redo_erase() && !is_erasing_busy;
+        if (!can_redo_erase) ImGui::BeginDisabled();
+        if (ImGui::Button("Redo Erase", ImVec2(half_btn, 24.0f))) {
+            erase_tool.redo_erase();
+        }
+        gui.register_dom_last_item("erase_btn_redo_erase", "Redo Erase", "button", false, can_redo_erase);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Step forward to next image stage");
+        if (!can_redo_erase) ImGui::EndDisabled();
+
+        if (gui.m_has_depth) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            bool depth_busy = gui.m_depth_is_busy || DepthManager::get().is_processing();
+            if (depth_busy) ImGui::BeginDisabled();
+            if (ImGui::Button("Re-generate Depth Buffer", ImVec2(-1.0f, 24.0f))) {
+                gui.m_req_generate_depth = true;
+                gui.m_depth_status_text = "Running Depth-Anything-V2 (" + gui.m_depth_encoder + ")...";
+                gui.m_depth_is_busy = true;
+            }
+            gui.register_dom_last_item("erase_btn_regen_depth", "Re-generate Depth Buffer", "button", false, !depth_busy);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Update 3D depth map after erasing objects");
+            if (depth_busy) ImGui::EndDisabled();
         }
     }
 
@@ -304,17 +382,21 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
         gui.register_dom_last_item("btn_reset_defaults", "Reset Parameters to Default", "button", false, has_effect);
         if (!has_effect) ImGui::EndDisabled();
     } else if (gui.m_right_panel_tab == 1) {
+        auto &depth_mgr = DepthManager::get();
         auto &req = ToolRequirements::get();
-        bool is_downloading = req.is_depth_downloading();
-        bool model_present = req.is_depth_model_present(gui.m_depth_encoder);
+        bool is_downloading = depth_mgr.is_downloading() || req.is_depth_downloading();
+        bool model_present = depth_mgr.is_model_present(gui.m_depth_encoder) || req.is_depth_model_present(gui.m_depth_encoder);
+        bool is_busy = gui.m_depth_is_busy || depth_mgr.is_processing();
 
-        if (gui.m_depth_is_busy) {
+        if (is_busy) {
             ImGui::BeginDisabled();
-            ImGui::Button(gui.m_depth_status_text.empty() ? "Generating Depth..." : gui.m_depth_status_text.c_str(), ImVec2(-1.0f, bottom_btn_h));
+            std::string status = !depth_mgr.get_status().empty() ? depth_mgr.get_status() : gui.m_depth_status_text;
+            if (status.empty()) status = "Generating Depth...";
+            ImGui::Button(status.c_str(), ImVec2(-1.0f, bottom_btn_h));
             ImGui::EndDisabled();
             gui.register_dom_last_item("depth_btn_generate", "Generating Depth...", "button", false, false);
         } else if (is_downloading) {
-            float p = req.get_depth_download_progress();
+            float p = depth_mgr.is_downloading() ? depth_mgr.get_download_progress() : req.get_depth_download_progress();
             char dl_buf[128];
             if (p > 0.0f) snprintf(dl_buf, sizeof(dl_buf), "Downloading: %.0f%%", p * 100.0f);
             else snprintf(dl_buf, sizeof(dl_buf), "Downloading Depth Model...");
@@ -328,7 +410,9 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
             else if (gui.m_depth_encoder == "vits") dl_label = "Download & Generate Depth (100MB)";
 
             if (ImGui::Button(dl_label, ImVec2(-1.0f, bottom_btn_h))) {
-                req.trigger_depth_download(gui.m_depth_encoder);
+                if (!depth_mgr.trigger_model_download(gui.m_depth_encoder)) {
+                    req.trigger_depth_download(gui.m_depth_encoder);
+                }
             }
             gui.register_dom_last_item("depth_btn_generate", dl_label, "button");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Download Depth Anything V2 (%s) model checkpoint", gui.m_depth_encoder.c_str());
@@ -341,17 +425,21 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
             gui.register_dom_last_item("depth_btn_generate", "Generate 3D Depth Map", "button");
         }
     } else if (gui.m_right_panel_tab == 2) {
+        auto &erase_tool = EraseTool::get();
         auto &req = ToolRequirements::get();
-        bool is_downloading = req.is_lama_downloading();
-        bool model_present = req.is_lama_model_present();
+        bool is_downloading = erase_tool.is_downloading() || req.is_lama_downloading();
+        bool model_present = erase_tool.is_model_present() || req.is_lama_model_present();
+        bool is_busy = gui.m_inpaint_is_busy || erase_tool.is_processing();
 
-        if (gui.m_inpaint_is_busy) {
+        if (is_busy) {
             ImGui::BeginDisabled();
-            ImGui::Button(gui.m_inpaint_status_text.empty() ? "Inpainting..." : gui.m_inpaint_status_text.c_str(), ImVec2(-1.0f, bottom_btn_h));
+            std::string status = !erase_tool.get_status().empty() ? erase_tool.get_status() : gui.m_inpaint_status_text;
+            if (status.empty()) status = "Inpainting...";
+            ImGui::Button(status.c_str(), ImVec2(-1.0f, bottom_btn_h));
             ImGui::EndDisabled();
             gui.register_dom_last_item("erase_btn_inpaint", "Inpainting...", "button", false, false);
         } else if (is_downloading) {
-            float p = req.get_lama_download_progress();
+            float p = erase_tool.is_downloading() ? erase_tool.get_download_progress() : req.get_lama_download_progress();
             char dl_buf[128];
             if (p > 0.0f) snprintf(dl_buf, sizeof(dl_buf), "Downloading: %.0f%%", p * 100.0f);
             else snprintf(dl_buf, sizeof(dl_buf), "Downloading LaMa Big HD (~196MB)...");
@@ -361,19 +449,19 @@ void render_right_panel(GuiManager &gui, float right_offset, float top_offset, f
             gui.register_dom_last_item("erase_btn_inpaint", dl_buf, "button", false, false);
         } else if (!model_present) {
             if (ImGui::Button("Download LaMa Big HD (196MB)", ImVec2(-1.0f, bottom_btn_h))) {
-                req.trigger_lama_download();
+                if (!erase_tool.trigger_model_download()) {
+                    req.trigger_lama_download();
+                }
             }
             gui.register_dom_last_item("erase_btn_inpaint", "Download LaMa Big HD (196MB)", "button");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Download neural inpainting model (common/big-lama.pt) required for object erasing");
         } else {
-            bool has_mask = !gui.m_erase_strokes.empty();
+            bool has_mask = erase_tool.has_mask_edits();
             if (!has_mask) ImGui::BeginDisabled();
             if (ImGui::Button("Inpaint Selection (LaMa)", ImVec2(-1.0f, bottom_btn_h))) {
-                gui.m_req_inpaint = true;
-                gui.m_inpaint_status_text = "Running LaMa Big HD inpainting...";
-                gui.m_inpaint_is_busy = true;
+                gui.request_inpaint();
             }
-            gui.register_dom_last_item("erase_btn_inpaint", "Inpaint Selection", "button");
+            gui.register_dom_last_item("erase_btn_inpaint", "Inpaint Selection", "button", false, has_mask);
             if (!has_mask) ImGui::EndDisabled();
         }
     }
