@@ -2822,6 +2822,104 @@ bool compile_hlsl_blob(
     return true;
 }
 
+bool compile_matching_fullscreen_vs(
+    ID3DBlob *ps_blob,
+    ComPtr<ID3DBlob> &out_vs_blob,
+    std::string &out_error)
+{
+    if (!ps_blob) return false;
+    ComPtr<ID3D11ShaderReflection> refl;
+    if (FAILED(D3DReflect(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), IID_PPV_ARGS(&refl)))) {
+        return false;
+    }
+
+    D3D11_SHADER_DESC sdesc{};
+    refl->GetDesc(&sdesc);
+
+    struct VsField {
+        std::string type;
+        std::string name;
+        std::string sem;
+        std::string assign_expr;
+    };
+    std::vector<VsField> fields;
+    bool has_sv_pos = false;
+
+    for (UINT i = 0; i < sdesc.InputParameters; ++i) {
+        D3D11_SIGNATURE_PARAMETER_DESC pdesc{};
+        if (FAILED(refl->GetInputParameterDesc(i, &pdesc)) || !pdesc.SemanticName) continue;
+
+        if (pdesc.SystemValueType == D3D_NAME_IS_FRONT_FACE ||
+            pdesc.SystemValueType == D3D_NAME_PRIMITIVE_ID ||
+            pdesc.SystemValueType == D3D_NAME_SAMPLE_INDEX ||
+            pdesc.SystemValueType == D3D_NAME_COVERAGE ||
+            _stricmp(pdesc.SemanticName, "SV_IsFrontFace") == 0 ||
+            _stricmp(pdesc.SemanticName, "SV_PrimitiveID") == 0 ||
+            _stricmp(pdesc.SemanticName, "SV_SampleIndex") == 0 ||
+            _stricmp(pdesc.SemanticName, "SV_Coverage") == 0) {
+            continue;
+        }
+
+        int ncomp = 1;
+        if (pdesc.Mask & 0x8) ncomp = 4;
+        else if (pdesc.Mask & 0x4) ncomp = 3;
+        else if (pdesc.Mask & 0x2) ncomp = 2;
+
+        const char *base_t = "float";
+        if (pdesc.ComponentType == D3D_REGISTER_COMPONENT_UINT32) base_t = "uint";
+        else if (pdesc.ComponentType == D3D_REGISTER_COMPONENT_SINT32) base_t = "int";
+
+        bool is_pos = (pdesc.SystemValueType == D3D_NAME_POSITION ||
+                       _stricmp(pdesc.SemanticName, "SV_Position") == 0);
+        VsField f;
+        f.name = "f_" + std::to_string(i);
+        if (is_pos) {
+            has_sv_pos = true;
+            f.type = "float4";
+            f.sem = "SV_Position";
+            f.assign_expr = "__sl_pos";
+        } else {
+            f.type = std::string(base_t) + (ncomp > 1 ? std::to_string(ncomp) : std::string());
+            f.sem = std::string(pdesc.SemanticName) + std::to_string(pdesc.SemanticIndex);
+            if (_stricmp(pdesc.SemanticName, "TEXCOORD") == 0 && pdesc.ComponentType == D3D_REGISTER_COMPONENT_FLOAT32) {
+                if (ncomp == 4) f.assign_expr = "float4(__sl_uv, 0.0, 1.0)";
+                else if (ncomp == 3) f.assign_expr = "float3(__sl_uv, 0.0)";
+                else if (ncomp == 2) f.assign_expr = "__sl_uv";
+                else f.assign_expr = "__sl_uv.x";
+            } else if (_stricmp(pdesc.SemanticName, "COLOR") == 0 && pdesc.ComponentType == D3D_REGISTER_COMPONENT_FLOAT32) {
+                if (ncomp == 4) f.assign_expr = "float4(1.0, 1.0, 1.0, 1.0)";
+                else if (ncomp == 3) f.assign_expr = "float3(1.0, 1.0, 1.0)";
+                else if (ncomp == 2) f.assign_expr = "float2(1.0, 1.0)";
+                else f.assign_expr = "1.0";
+            }
+        }
+        fields.push_back(std::move(f));
+    }
+
+    if (!has_sv_pos) {
+        fields.push_back({ "float4", "__sl_fallback_pos", "SV_Position", "__sl_pos" });
+    }
+
+    std::ostringstream vs_src;
+    vs_src << "struct __SLDynVSOut {\n";
+    for (const auto &f : fields) {
+        vs_src << "    " << f.type << " " << f.name << " : " << f.sem << ";\n";
+    }
+    vs_src << "};\n"
+           << "__SLDynVSOut __SLSynthVS(in uint id : SV_VertexID) {\n"
+           << "    __SLDynVSOut o = (__SLDynVSOut)0;\n"
+           << "    float2 __sl_uv = float2((id == 2) ? 2.0 : 0.0, (id == 1) ? 2.0 : 0.0);\n"
+           << "    float4 __sl_pos = float4(__sl_uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n";
+    for (const auto &f : fields) {
+        if (!f.assign_expr.empty()) {
+            vs_src << "    o." << f.name << " = " << f.assign_expr << ";\n";
+        }
+    }
+    vs_src << "    return o;\n}\n";
+
+    return compile_hlsl_blob(vs_src.str(), "__SLSynthVS", "vs_5_0", out_vs_blob, out_error);
+}
+
 void reflect_pass_resources(
     ID3D11Device *device,
     ID3DBlob *ps_blob,
@@ -3165,12 +3263,21 @@ bool UniversalHlslParser::parse_and_compile_source(
         ComPtr<ID3DBlob> vs_blob;
         ComPtr<ID3DBlob> ps_blob;
         std::string compile_err;
-        if (!compile_hlsl_blob(prog.hlsl_body, pdecl.vs_entry, "vs_5_0", vs_blob, compile_err)) {
-            out_error = "Vertex shader '" + pdecl.vs_entry + "' compile error:\n" + compile_err;
-            return false;
-        }
         if (!compile_hlsl_blob(prog.hlsl_body, pdecl.ps_entry, "ps_5_0", ps_blob, compile_err)) {
             out_error = "Pixel shader '" + pdecl.ps_entry + "' compile error:\n" + compile_err;
+            return false;
+        }
+        bool is_synth_vs = (pdecl.vs_entry == "__ShaderLabUnityVS" || pdecl.vs_entry == "__ShaderLabFullscreenVS");
+        if (is_synth_vs) {
+            if (!compile_matching_fullscreen_vs(ps_blob.Get(), vs_blob, compile_err)) {
+                vs_blob.Reset();
+                if (!compile_hlsl_blob(prog.hlsl_body, pdecl.vs_entry, "vs_5_0", vs_blob, compile_err)) {
+                    out_error = "Vertex shader '" + pdecl.vs_entry + "' compile error:\n" + compile_err;
+                    return false;
+                }
+            }
+        } else if (!compile_hlsl_blob(prog.hlsl_body, pdecl.vs_entry, "vs_5_0", vs_blob, compile_err)) {
+            out_error = "Vertex shader '" + pdecl.vs_entry + "' compile error:\n" + compile_err;
             return false;
         }
 
