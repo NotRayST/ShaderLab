@@ -106,6 +106,148 @@ static bool test_python_interpreter(const std::wstring &py_path) {
     return (code == 0 && wait_res == WAIT_OBJECT_0);
 }
 
+static bool system_has_nvidia_gpu() {
+    DISPLAY_DEVICEW dd = {};
+    dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        std::wstring id = dd.DeviceID;
+        std::wstring name = dd.DeviceString;
+        if (id.find(L"VEN_10DE") != std::wstring::npos ||
+            name.find(L"NVIDIA") != std::wstring::npos ||
+            name.find(L"GeForce") != std::wstring::npos ||
+            name.find(L"RTX") != std::wstring::npos ||
+            name.find(L"GTX") != std::wstring::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool run_pip_command_with_progress(
+    const std::wstring &cmd,
+    const std::function<void(const std::string &)> &on_line,
+    std::string &out_error,
+    DWORD inactivity_timeout_ms = 180000
+) {
+    HANDLE hReadPipe = nullptr, hWritePipe = nullptr;
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+        out_error = "CreatePipe failed";
+        return false;
+    }
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    HANDLE hNullInput = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags |= STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.hStdInput = (hNullInput != INVALID_HANDLE_VALUE) ? hNullInput : nullptr;
+
+    PROCESS_INFORMATION pi = {};
+    std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
+    cmd_buf.push_back(L'\0');
+
+    BOOL created = CreateProcessW(
+        nullptr, cmd_buf.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi
+    );
+
+    CloseHandle(hWritePipe);
+    if (hNullInput != INVALID_HANDLE_VALUE) CloseHandle(hNullInput);
+
+    if (!created) {
+        CloseHandle(hReadPipe);
+        out_error = "CreateProcessW failed: " + std::to_string(GetLastError());
+        return false;
+    }
+
+    char pipe_buf[512];
+    std::string line_accum;
+    auto last_activity = std::chrono::steady_clock::now();
+    bool timed_out = false;
+
+    while (true) {
+        DWORD bytes_avail = 0;
+        if (PeekNamedPipe(hReadPipe, nullptr, 0, nullptr, &bytes_avail, nullptr) && bytes_avail > 0) {
+            DWORD to_read = (std::min)(bytes_avail, static_cast<DWORD>(sizeof(pipe_buf) - 1));
+            DWORD bytes_read = 0;
+            if (ReadFile(hReadPipe, pipe_buf, to_read, &bytes_read, nullptr) && bytes_read > 0) {
+                last_activity = std::chrono::steady_clock::now();
+                pipe_buf[bytes_read] = '\0';
+                for (DWORD i = 0; i < bytes_read; ++i) {
+                    char c = pipe_buf[i];
+                    if (c == '\n' || c == '\r') {
+                        if (!line_accum.empty()) {
+                            if (on_line) on_line(line_accum);
+                            line_accum.clear();
+                        }
+                    } else {
+                        line_accum += c;
+                    }
+                }
+            }
+        } else {
+            DWORD wait_res = WaitForSingleObject(pi.hProcess, 50);
+            if (wait_res == WAIT_OBJECT_0) {
+                DWORD final_avail = 0;
+                while (PeekNamedPipe(hReadPipe, nullptr, 0, nullptr, &final_avail, nullptr) && final_avail > 0) {
+                    DWORD bytes_read = 0;
+                    if (ReadFile(hReadPipe, pipe_buf, (std::min)(final_avail, static_cast<DWORD>(sizeof(pipe_buf) - 1)), &bytes_read, nullptr) && bytes_read > 0) {
+                        for (DWORD i = 0; i < bytes_read; ++i) {
+                            char c = pipe_buf[i];
+                            if (c == '\n' || c == '\r') {
+                                if (!line_accum.empty()) {
+                                    if (on_line) on_line(line_accum);
+                                    line_accum.clear();
+                                }
+                            } else {
+                                line_accum += c;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                break;
+            }
+
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - last_activity).count();
+            if (elapsed > inactivity_timeout_ms) {
+                timed_out = true;
+                TerminateProcess(pi.hProcess, 1);
+                break;
+            }
+        }
+    }
+
+    if (!line_accum.empty() && on_line) {
+        on_line(line_accum);
+    }
+
+    CloseHandle(hReadPipe);
+
+    DWORD exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (timed_out) {
+        out_error = "Process stalled (no output for " + std::to_string(inactivity_timeout_ms / 1000) + "s)";
+        return false;
+    }
+
+    if (exit_code != 0) {
+        out_error = "Exit code " + std::to_string(exit_code);
+        return false;
+    }
+
+    return true;
+}
+
 static bool download_file_dynamic(
     const std::string &url,
     const fs::path &temp_file,
@@ -1254,6 +1396,22 @@ bool DepthManager::trigger_depth_estimate(
                 bool has_numpy = fs::exists(local_site_p / "numpy", py_ec) && !py_ec;
                 bool has_scipy = fs::exists(local_site_p / "scipy", py_ec) && !py_ec;
 
+                // check if torch has cuda dll when nvidia gpu is present
+                if (has_torch && system_has_nvidia_gpu()) {
+                    bool has_cuda_dll = fs::exists(local_site_p / "torch" / "lib" / "torch_cuda.dll", py_ec) && !py_ec;
+                    if (!has_cuda_dll) {
+                        log(1, "Detected NVIDIA GPU, but local PyTorch build is CPU-only. Cleaning up to reinstall CUDA build...");
+                        has_torch = false;
+                        fs::remove_all(local_site_p / "torch", py_ec);
+                        for (const auto &entry : fs::directory_iterator(local_site_p, py_ec)) {
+                            std::string fname = entry.path().filename().string();
+                            if (fname.rfind("torch-", 0) == 0 && fname.find(".dist-info") != std::string::npos) {
+                                fs::remove_all(entry.path(), py_ec);
+                            }
+                        }
+                    }
+                }
+
                 if (has_torch && has_cv2 && has_numpy && has_scipy) {
                     deps_ready = true;
                     m_deps_verified = true;
@@ -1265,7 +1423,9 @@ bool DepthManager::trigger_depth_estimate(
                 std::wstring local_site_w = local_site_p.empty() ? L"" : fs::absolute(local_site_p).wstring();
                 std::wstring check_cmd = L"\"" + py_exe + L"\" -c \"import sys; "
                     + (local_site_w.empty() ? L"" : (L"sys.path.insert(0, r'" + local_site_w + L"'); "))
-                    + L"import torch, cv2, numpy, scipy\"";
+                    + L"import torch, cv2, numpy, scipy; "
+                    + (system_has_nvidia_gpu() ? L"sys.exit(0 if (torch.version.cuda is not None) else 2)" : L"sys.exit(0)")
+                    + L"\"";
 
                 STARTUPINFOW check_si = {};
                 check_si.cb = sizeof(check_si);
@@ -1284,6 +1444,8 @@ bool DepthManager::trigger_depth_estimate(
                             deps_ready = true;
                             m_deps_verified = true;
                             log(0, "Verified model dependencies via Python import successfully");
+                        } else if (code == 2) {
+                            log(1, "Python import verified packages, but torch is CPU-only on NVIDIA system.");
                         }
                     } else if (wait_res == WAIT_TIMEOUT) {
                         log(1, "Dependency check timed out after 45s, terminating check process...");
@@ -1299,38 +1461,68 @@ bool DepthManager::trigger_depth_estimate(
                         fs::create_directories(base_dest, py_ec);
                         local_site_w = fs::absolute(base_dest).wstring();
                     }
-                    log(1, "Missing model dependencies (torch, cv2, numpy). Installing locally to " + wide_to_utf8(local_site_w.c_str()) + " via pip...");
-                    {
-                        std::lock_guard<std::mutex> lock(m_status_mutex);
-                        m_status_text = "Auto-installing model packages locally into ShaderLab folder...";
+                    log(1, "Installing model dependencies to " + wide_to_utf8(local_site_w.c_str()) + " via pip...");
+
+                    auto on_pip_line = [this](const std::string &line) {
+                        if (line.empty()) return;
+                        if (line.find("Downloading") != std::string::npos ||
+                            line.find("Collecting") != std::string::npos ||
+                            line.find("Installing") != std::string::npos ||
+                            line.find("%") != std::string::npos ||
+                            line.find("Successfully installed") != std::string::npos) {
+                            std::lock_guard<std::mutex> lock(m_status_mutex);
+                            m_status_text = "Pip: " + line;
+                        }
+                        if (line.find("Downloading torch") != std::string::npos ||
+                            line.find("Successfully installed") != std::string::npos ||
+                            line.find("ERROR:") != std::string::npos) {
+                            log(0, "[Pip] " + line);
+                        }
+                    };
+
+                    bool torch_ok = false;
+                    std::string pip_err;
+
+                    if (system_has_nvidia_gpu()) {
+                        {
+                            std::lock_guard<std::mutex> lock(m_status_mutex);
+                            m_status_text = "Downloading & installing PyTorch with CUDA (cu126)...";
+                        }
+                        log(0, "NVIDIA GPU detected. Installing CUDA PyTorch (cu126) via --index-url...");
+                        std::wstring pip_torch = L"\"" + py_exe + L"\" -m pip install --no-user --target \"" + local_site_w + L"\" torch --index-url https://download.pytorch.org/whl/cu126 --progress-bar on";
+                        torch_ok = run_pip_command_with_progress(pip_torch, on_pip_line, pip_err);
+                        if (!torch_ok) {
+                            log(1, "CUDA 12.6 install failed (" + pip_err + "), attempting CUDA 12.4 fallback...");
+                            std::wstring pip_torch_fallback = L"\"" + py_exe + L"\" -m pip install --no-user --target \"" + local_site_w + L"\" torch --index-url https://download.pytorch.org/whl/cu124 --progress-bar on";
+                            torch_ok = run_pip_command_with_progress(pip_torch_fallback, on_pip_line, pip_err);
+                        }
+                    } else {
+                        {
+                            std::lock_guard<std::mutex> lock(m_status_mutex);
+                            m_status_text = "Downloading & installing PyTorch...";
+                        }
+                        std::wstring pip_torch = L"\"" + py_exe + L"\" -m pip install --no-user --target \"" + local_site_w + L"\" torch --progress-bar on";
+                        torch_ok = run_pip_command_with_progress(pip_torch, on_pip_line, pip_err);
                     }
 
-                    std::wstring pip_cmd = L"\"" + py_exe + L"\" -m pip install --no-user --target \"" + local_site_w + L"\" torch opencv-python numpy scipy --extra-index-url https://download.pytorch.org/whl/cu126 --extra-index-url https://download.pytorch.org/whl/cu124";
-                    STARTUPINFOW pip_si = {};
-                    pip_si.cb = sizeof(pip_si);
-                    pip_si.dwFlags = STARTF_USESHOWWINDOW;
-                    pip_si.wShowWindow = SW_HIDE;
-                    PROCESS_INFORMATION pip_pi = {};
-                    std::vector<wchar_t> pip_buf(pip_cmd.begin(), pip_cmd.end());
-                    pip_buf.push_back(L'\0');
+                    if (!torch_ok) {
+                        log(2, "Failed to install PyTorch: " + pip_err);
+                    }
 
-                    if (CreateProcessW(nullptr, pip_buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &pip_si, &pip_pi)) {
-                        DWORD wait_res = WaitForSingleObject(pip_pi.hProcess, 120000);
-                        DWORD pip_exit = 1;
-                        if (wait_res == WAIT_TIMEOUT) {
-                            TerminateProcess(pip_pi.hProcess, 1);
-                            log(2, "Local pip dependency install timed out after 120s");
-                        } else {
-                            GetExitCodeProcess(pip_pi.hProcess, &pip_exit);
-                        }
-                        CloseHandle(pip_pi.hProcess);
-                        CloseHandle(pip_pi.hThread);
+                    {
+                        std::lock_guard<std::mutex> lock(m_status_mutex);
+                        m_status_text = "Installing model dependencies (opencv, numpy, scipy)...";
+                    }
+                    std::wstring pip_aux = L"\"" + py_exe + L"\" -m pip install --no-user --target \"" + local_site_w + L"\" opencv-python numpy scipy --progress-bar on";
+                    bool aux_ok = run_pip_command_with_progress(pip_aux, on_pip_line, pip_err);
+                    if (!aux_ok) {
+                        log(2, "Failed to install auxiliary dependencies: " + pip_err);
+                    }
 
-                        if (pip_exit == 0 && wait_res == WAIT_OBJECT_0) {
-                            deps_ready = true;
-                            m_deps_verified = true;
-                            log(3, "Dependencies installed locally successfully via pip!");
-                        }
+                    if (torch_ok && aux_ok) {
+                        deps_ready = true;
+                        m_deps_verified = true;
+                        log(3, "Dependencies installed locally successfully via pip!");
                     }
                 }
             }
