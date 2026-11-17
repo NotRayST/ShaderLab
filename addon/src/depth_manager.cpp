@@ -84,7 +84,7 @@ using str_utils::utf8_to_wide;
 
 static bool test_python_interpreter(const std::wstring &py_path) {
     if (py_path.empty()) return false;
-    std::wstring cmd = L"\"" + py_path + L"\" -c \"import sys; sys.exit(0 if sys.version_info >= (3, 8) and sys.maxsize > 2**32 else 1)\"";
+    std::wstring cmd = L"\"" + py_path + L"\" -s -E -c \"import sys; sys.exit(0 if sys.version_info >= (3, 8) and sys.maxsize > 2**32 else 1)\"";
     STARTUPINFOW si = { sizeof(si) };
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
@@ -900,7 +900,7 @@ bool DepthManager::provision_portable_python(std::wstring &out_py_exe) {
         pip_dl_cb->Release();
 
         if (get_pip_ok) {
-            std::wstring pip_boot_cmd = L"\"" + py_exe.wstring() + L"\" \"" + get_pip_path.wstring() + L"\" --no-warn-script-location --no-setuptools --no-wheel";
+            std::wstring pip_boot_cmd = L"\"" + py_exe.wstring() + L"\" -s -E \"" + get_pip_path.wstring() + L"\" --no-warn-script-location --no-setuptools --no-wheel";
             STARTUPINFOW pip_si = {};
             pip_si.cb = sizeof(pip_si);
             pip_si.dwFlags = STARTF_USESHOWWINDOW;
@@ -910,7 +910,7 @@ bool DepthManager::provision_portable_python(std::wstring &out_py_exe) {
             pip_buf.push_back(L'\0');
 
             if (CreateProcessW(nullptr, pip_buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &pip_si, &pip_pi)) {
-                DWORD wait_res = WaitForSingleObject(pip_pi.hProcess, 60000);
+                DWORD wait_res = WaitForSingleObject(pip_pi.hProcess, 120000);
                 if (wait_res == WAIT_TIMEOUT) {
                     TerminateProcess(pip_pi.hProcess, 1);
                 }
@@ -941,112 +941,45 @@ std::wstring DepthManager::find_python_executable() const {
             return m_cached_python_path;
         }
 
-        auto is_valid_python = [](const fs::path &p) -> bool {
+        auto is_candidate_working = [](const fs::path &p) -> bool {
             std::error_code err;
             if (!fs::exists(p, err) || err) return false;
             if (!fs::is_regular_file(p, err) || err) return false;
             uintmax_t sz = fs::file_size(p, err);
             if (err || sz < 1024) return false;
-            std::wstring pw = p.wstring();
-            if (pw.find(L"WindowsApps") != std::wstring::npos) return false;
-            return true;
-        };
-
-        auto is_candidate_working = [&](const fs::path &p) -> bool {
-            if (!is_valid_python(p)) return false;
             return test_python_interpreter(p.wstring());
         };
 
-        std::vector<fs::path> base_dirs = get_base_search_dirs();
-        for (const auto &b : base_dirs) {
-            fs::path cur = b;
-            for (int i = 0; i <= 6; ++i) {
-                const fs::path local_candidates[] = {
-                    cur / "tools" / "python" / "python.exe",
-                    cur / "python" / "python.exe",
-                    cur / "tools" / "depth_anything_v2" / "venv" / "Scripts" / "python.exe",
-                    cur / "tools" / "depth_anything_v2" / "python" / "python.exe",
-                    cur / "test" / "tools" / "python" / "python.exe",
-                    cur / "venv" / "Scripts" / "python.exe",
-                    cur / ".venv" / "Scripts" / "python.exe"
-                };
-                for (const auto &p : local_candidates) {
-                    if (is_candidate_working(p)) {
-                        m_cached_python_path = p.wstring();
-                        return m_cached_python_path;
-                    }
-                }
-                if (!cur.has_parent_path() || cur == cur.parent_path()) break;
-                cur = cur.parent_path();
-            }
+        // only look in shaderlab's own directory, never fall back to system python
+        std::vector<fs::path> local_roots;
+        wchar_t exe_path[MAX_PATH] = {};
+        if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH) > 0) {
+            local_roots.push_back(fs::path(exe_path).parent_path());
         }
-
-        wchar_t out_path[MAX_PATH] = {};
-        if (SearchPathW(nullptr, L"python.exe", nullptr, MAX_PATH, out_path, nullptr) > 0) {
-            if (is_candidate_working(out_path)) {
-                m_cached_python_path = out_path;
-                return m_cached_python_path;
-            }
-        }
-
-        const wchar_t *common_paths[] = {
-            L"C:\\Python314\\python.exe",
-            L"C:\\Python313\\python.exe",
-            L"C:\\Python312\\python.exe",
-            L"C:\\Python311\\python.exe",
-            L"C:\\Python310\\python.exe"
-        };
-        for (const auto *p : common_paths) {
-            if (is_candidate_working(p)) {
-                m_cached_python_path = p;
-                return m_cached_python_path;
-            }
-        }
-
-        wchar_t local_app_data[MAX_PATH] = {};
-        if (GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH) > 0) {
-            fs::path p_root = fs::path(local_app_data) / "Programs" / "Python";
-            std::error_code root_ec;
-            if (fs::exists(p_root, root_ec) && !root_ec) {
-                fs::directory_iterator it(p_root, fs::directory_options::skip_permission_denied, root_ec);
-                fs::directory_iterator end_it;
-                while (!root_ec && it != end_it) {
-                    try {
-                        fs::path exe = it->path() / "python.exe";
-                        if (is_candidate_working(exe)) {
-                            m_cached_python_path = exe.wstring();
-                            return m_cached_python_path;
-                        }
-                    } catch (...) {
-                    }
-                    it.increment(root_ec);
+        HMODULE hMod = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&DepthManager::get, &hMod) && hMod) {
+            wchar_t mod_path[MAX_PATH] = {};
+            if (GetModuleFileNameW(hMod, mod_path, MAX_PATH) > 0) {
+                fs::path mp = fs::path(mod_path).parent_path();
+                if (local_roots.empty() || !fs::equivalent(local_roots[0], mp, ec)) {
+                    local_roots.push_back(mp);
                 }
             }
         }
 
-        // check program files
-        wchar_t prog_files[MAX_PATH] = {};
-        if (GetEnvironmentVariableW(L"ProgramFiles", prog_files, MAX_PATH) > 0) {
-            fs::path p_pf = fs::path(prog_files) / "Python";
-            std::error_code pf_ec;
-            if (fs::exists(p_pf, pf_ec) && !pf_ec) {
-                fs::directory_iterator it(p_pf, fs::directory_options::skip_permission_denied, pf_ec);
-                fs::directory_iterator end_it;
-                while (!pf_ec && it != end_it) {
-                    try {
-                        fs::path exe = it->path() / "python.exe";
-                        if (is_candidate_working(exe)) {
-                            m_cached_python_path = exe.wstring();
-                            return m_cached_python_path;
-                        }
-                    } catch (...) {
-                    }
-                    it.increment(pf_ec);
+        for (const auto &root : local_roots) {
+            const fs::path local_candidates[] = {
+                root / "tools" / "python" / "python.exe",
+                root / "python" / "python.exe"
+            };
+            for (const auto &p : local_candidates) {
+                if (is_candidate_working(p)) {
+                    m_cached_python_path = fs::absolute(p, ec).wstring();
+                    return m_cached_python_path;
                 }
             }
         }
     } catch (...) {
-        // catch all std::filesystem or other exceptions
     }
 
     m_cached_python_path.clear();
@@ -1361,35 +1294,19 @@ bool DepthManager::trigger_depth_estimate(
                 return;
             }
 
-            // auto-check and install required python packages if missing locally
+            // always install and load dependencies strictly from local site-packages
             bool deps_ready = m_deps_verified.load();
             fs::path local_site_p;
             if (!script.empty()) {
                 local_site_p = fs::path(script).parent_path() / "site-packages";
-            }
-            if (local_site_p.empty() || !fs::exists(local_site_p, py_ec)) {
-                std::vector<fs::path> bdirs = get_base_search_dirs();
-                for (const auto &b : bdirs) {
-                    fs::path cur = b;
-                    for (int d = 0; d <= 6; ++d) {
-                        fs::path cand = cur / "tools" / "depth_anything_v2" / "site-packages";
-                        if (fs::exists(cand, py_ec) && !py_ec) {
-                            local_site_p = cand;
-                            break;
-                        }
-                        cand = cur / "test" / "tools" / "depth_anything_v2" / "site-packages";
-                        if (fs::exists(cand, py_ec) && !py_ec) {
-                            local_site_p = cand;
-                            break;
-                        }
-                        if (!cur.has_parent_path() || cur == cur.parent_path()) break;
-                        cur = cur.parent_path();
-                    }
-                    if (!local_site_p.empty()) break;
-                }
+            } else {
+                wchar_t exe_p[MAX_PATH] = {};
+                fs::path app_root = (GetModuleFileNameW(nullptr, exe_p, MAX_PATH) > 0)
+                    ? fs::path(exe_p).parent_path() : fs::current_path(py_ec);
+                local_site_p = app_root / "tools" / "depth_anything_v2" / "site-packages";
             }
 
-            // fast-path: check if disk packages are present
+            // check local packages on disk
             if (!deps_ready && !local_site_p.empty() && fs::exists(local_site_p, py_ec)) {
                 bool has_torch = fs::exists(local_site_p / "torch", py_ec) && !py_ec;
                 bool has_cv2   = fs::exists(local_site_p / "cv2", py_ec) && !py_ec;
@@ -1420,110 +1337,122 @@ bool DepthManager::trigger_depth_estimate(
             }
 
             if (!deps_ready) {
-                std::wstring local_site_w = local_site_p.empty() ? L"" : fs::absolute(local_site_p).wstring();
-                std::wstring check_cmd = L"\"" + py_exe + L"\" -c \"import sys; "
-                    + (local_site_w.empty() ? L"" : (L"sys.path.insert(0, r'" + local_site_w + L"'); "))
-                    + L"import torch, cv2, numpy, scipy; "
-                    + (system_has_nvidia_gpu() ? L"sys.exit(0 if (torch.version.cuda is not None) else 2)" : L"sys.exit(0)")
-                    + L"\"";
+                fs::create_directories(local_site_p, py_ec);
+                std::wstring local_site_w = fs::absolute(local_site_p, py_ec).wstring();
+                log(1, "Installing model dependencies locally to " + wide_to_utf8(local_site_w.c_str()) + " via pip...");
 
-                STARTUPINFOW check_si = {};
-                check_si.cb = sizeof(check_si);
-                check_si.dwFlags = STARTF_USESHOWWINDOW;
-                check_si.wShowWindow = SW_HIDE;
-                PROCESS_INFORMATION check_pi = {};
-                std::vector<wchar_t> check_buf(check_cmd.begin(), check_cmd.end());
-                check_buf.push_back(L'\0');
-
-                if (CreateProcessW(nullptr, check_buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &check_si, &check_pi)) {
-                    DWORD wait_res = WaitForSingleObject(check_pi.hProcess, 45000);
-                    if (wait_res == WAIT_OBJECT_0) {
-                        DWORD code = 1;
-                        GetExitCodeProcess(check_pi.hProcess, &code);
-                        if (code == 0) {
-                            deps_ready = true;
-                            m_deps_verified = true;
-                            log(0, "Verified model dependencies via Python import successfully");
-                        } else if (code == 2) {
-                            log(1, "Python import verified packages, but torch is CPU-only on NVIDIA system.");
+                std::string cur_pkg;
+                auto on_pip_line = [this, &cur_pkg](const std::string &line) {
+                    if (line.empty()) return;
+                    if (line.find("Downloading ") != std::string::npos) {
+                        auto pos = line.find("Downloading ");
+                        std::string rest = line.substr(pos + 12);
+                        auto sp = rest.find(' ');
+                        cur_pkg = (sp != std::string::npos) ? rest.substr(0, sp) : rest;
+                        auto dash1 = cur_pkg.find('-');
+                        if (dash1 != std::string::npos) {
+                            auto dash2 = cur_pkg.find('-', dash1 + 1);
+                            if (dash2 != std::string::npos) cur_pkg = cur_pkg.substr(0, dash2);
                         }
-                    } else if (wait_res == WAIT_TIMEOUT) {
-                        log(1, "Dependency check timed out after 45s, terminating check process...");
-                        TerminateProcess(check_pi.hProcess, 1);
-                    }
-                    CloseHandle(check_pi.hProcess);
-                    CloseHandle(check_pi.hThread);
-                }
-
-                if (!deps_ready) {
-                    if (local_site_w.empty()) {
-                        fs::path base_dest = fs::path(py_exe).parent_path() / "tools" / "depth_anything_v2" / "site-packages";
-                        fs::create_directories(base_dest, py_ec);
-                        local_site_w = fs::absolute(base_dest).wstring();
-                    }
-                    log(1, "Installing model dependencies to " + wide_to_utf8(local_site_w.c_str()) + " via pip...");
-
-                    auto on_pip_line = [this](const std::string &line) {
-                        if (line.empty()) return;
-                        if (line.find("Downloading") != std::string::npos ||
-                            line.find("Collecting") != std::string::npos ||
-                            line.find("Installing") != std::string::npos ||
-                            line.find("%") != std::string::npos ||
-                            line.find("Successfully installed") != std::string::npos) {
+                        {
                             std::lock_guard<std::mutex> lock(m_status_mutex);
                             m_status_text = "Pip: " + line;
                         }
-                        if (line.find("Downloading torch") != std::string::npos ||
-                            line.find("Successfully installed") != std::string::npos ||
+                        if (line.find(".whl.metadata") == std::string::npos) {
+                            log(0, "[Pip] " + line);
+                        }
+                        return;
+                    }
+                    unsigned long long cur_b = 0, tot_b = 0;
+                    if (sscanf_s(line.c_str(), "Progress %llu of %llu", &cur_b, &tot_b) == 2 && tot_b > 0) {
+                        float frac = static_cast<float>(cur_b) / static_cast<float>(tot_b);
+                        if (frac > 1.0f) frac = 1.0f;
+                        m_progress.store(frac);
+                        double cur_mb = static_cast<double>(cur_b) / (1024.0 * 1024.0);
+                        double tot_mb = static_cast<double>(tot_b) / (1024.0 * 1024.0);
+                        char buf[192];
+                        snprintf(buf, sizeof(buf), "Downloading %s: %.0f%% (%.1f / %.1f MB)",
+                                 cur_pkg.empty() ? "package" : cur_pkg.c_str(), frac * 100.0f, cur_mb, tot_mb);
+                        std::lock_guard<std::mutex> lock(m_status_mutex);
+                        m_status_text = buf;
+                        return;
+                    }
+                    if (line.find("Installing collected packages") != std::string::npos) {
+                        m_progress.store(-1.0f);
+                        std::lock_guard<std::mutex> lock(m_status_mutex);
+                        m_status_text = "Unpacking & installing Python packages...";
+                        log(0, "[Pip] " + line);
+                        return;
+                    }
+                    if (line.find("Collecting") != std::string::npos ||
+                        line.find("Successfully installed") != std::string::npos ||
+                        line.find("ERROR:") != std::string::npos) {
+                        {
+                            std::lock_guard<std::mutex> lock(m_status_mutex);
+                            m_status_text = "Pip: " + line;
+                        }
+                        if (line.find("Successfully installed") != std::string::npos ||
                             line.find("ERROR:") != std::string::npos) {
                             log(0, "[Pip] " + line);
                         }
-                    };
-
-                    bool torch_ok = false;
-                    std::string pip_err;
-
-                    if (system_has_nvidia_gpu()) {
-                        {
-                            std::lock_guard<std::mutex> lock(m_status_mutex);
-                            m_status_text = "Downloading & installing PyTorch with CUDA (cu126)...";
-                        }
-                        log(0, "NVIDIA GPU detected. Installing CUDA PyTorch (cu126) via --index-url...");
-                        std::wstring pip_torch = L"\"" + py_exe + L"\" -m pip install --no-user --target \"" + local_site_w + L"\" torch --index-url https://download.pytorch.org/whl/cu126 --progress-bar on";
-                        torch_ok = run_pip_command_with_progress(pip_torch, on_pip_line, pip_err);
-                        if (!torch_ok) {
-                            log(1, "CUDA 12.6 install failed (" + pip_err + "), attempting CUDA 12.4 fallback...");
-                            std::wstring pip_torch_fallback = L"\"" + py_exe + L"\" -m pip install --no-user --target \"" + local_site_w + L"\" torch --index-url https://download.pytorch.org/whl/cu124 --progress-bar on";
-                            torch_ok = run_pip_command_with_progress(pip_torch_fallback, on_pip_line, pip_err);
-                        }
-                    } else {
-                        {
-                            std::lock_guard<std::mutex> lock(m_status_mutex);
-                            m_status_text = "Downloading & installing PyTorch...";
-                        }
-                        std::wstring pip_torch = L"\"" + py_exe + L"\" -m pip install --no-user --target \"" + local_site_w + L"\" torch --progress-bar on";
-                        torch_ok = run_pip_command_with_progress(pip_torch, on_pip_line, pip_err);
                     }
+                };
 
+                bool torch_ok = false;
+                std::string pip_err;
+                bool has_nv = system_has_nvidia_gpu();
+                bool need_torch = !fs::exists(local_site_p / "torch", py_ec) ||
+                    (has_nv && !fs::exists(local_site_p / "torch" / "lib" / "torch_cuda.dll", py_ec));
+
+                if (!need_torch) {
+                    torch_ok = true;
+                } else if (has_nv) {
+                    {
+                        std::lock_guard<std::mutex> lock(m_status_mutex);
+                        m_status_text = "Downloading & installing PyTorch with CUDA (cu126)...";
+                    }
+                    log(0, "NVIDIA GPU detected. Installing CUDA PyTorch (cu126) via --index-url...");
+                    std::wstring pip_torch = L"\"" + py_exe + L"\" -u -s -E -m pip install --no-user --target \"" + local_site_w + L"\" torch --index-url https://download.pytorch.org/whl/cu126 --progress-bar raw";
+                    torch_ok = run_pip_command_with_progress(pip_torch, on_pip_line, pip_err, 300000);
                     if (!torch_ok) {
-                        log(2, "Failed to install PyTorch: " + pip_err);
+                        log(1, "CUDA 12.6 install failed (" + pip_err + "), attempting CUDA 12.4 fallback...");
+                        std::wstring pip_torch_fallback = L"\"" + py_exe + L"\" -u -s -E -m pip install --no-user --target \"" + local_site_w + L"\" torch --index-url https://download.pytorch.org/whl/cu124 --progress-bar raw";
+                        torch_ok = run_pip_command_with_progress(pip_torch_fallback, on_pip_line, pip_err, 300000);
                     }
+                } else {
+                    {
+                        std::lock_guard<std::mutex> lock(m_status_mutex);
+                        m_status_text = "Downloading & installing PyTorch...";
+                    }
+                    std::wstring pip_torch = L"\"" + py_exe + L"\" -u -s -E -m pip install --no-user --target \"" + local_site_w + L"\" torch --progress-bar raw";
+                    torch_ok = run_pip_command_with_progress(pip_torch, on_pip_line, pip_err, 300000);
+                }
 
+                if (!torch_ok) {
+                    log(2, "Failed to install PyTorch: " + pip_err);
+                }
+
+                bool need_aux = !fs::exists(local_site_p / "cv2", py_ec) ||
+                                !fs::exists(local_site_p / "numpy", py_ec) ||
+                                !fs::exists(local_site_p / "scipy", py_ec);
+                bool aux_ok = !need_aux;
+                if (need_aux) {
                     {
                         std::lock_guard<std::mutex> lock(m_status_mutex);
                         m_status_text = "Installing model dependencies (opencv, numpy, scipy)...";
                     }
-                    std::wstring pip_aux = L"\"" + py_exe + L"\" -m pip install --no-user --target \"" + local_site_w + L"\" opencv-python numpy scipy --progress-bar on";
-                    bool aux_ok = run_pip_command_with_progress(pip_aux, on_pip_line, pip_err);
+                    std::wstring pip_aux = L"\"" + py_exe + L"\" -u -s -E -m pip install --no-user --target \"" + local_site_w + L"\" opencv-python numpy scipy --progress-bar raw";
+                    aux_ok = run_pip_command_with_progress(pip_aux, on_pip_line, pip_err, 300000);
                     if (!aux_ok) {
                         log(2, "Failed to install auxiliary dependencies: " + pip_err);
                     }
+                }
 
-                    if (torch_ok && aux_ok) {
-                        deps_ready = true;
-                        m_deps_verified = true;
-                        log(3, "Dependencies installed locally successfully via pip!");
-                    }
+                if (torch_ok && aux_ok) {
+                    m_progress.store(-1.0f);
+                    deps_ready = true;
+                    m_deps_verified = true;
+                    log(3, "Dependencies installed locally successfully via pip!");
                 }
             }
 
@@ -1540,7 +1469,7 @@ bool DepthManager::trigger_depth_estimate(
             sidecar_p.replace_extension(".sldepth");
             fs::path script_dir = fs::path(script).parent_path();
 
-            std::wstring cmdline = L"\"" + py_exe + L"\" \"" + fs::absolute(script).wstring() + L"\""
+            std::wstring cmdline = L"\"" + py_exe + L"\" -s -E \"" + fs::absolute(script).wstring() + L"\""
                                  + L" --input \"" + base_p.wstring() + L"\""
                                  + L" --model \"" + fs::absolute(model).wstring() + L"\""
                                  + L" --encoder " + utf8_to_wide(model_encoder.c_str())

@@ -418,16 +418,9 @@ std::wstring EraseTool::find_lama_model_path() const {
 std::wstring EraseTool::find_python_executable() const {
     std::lock_guard<std::mutex> lock(m_cache_mutex);
     if (!m_cached_py.empty() && fs::exists(m_cached_py)) return m_cached_py;
-    auto p = find_in_paths(get_base_dirs(), {
-        L"tools/python/python.exe", L"python/python.exe", L"tools/depth_anything_v2/venv/Scripts/python.exe", L"venv/Scripts/python.exe", L"test/tools/python/python.exe"
-    }, 1024);
-    if (!p.empty()) return m_cached_py = p.wstring();
-    for (auto cmd : { L"python.exe", L"py.exe", L"C:\\Python314\\python.exe", L"C:\\Python313\\python.exe", L"C:\\Python312\\python.exe", L"C:\\Python311\\python.exe" }) {
-        wchar_t out[MAX_PATH];
-        if (SearchPathW(nullptr, cmd, nullptr, MAX_PATH, out, nullptr) > 0 && fs::exists(out)) return m_cached_py = out;
-        if (fs::exists(cmd)) return m_cached_py = cmd;
-    }
-    return L"";
+    std::wstring py = DepthManager::get().find_python_executable();
+    if (!py.empty()) m_cached_py = py;
+    return py;
 }
 
 bool EraseTool::is_model_present() const { return !find_lama_model_path().empty(); }
@@ -588,7 +581,7 @@ bool EraseTool::prewarm_worker() {
         SetHandleInformation(in_wr, HANDLE_FLAG_INHERIT, 0);
         SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0);
 
-        std::wstring cmd = L"\"" + py + L"\" \"" + fs::absolute(script).wstring() + L"\" --daemon --model \"" + fs::absolute(model).wstring() + L"\"";
+        std::wstring cmd = L"\"" + py + L"\" -s -E \"" + fs::absolute(script).wstring() + L"\" --daemon --model \"" + fs::absolute(model).wstring() + L"\"";
         PROCESS_INFORMATION pi = {};
         BOOL ok = run_cmd(cmd, fs::path(script).parent_path().wstring(), in_rd, out_wr, &pi);
         CloseHandle(in_rd); CloseHandle(out_wr);
@@ -826,7 +819,7 @@ bool EraseTool::trigger_erase(const std::wstring &base_image_path, const std::ws
             if (!success) {
                 std::wstring py = find_python_executable(), script = find_lama_script_path(), model = find_lama_model_path();
                 if (!py.empty() && !script.empty() && !model.empty()) {
-                    std::wstring cmd = L"\"" + py + L"\" \"" + fs::absolute(script).wstring() + L"\" --input \"" + in_img +
+                    std::wstring cmd = L"\"" + py + L"\" -s -E \"" + fs::absolute(script).wstring() + L"\" --input \"" + in_img +
                                        L"\" --mask \"" + fs::absolute(mask_path).wstring() + L"\" --output \"" + out_img +
                                        L"\" --model \"" + fs::absolute(model).wstring() + L"\"";
                     log(0, "Fallback CLI: " + wide_to_utf8(cmd.c_str()));

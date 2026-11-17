@@ -22,42 +22,15 @@ static std::wstring find_python() {
     wchar_t exe_path[MAX_PATH] = {};
     if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH) > 0) {
         fs::path base = fs::path(exe_path).parent_path();
-        for (int i = 0; i <= 3; ++i) {
-            std::vector<fs::path> local_candidates = {
-                base / "tools" / "python" / "python.exe",
-                base / "python" / "python.exe",
-                base / "tools" / "depth_anything_v2" / "venv" / "Scripts" / "python.exe",
-                base / "tools" / "depth_anything_v2" / "python" / "python.exe",
-                base / "venv" / "Scripts" / "python.exe",
-                base / ".venv" / "Scripts" / "python.exe"
-            };
-            for (const auto &p : local_candidates) {
-                if (fs::exists(p)) return fs::absolute(p).wstring();
-            }
-            base = base.parent_path();
+        std::vector<fs::path> local_candidates = {
+            base / "tools" / "python" / "python.exe",
+            base / "python" / "python.exe"
+        };
+        for (const auto &p : local_candidates) {
+            if (fs::exists(p)) return fs::absolute(p).wstring();
         }
     }
-
-    wchar_t user_prof[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"USERPROFILE", user_prof, MAX_PATH) > 0) {
-        std::wstring conda = std::wstring(user_prof) + L"\\miniconda3\\python.exe";
-        if (fs::exists(conda)) return conda;
-        std::wstring ana = std::wstring(user_prof) + L"\\anaconda3\\python.exe";
-        if (fs::exists(ana)) return ana;
-    }
-    std::vector<std::wstring> known = {
-        L"C:\\Python314\\python.exe",
-        L"C:\\Python313\\python.exe",
-        L"C:\\Python312\\python.exe",
-        L"C:\\Python311\\python.exe",
-        L"C:\\Python310\\python.exe",
-        L"C:\\Program Files\\Python312\\python.exe",
-        L"C:\\Program Files\\Python311\\python.exe"
-    };
-    for (const auto &p : known) {
-        if (fs::exists(p)) return p;
-    }
-    return L"python.exe";
+    return L"";
 }
 
 static std::wstring find_script() {
@@ -135,6 +108,10 @@ int CliDepth::execute(const CliOptions &opts) {
     std::wstring script = find_script();
     std::wstring model = find_model(opts.encoder);
 
+    if (py_exe.empty() || !fs::exists(py_exe)) {
+        std::cerr << "Error: Local portable Python not found in tools/python/python.exe. Run Depth once in ShaderLab GUI to provision it.\n";
+        return 1;
+    }
     if (!fs::exists(script)) {
         std::cerr << "Error: Inference script not found: " << wide_to_utf8(script.c_str()) << "\n";
         return 1;
@@ -173,7 +150,7 @@ int CliDepth::execute(const CliOptions &opts) {
         fs::path target_sidecar = img_p;
         target_sidecar.replace_extension(".sldepth");
 
-        std::wstring cmd = L"\"" + py_exe + L"\" \"" + script + L"\""
+        std::wstring cmd = L"\"" + py_exe + L"\" -s -E \"" + script + L"\""
                          + L" --input \"" + img_p.wstring() + L"\""
                          + L" --model \"" + model + L"\""
                          + L" --encoder " + utf8_to_wide(opts.encoder.c_str())
