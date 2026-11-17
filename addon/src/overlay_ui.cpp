@@ -69,6 +69,7 @@ inline ImGuiContext* get_imgui_context() {
 #include <shlobj.h>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <cmath>
 #include <cstdio>
@@ -100,14 +101,50 @@ using str_utils::wide_to_utf8;
 inline std::string wide_to_utf8_ui(const wchar_t *wstr) { return str_utils::wide_to_utf8(wstr); }
 inline std::string wide_to_utf8_ui(const std::wstring &wstr) { return str_utils::wide_to_utf8(wstr); }
 
-static bool browse_image_dialog(std::wstring &selected_path) {
-    wchar_t filename[MAX_PATH] = {};
+static int s_last_overlay_frame = -1;
+static int s_last_any_frame = -1;
+
+struct PendingNativeDialog {
+    bool active = false;
+    int wait_frames = 0;
+    bool restore_overlay = false;
+    std::function<void(reshade::api::effect_runtime *, HWND)> run;
+};
+static PendingNativeDialog s_pending_dialog;
+
+// defer native win32 dialogs past reshade's overlay input block so scrollbar drag and keys work
+static void schedule_native_dialog(
+    reshade::api::effect_runtime *runtime,
+    std::function<void(reshade::api::effect_runtime *, HWND)> fn
+) {
+    if (s_pending_dialog.active) return;
+
+    bool overlay_open = (s_last_overlay_frame >= 0 && s_last_overlay_frame >= s_last_any_frame);
+    if (!overlay_open) {
+        HWND hwnd = runtime ? static_cast<HWND>(runtime->get_hwnd()) : GetForegroundWindow();
+        fn(runtime, hwnd);
+        return;
+    }
+
+    s_pending_dialog.active = true;
+    s_pending_dialog.wait_frames = 2;
+    s_pending_dialog.restore_overlay = true;
+    s_pending_dialog.run = std::move(fn);
+    if (runtime) {
+        runtime->open_overlay(false, reshade::api::input_source::mouse);
+    }
+}
+
+static bool browse_image_dialog(HWND hwnd, std::wstring &selected_path) {
+    wchar_t filename[kMaxPathW] = {};
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(OPENFILENAMEW);
+    ofn.hwndOwner = hwnd;
     ofn.lpstrFilter = L"All Supported Files (*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.hdr;*.shaderlab;*.slab)\0*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.hdr;*.shaderlab;*.slab\0ShaderLab Projects (*.shaderlab;*.slab)\0*.shaderlab;*.slab\0Image Files (*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.hdr)\0*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.hdr\0All Files (*.*)\0*.*\0";
     ofn.lpstrFile = filename;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.nMaxFile = kMaxPathW;
+    ofn.lpstrTitle = L"Open Image or Project";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
 
     if (GetOpenFileNameW(&ofn)) {
         selected_path = filename;
@@ -477,8 +514,6 @@ void trigger_save_project_workflow(reshade::api::effect_runtime *runtime, bool f
     }
 
     // first time save (or Save As): open windows file explorer save dialog
-    HWND hwnd = runtime ? static_cast<HWND>(runtime->get_hwnd()) : GetForegroundWindow();
-
     std::wstring suggested_stem;
     std::wstring initial_dir;
 
@@ -517,10 +552,13 @@ void trigger_save_project_workflow(reshade::api::effect_runtime *runtime, bool f
         suggested_stem = L"project";
     }
 
-    std::wstring chosen_path;
-    if (browse_save_project_dialog(hwnd, suggested_stem, initial_dir, chosen_path)) {
-        execute_project_save(runtime, active_path, chosen_path, block, queue_mgr);
-    }
+    schedule_native_dialog(runtime, [active_path, suggested_stem, initial_dir](reshade::api::effect_runtime *rt, HWND dlg_hwnd) {
+        std::wstring chosen_path;
+        if (browse_save_project_dialog(dlg_hwnd, suggested_stem, initial_dir, chosen_path)) {
+            JobQueueManager &qm = JobQueueManager::get();
+            execute_project_save(rt, active_path, chosen_path, qm.get_control_block(), qm);
+        }
+    });
 }
 
 void trigger_export_workflow(reshade::api::effect_runtime *runtime) {
@@ -570,17 +608,21 @@ void trigger_export_workflow(reshade::api::effect_runtime *runtime) {
 
     if (is_duplicate) {
         // duplicate detected: open file explorer for export
-        HWND hwnd = runtime ? static_cast<HWND>(runtime->get_hwnd()) : GetForegroundWindow();
-        std::wstring chosen_path;
-        if (browse_export_as_dialog(hwnd, in_p.stem().wstring(), out_dir.wstring(), chosen_path)) {
-            fs::path chosen_p(chosen_path);
-            std::wstring override_name = chosen_p.filename().wstring();
-            std::wstring target_dir = chosen_p.parent_path().wstring();
+        std::wstring stem = in_p.stem().wstring();
+        std::wstring out_dir_w = out_dir.wstring();
+        std::wstring fname_w = in_p.filename().wstring();
+        schedule_native_dialog(runtime, [active_path, stem, out_dir_w, fname_w, settle_cap, flags](reshade::api::effect_runtime *, HWND dlg_hwnd) {
+            std::wstring chosen_path;
+            if (browse_export_as_dialog(dlg_hwnd, stem, out_dir_w, chosen_path)) {
+                fs::path chosen_p(chosen_path);
+                std::wstring override_name = chosen_p.filename().wstring();
+                std::wstring target_dir = chosen_p.parent_path().wstring();
 
-            queue_mgr.add_log(L"Export started: " + in_p.filename().wstring()
-                             + L" -> " + override_name);
-            queue_mgr.trigger_export(active_path, target_dir, settle_cap, flags, override_name);
-        }
+                JobQueueManager &qm = JobQueueManager::get();
+                qm.add_log(L"Export started: " + fname_w + L" -> " + override_name);
+                qm.trigger_export(active_path, target_dir, settle_cap, flags, override_name);
+            }
+        });
     } else {
         // new image: exports directly into out folder without opening file explorer
         queue_mgr.add_log(L"Export started: " + in_p.filename().wstring()
@@ -614,8 +656,6 @@ void trigger_export_as_workflow(reshade::api::effect_runtime *runtime) {
         return;
     }
 
-    HWND hwnd = runtime ? static_cast<HWND>(runtime->get_hwnd()) : GetForegroundWindow();
-
     std::wstring suggested_stem;
     std::wstring initial_dir;
 
@@ -647,41 +687,62 @@ void trigger_export_as_workflow(reshade::api::effect_runtime *runtime) {
         suggested_stem = L"export";
     }
 
-    std::wstring chosen_path;
-    if (browse_export_as_dialog(hwnd, suggested_stem, initial_dir, chosen_path)) {
-        fs::path chosen_p(chosen_path);
-        std::wstring target_dir = chosen_p.parent_path().wstring();
-        std::wstring filename = chosen_p.filename().wstring();
+    schedule_native_dialog(runtime, [active_path, suggested_stem, initial_dir](reshade::api::effect_runtime *, HWND dlg_hwnd) {
+        std::wstring chosen_path;
+        if (browse_export_as_dialog(dlg_hwnd, suggested_stem, initial_dir, chosen_path)) {
+            fs::path chosen_p(chosen_path);
+            std::wstring target_dir = chosen_p.parent_path().wstring();
+            std::wstring filename = chosen_p.filename().wstring();
 
-        uint32_t flags = 0;
-        if (s_auto_converge)      flags |= EXPORT_FLAG_AUTO_CONVERGE;
-        if (s_export_wysiwyg)     flags |= EXPORT_FLAG_WYSIWYG;
-        if (s_export_embed_depth) {
-            if (s_depth_export_format == 0)      flags |= EXPORT_FLAG_EMBED_DEPTH;
-            else if (s_depth_export_format == 1) flags |= EXPORT_FLAG_DEPTH_SIDECAR;
-            else                                 flags |= (EXPORT_FLAG_EMBED_DEPTH | EXPORT_FLAG_DEPTH_SIDECAR);
+            uint32_t flags = 0;
+            if (s_auto_converge)      flags |= EXPORT_FLAG_AUTO_CONVERGE;
+            if (s_export_wysiwyg)     flags |= EXPORT_FLAG_WYSIWYG;
+            if (s_export_embed_depth) {
+                if (s_depth_export_format == 0)      flags |= EXPORT_FLAG_EMBED_DEPTH;
+                else if (s_depth_export_format == 1) flags |= EXPORT_FLAG_DEPTH_SIDECAR;
+                else                                 flags |= (EXPORT_FLAG_EMBED_DEPTH | EXPORT_FLAG_DEPTH_SIDECAR);
+            }
+
+            uint32_t settle_cap = s_auto_converge ? 1800 : static_cast<uint32_t>(std::round(s_settle_time_sec * 60.0f));
+            if (settle_cap < 30) settle_cap = 30;
+
+            JobQueueManager &qm = JobQueueManager::get();
+            qm.add_log(L"Export started: " + fs::path(active_path).filename().wstring() + L" -> " + filename);
+            qm.trigger_export(active_path, target_dir, settle_cap, flags, chosen_path);
         }
-
-        uint32_t settle_cap = s_auto_converge ? 1800 : static_cast<uint32_t>(std::round(s_settle_time_sec * 60.0f));
-        if (settle_cap < 30) settle_cap = 30;
-
-        queue_mgr.add_log(L"Export started: " + fs::path(active_path).filename().wstring()
-                         + L" -> " + filename);
-        queue_mgr.trigger_export(active_path, target_dir, settle_cap, flags, chosen_path);
-
-    }
+    });
 }
 
 static int s_keybind_capturing = -1;
-static int s_last_overlay_frame = -1;
 
 void on_reshade_overlay_frame(reshade::api::effect_runtime *runtime) {
+    int cur_frame = ImGui::GetFrameCount();
+    s_last_any_frame = cur_frame;
+
+    if (s_pending_dialog.active) {
+        if (s_pending_dialog.wait_frames > 0) {
+            s_pending_dialog.wait_frames--;
+            return;
+        }
+        auto fn = std::move(s_pending_dialog.run);
+        bool restore = s_pending_dialog.restore_overlay;
+        s_pending_dialog = {};
+
+        HWND hwnd = runtime ? static_cast<HWND>(runtime->get_hwnd()) : GetForegroundWindow();
+        if (fn) {
+            fn(runtime, hwnd);
+        }
+        if (restore && runtime) {
+            runtime->open_overlay(true, reshade::api::input_source::mouse);
+        }
+        return;
+    }
+
     JobQueueManager &queue_mgr = JobQueueManager::get();
     SharedControlBlock *block = queue_mgr.get_control_block();
     if (!block || !queue_mgr.is_connected()) return;
     std::wstring active_path = queue_mgr.get_active_image_path();
 
-    int cur_frame = ImGui::GetFrameCount();
     bool overlay_open = (s_last_overlay_frame == cur_frame);
     if (!overlay_open) {
         EraseTool::get().set_ui_rect(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1192,11 +1253,14 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         float drop_avail = ImGui::GetContentRegionAvail().x;
         const char *drop_txt = (drop_avail < 250.0f) ? "Click to replace image" : "Click or drop to replace image";
         if (ImGui::Button(drop_txt, ImVec2(-1, 42))) {
-            std::wstring picked;
-            if (browse_image_dialog(picked)) {
-                queue_mgr.set_preview_image(picked);
-                queue_mgr.add_log(L"Image loaded: " + fs::path(picked).filename().wstring());
-            }
+            schedule_native_dialog(runtime, [](reshade::api::effect_runtime *, HWND dlg_hwnd) {
+                std::wstring picked;
+                if (browse_image_dialog(dlg_hwnd, picked)) {
+                    JobQueueManager &qm = JobQueueManager::get();
+                    qm.set_preview_image(picked);
+                    qm.add_log(L"Image loaded: " + fs::path(picked).filename().wstring());
+                }
+            });
         }
 
         if (fname.empty()) {
@@ -1224,15 +1288,16 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         }
         ImGui::SameLine();
         if (ImGui::Button("Change", ImVec2(change_btn_w, 0))) {
-            HWND hwnd = runtime ? static_cast<HWND>(runtime->get_hwnd()) : GetForegroundWindow();
             std::wstring initial = utf8_to_wide(s_output_folder);
-            std::wstring picked_dir;
-            if (browse_folder_dialog(hwnd, initial, picked_dir)) {
-                std::string picked_u8 = wide_to_utf8_ui(picked_dir.c_str());
-                strncpy_s(s_output_folder, sizeof(s_output_folder), picked_u8.c_str(), _TRUNCATE);
-                queue_mgr.add_log(L"Output folder changed: " + picked_dir);
-                strncpy_s(s_prev_output_folder, s_output_folder, sizeof(s_prev_output_folder));
-            }
+            schedule_native_dialog(runtime, [initial](reshade::api::effect_runtime *, HWND dlg_hwnd) {
+                std::wstring picked_dir;
+                if (browse_folder_dialog(dlg_hwnd, initial, picked_dir)) {
+                    std::string picked_u8 = wide_to_utf8_ui(picked_dir.c_str());
+                    strncpy_s(s_output_folder, sizeof(s_output_folder), picked_u8.c_str(), _TRUNCATE);
+                    JobQueueManager::get().add_log(L"Output folder changed: " + picked_dir);
+                    strncpy_s(s_prev_output_folder, s_output_folder, sizeof(s_prev_output_folder));
+                }
+            });
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Browse to change the output folder.");
@@ -1683,10 +1748,12 @@ void on_overlay(reshade::api::effect_runtime *runtime) {
         std::string depth_display_name = depth_path_utf8.empty() ? "[ Click to Browse Depth Screenshot ]" : fs::path(s_selected_depth_path).filename().string();
 
         if (ImGui::Button(depth_display_name.c_str(), ImVec2(-1, 35))) {
-            std::wstring picked;
-            if (browse_image_dialog(picked)) {
-                wcsncpy_s(s_selected_depth_path, MAX_PATH, picked.c_str(), _TRUNCATE);
-            }
+            schedule_native_dialog(runtime, [](reshade::api::effect_runtime *, HWND dlg_hwnd) {
+                std::wstring picked;
+                if (browse_image_dialog(dlg_hwnd, picked)) {
+                    wcsncpy_s(s_selected_depth_path, MAX_PATH, picked.c_str(), _TRUNCATE);
+                }
+            });
         }
 
         if (wcslen(s_selected_depth_path) > 0) {
